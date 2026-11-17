@@ -77,7 +77,10 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
         return 0;
     }
 
-    let (env_id, _scope_id) = env.data_mut().commit_isolate(snapi_env_state, &reservation);
+    let Ok((env_id, _scope_id)) = env.data_mut().commit_isolate(snapi_env_state, &reservation)
+    else {
+        return 0;
+    };
     env.data_mut().default_napi_env_id = Some(env_id);
     env_id as i32
 }
@@ -316,7 +319,10 @@ fn guest_unofficial_napi_create_env(
         env.data().abort_isolate(&reservation);
         return status;
     }
-    let (env_id, scope_id) = env.data_mut().commit_isolate(snapi_env_state, &reservation);
+    let (env_id, scope_id) = match env.data_mut().commit_isolate(snapi_env_state, &reservation) {
+        Ok(ids) => ids,
+        Err(status) => return status,
+    };
     if env_out_ptr != 0 {
         write_guest_u32(&mut env, env_out_ptr, env_id);
     }

@@ -8,6 +8,7 @@
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
+    mpsc,
 };
 
 use wasmer_napi::{
@@ -16,6 +17,7 @@ use wasmer_napi::{
 
 mod common;
 use common::build_wasix_test;
+mod wat_guest;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -86,25 +88,70 @@ fn an_explicit_webassembly_policy_wins_over_the_default() {
 /// limit later, so the WebAssembly default does not depend on its number.
 #[test]
 fn an_accountant_makes_the_context_budgeted_whatever_its_limit() {
-    struct Accountant(AtomicU64);
+    struct Accountant {
+        limit: AtomicU64,
+        charged: AtomicU64,
+    }
     impl NapiMemoryAccountant for Accountant {
         fn memory_limit(&self) -> u64 {
-            u64::MAX
+            self.limit.load(Ordering::Acquire)
         }
         fn memory_charged(&self) -> u64 {
-            self.0.load(Ordering::Acquire)
+            self.charged.load(Ordering::Acquire)
         }
         fn try_charge(&self, bytes: u64) -> bool {
-            self.0.fetch_add(bytes, Ordering::AcqRel);
-            true
+            self.charged
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
+                    charged
+                        .checked_add(bytes)
+                        .filter(|next| *next <= self.memory_limit())
+                })
+                .is_ok()
         }
         fn uncharge(&self, bytes: u64) {
-            self.0.fetch_sub(bytes, Ordering::AcqRel);
+            self.charged.fetch_sub(bytes, Ordering::AcqRel);
         }
     }
+    let accountant = Arc::new(Accountant {
+        limit: AtomicU64::new(u64::MAX),
+        charged: AtomicU64::new(0),
+    });
     let ctx = NapiCtx::builder()
-        .memory_accountant(Arc::new(Accountant(AtomicU64::new(0))))
+        .memory_accountant(accountant.clone())
         .build();
     assert_eq!(ctx.webassembly_policy(), WasmPolicy::Restricted);
     assert!(ctx.budget().is_budgeted());
+
+    let (engine, module) = wat_guest::compile();
+    let (signal_tx, _signal_rx) = mpsc::channel();
+    let mut guest = wat_guest::Guest::new(&ctx, &engine, &module, signal_tx);
+    guest.create();
+    assert_eq!(guest.install_serdes(), 0);
+
+    // Leave room for the script text and a small serialization. The same
+    // isolate must also refuse a larger serialization after the limit changes.
+    accountant
+        .limit
+        .store(accountant.memory_charged() + 4096, Ordering::Release);
+    assert_eq!(
+        guest.number("const s = new serdes.Serializer(); s.writeValue(42) ? 1 : 0"),
+        1
+    );
+    assert!(ctx.budget().snapshot().host_transient > 0);
+    assert_eq!(
+        guest.number(
+            "(() => {
+                const s = new serdes.Serializer();
+                try {
+                    s.writeValue('x'.repeat(32768));
+                    return 0;
+                } catch (error) {
+                    return error.message.includes('out of memory') ? 1 : 2;
+                }
+            })()"
+        ),
+        1
+    );
+    assert_eq!(guest.release(), 0);
+    assert_eq!(ctx.budget().snapshot().host_transient, 0);
 }

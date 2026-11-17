@@ -47,6 +47,8 @@ const WAT: &str = r#"(module
     (func $collect_garbage (param i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_memory_pressure"
     (func $memory_pressure (param i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_create_serdes_binding"
+    (func $create_serdes (param i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_message_create"
     (func $message_create (param i32 i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_message_take"
@@ -104,6 +106,7 @@ const WAT: &str = r#"(module
   (data (i32.const 200) "const end = Date.now() + 30000; while (Date.now() < end) {}\00")
   (data (i32.const 280) "release_self\00")
   (data (i32.const 296) "attach\00")
+  (data (i32.const 304) "serdes\00")
 
   (func $string (param $ptr i32) (param $len i32) (result i32)
     (if (call $create_string (global.get $env) (local.get $ptr) (local.get $len) (i32.const 28))
@@ -217,6 +220,13 @@ const WAT: &str = r#"(module
     (if (call $get_global (global.get $env) (i32.const 48)) (then unreachable))
     (call $set_named_property (global.get $env) (i32.load (i32.const 48))
       (i32.const 100) (i32.load (i32.const 40))))
+  (func (export "install_serdes") (result i32)
+    (local $status i32)
+    (local.set $status (call $create_serdes (global.get $env) (i32.const 40)))
+    (if (local.get $status) (then (return (local.get $status))))
+    (if (call $get_global (global.get $env) (i32.const 48)) (then unreachable))
+    (call $set_named_property (global.get $env) (i32.load (i32.const 48))
+      (i32.const 304) (i32.load (i32.const 40))))
   (func (export "drop") (param $token i32) (call $message_drop (local.get $token)))
 
   (func (export "undefined_in") (param $env i32) (result i32)
@@ -512,6 +522,10 @@ impl Guest {
     /// Stores the last taken value as `globalThis.shared`.
     pub fn install(&mut self) -> i32 {
         self.call0("install")
+    }
+
+    pub fn install_serdes(&mut self) -> i32 {
+        self.call0("install_serdes")
     }
 
     pub fn drop_message(&mut self, token: i32) {

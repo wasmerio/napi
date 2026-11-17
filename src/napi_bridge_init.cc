@@ -145,15 +145,18 @@ struct BookkeepingAccount {
     return true;
   }
 
-  // Returns everything granted and the budget reference. The agent's tables
-  // are gone.
-  void Close() {
-    live = 0;
+  // Returns everything granted and the budget reference.
+  void Detach() {
     if (budget == nullptr) return;
     if (granted != 0) napi_host_bookkeeping_uncharge(budget, granted);
     granted = 0;
     napi_host_budget_release(budget);
     budget = nullptr;
+  }
+
+  void Close() {
+    live = 0;
+    Detach();
   }
 };
 
@@ -3830,17 +3833,19 @@ extern "C" int snapi_bridge_value_id_alive(SnapiEnvState* env_state, uint32_t id
 extern "C" int snapi_bridge_unofficial_set_host_budget(SnapiEnvState* env_state,
                                                        const void* budget) {
   auto* state = LookupEnvState(env_state);
-  if (state == nullptr) return napi_invalid_arg;
-  if (!state->agent->bookkeeping.Attach(budget)) return napi_generic_failure;
-  // The provider's host memory (messages) holds a reference of its own: its
-  // charges can outlive the agent.
+  if (state == nullptr || budget == nullptr) return napi_invalid_arg;
+  // Bookkeeping takes a separate reference. The provider takes the caller's
+  // reference on success because its charges can outlive the agent.
   napi_host_budget_retain(budget);
-  if (snapi_private_set_host_memory(state->env, const_cast<void*>(budget),
-                                    napi_host_memory_charge, napi_host_memory_uncharge,
-                                    HostBudgetRelease) != napi_ok) {
+  if (!state->agent->bookkeeping.Attach(budget)) {
     napi_host_budget_release(budget);
+    return napi_generic_failure;
   }
-  return napi_ok;
+  const napi_status status = snapi_private_set_host_memory(
+      state->env, const_cast<void*>(budget), napi_host_memory_charge,
+      napi_host_memory_uncharge, HostBudgetRelease);
+  if (status != napi_ok) state->agent->bookkeeping.Detach();
+  return status;
 }
 
 extern "C" int snapi_bridge_unofficial_release_env(SnapiEnvState* env_state) {
