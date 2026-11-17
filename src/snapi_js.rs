@@ -1742,7 +1742,11 @@ extern "C" {
     ) -> Result<i32, JsValue>;
     #[wasm_bindgen(catch)]
     fn wasmer_napi_is_lazy_data_property(object: &JsValue, key: &JsValue) -> Result<bool, JsValue>;
-    fn wasmer_napi_property_writable(object: &JsValue, key: &JsValue, descriptor: &JsValue) -> JsValue;
+    fn wasmer_napi_property_writable(
+        object: &JsValue,
+        key: &JsValue,
+        descriptor: &JsValue,
+    ) -> JsValue;
     #[wasm_bindgen(catch)]
     fn wasmer_napi_new(ctor: &Function, args: &Array) -> Result<JsValue, JsValue>;
     fn wasmer_napi_symbol(description: &JsValue) -> JsValue;
@@ -5014,8 +5018,9 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_is_lazy_data_property(
         (object, key)
     };
     match wasmer_napi_is_lazy_data_property(&object, &key) {
-        Ok(lazy) => unsafe { write(result_out, i32::from(lazy)) }
-            .map_or_else(|status| status, |()| NAPI_OK),
+        Ok(lazy) => {
+            unsafe { write(result_out, i32::from(lazy)) }.map_or_else(|status| status, |()| NAPI_OK)
+        }
         Err(error) => {
             if let Ok(state) = unsafe { env_mut(env) } {
                 state.last_exception = Some(error);
@@ -5075,7 +5080,8 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_get_own_non_index_properties(
                 continue;
             }
             if filter_bits & 1 != 0
-                && wasmer_napi_property_writable(&object, &key, &descriptor).as_bool() == Some(false)
+                && wasmer_napi_property_writable(&object, &key, &descriptor).as_bool()
+                    == Some(false)
             {
                 continue;
             }
@@ -5363,8 +5369,16 @@ pub unsafe extern "C" fn snapi_bridge_unofficial_structured_clone(
 pub unsafe extern "C" fn snapi_bridge_unofficial_message_create(
     env: SnapiEnv,
     value_id: u32,
+    _range_begin: u64,
+    _range_end: u64,
     payload_out: *mut u32,
+    in_range_out: *mut i32,
 ) -> i32 {
+    // The host shares the value itself: nothing is charged, and its shared
+    // buffers are host JavaScript memory, never a guest heap.
+    if !in_range_out.is_null() {
+        unsafe { in_range_out.write(0) };
+    }
     let Ok(state) = (unsafe { env_mut(env) }) else {
         return NAPI_INVALID_ARG;
     };

@@ -140,10 +140,13 @@ unsafe extern "C" {
         env: SnapiEnv,
         data: *const c_void,
     ) -> i32;
-    /// Cap the number of live per-value host handles (and callback
-    /// registrations) this env may hold, bounding host-side bookkeeping RSS.
-    /// `limit == 0` means unlimited.
-    pub fn snapi_bridge_unofficial_set_value_limit(env: SnapiEnv, limit: u64) -> i32;
+    /// Charge the host bookkeeping of this env's handle tables to `budget`, a
+    /// reference from `ResourceBudget::bridge_reference` that the bridge owns
+    /// on success. Nonzero (the caller keeps the reference) on failure.
+    pub fn snapi_bridge_unofficial_set_host_budget(
+        env: SnapiEnv,
+        budget: *const std::ffi::c_void,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_get_promise_details(
         env: SnapiEnv,
         promise_id: u32,
@@ -297,10 +300,16 @@ unsafe extern "C" {
         transfer_list_id: u32,
         out_id: *mut u32,
     ) -> i32;
+    /// Serializes a message, charged to the env's budget by the provider
+    /// until it is taken or dropped. `in_range_out` says whether one of its
+    /// `SharedArrayBuffer`s has bytes in `[range_begin, range_end)`.
     pub fn snapi_bridge_unofficial_message_create(
         env: SnapiEnv,
         value_id: u32,
+        range_begin: u64,
+        range_end: u64,
         payload_out: *mut u32,
+        in_range_out: *mut i32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_message_take(
         env: SnapiEnv,

@@ -65,10 +65,21 @@ pub const DEFAULT_PER_ISOLATE_OVERHEAD: u64 = 8 * MIB;
 
 /// Estimated host-side bytes held per N-API value handle crossed to the guest:
 /// the `napi_ref` struct, the handle-map node, and a V8 global-handle slot. The
-/// referenced JS value itself lives in the (separately charged) V8 heap. Used
-/// only to derive a per-env cap on live handles — see
-/// [`ResourceBudget::value_handle_limit`].
+/// referenced JS value itself lives in the (separately charged) V8 heap. The
+/// bridge charges each entry of its handle tables at this estimate (see
+/// [`Pool::HostBookkeeping`]).
 pub const EST_HOST_BYTES_PER_VALUE: u64 = 128;
+
+/// Granularity of [`Pool::HostBookkeeping`] charges. The bridge asks for
+/// another chunk when its live estimate outgrows what was granted, and returns
+/// whole chunks once at least two are unused.
+pub const HOST_BOOKKEEPING_CHUNK: u64 = 256 * 1024;
+
+/// Host copies of guest memory below this size are not charged to
+/// [`Pool::HostTransient`]: an import holds a bounded number of them, and they
+/// are freed before it returns. Larger copies, and every name an import keeps
+/// in an array (property descriptors), are charged.
+pub const UNCHARGED_HOST_COPY_BYTES: usize = 16 * 1024;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn pages_to_bytes(pages: Pages) -> u64 {
@@ -83,9 +94,8 @@ fn round_up_to_page(bytes: u64) -> u64 {
 }
 
 /// A distinct byte pool metered against the budget.
-///
-/// Later phases add external-memory and host-transient pools.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Pool {
     /// Guest wasm linear memory (wasmer `WasmMmap`).
     WasmLinear,
@@ -100,16 +110,45 @@ pub enum Pool {
     /// the only allocation path for them and they're charged as
     /// [`Pool::WasmLinear`] instead — see [`crate::guest_heap::GuestHeap`].
     V8External,
+    /// Host memory the native bridge keeps for the guest's handles: value
+    /// slots, references, deferreds, callback registrations and the opaque
+    /// handle tables. Estimated per entry ([`EST_HOST_BYTES_PER_VALUE`]) and
+    /// granted in [`HOST_BOOKKEEPING_CHUNK`]s, so most handles charge nothing.
+    HostBookkeeping,
+    /// Host copies of guest memory an import makes for the duration of the
+    /// call: strings, names, property descriptors, argument arrays and other
+    /// guest-supplied byte ranges. Copies smaller than
+    /// [`UNCHARGED_HOST_COPY_BYTES`] are not charged.
+    HostTransient,
+    /// Serialized messages between the context's environments (`postMessage`
+    /// payloads), from creation until they are taken, dropped, or the
+    /// context stops.
+    SerializedMessage,
 }
 
 /// Embedder-owned aggregate accounting for byte reservations made by N-API.
 ///
 /// N-API retains its own per-pool counters; the embedder sees only byte totals,
 /// keeping pool policy and future N-API implementation details out of Edge.
+///
+/// A refused [`try_charge`](Self::try_charge) means the application is out of
+/// memory: N-API fails the operation, and the embedder may stop the
+/// application (for example through [`crate::NapiRuntimeControl::terminate_all`]).
+/// A refused [`try_charge_soft`](Self::try_charge_soft) is reported to the
+/// application as an ordinary JavaScript error, and it keeps running.
 pub trait NapiMemoryAccountant: Send + Sync {
     fn memory_limit(&self) -> u64;
     fn memory_charged(&self) -> u64;
     fn try_charge(&self, bytes: u64) -> bool;
+    /// Charges bytes whose refusal N-API reports to the application as a
+    /// catchable JavaScript error (for example a `postMessage` payload that
+    /// does not fit). It must refuse without side effects such as stopping
+    /// the application. Embedders whose [`try_charge`](Self::try_charge)
+    /// stops the application on refusal override it; the default is
+    /// `try_charge`.
+    fn try_charge_soft(&self, bytes: u64) -> bool {
+        self.try_charge(bytes)
+    }
     fn uncharge(&self, bytes: u64);
 }
 
@@ -153,6 +192,12 @@ pub struct ResourceUsage {
     pub v8_heap_reserved: u64,
     /// Currently-charged V8 external memory (ArrayBuffer/Buffer) bytes.
     pub v8_external: u64,
+    /// Host bookkeeping granted to the bridge ([`Pool::HostBookkeeping`]).
+    pub host_bookkeeping: u64,
+    /// Charged host copies of guest memory ([`Pool::HostTransient`]).
+    pub host_transient: u64,
+    /// Charged serialized messages ([`Pool::SerializedMessage`]).
+    pub serialized_message: u64,
     /// Number of live V8 isolates (envs) counted against `max_envs`.
     pub live_isolates: usize,
 }
@@ -205,6 +250,9 @@ pub struct ResourceBudget {
     wasm_linear: AtomicU64,
     v8_heap_reserved: AtomicU64,
     v8_external: AtomicU64,
+    host_bookkeeping: AtomicU64,
+    host_transient: AtomicU64,
+    serialized_message: AtomicU64,
     /// Live V8 isolates (envs), counted against `max_envs`.
     live_isolates: AtomicUsize,
 }
@@ -220,6 +268,18 @@ impl std::fmt::Debug for ResourceBudget {
                 &self.v8_heap_reserved.load(Ordering::Acquire),
             )
             .field("v8_external", &self.v8_external.load(Ordering::Acquire))
+            .field(
+                "host_bookkeeping",
+                &self.host_bookkeeping.load(Ordering::Acquire),
+            )
+            .field(
+                "host_transient",
+                &self.host_transient.load(Ordering::Acquire),
+            )
+            .field(
+                "serialized_message",
+                &self.serialized_message.load(Ordering::Acquire),
+            )
             .field("live_isolates", &self.live_isolates.load(Ordering::Acquire))
             .finish()
     }
@@ -256,6 +316,9 @@ impl ResourceBudget {
             wasm_linear: AtomicU64::new(0),
             v8_heap_reserved: AtomicU64::new(0),
             v8_external: AtomicU64::new(0),
+            host_bookkeeping: AtomicU64::new(0),
+            host_transient: AtomicU64::new(0),
+            serialized_message: AtomicU64::new(0),
             live_isolates: AtomicUsize::new(0),
         })
     }
@@ -268,6 +331,9 @@ impl ResourceBudget {
             wasm_linear: AtomicU64::new(0),
             v8_heap_reserved: AtomicU64::new(0),
             v8_external: AtomicU64::new(0),
+            host_bookkeeping: AtomicU64::new(0),
+            host_transient: AtomicU64::new(0),
+            serialized_message: AtomicU64::new(0),
             live_isolates: AtomicUsize::new(0),
         }
     }
@@ -303,12 +369,29 @@ impl ResourceBudget {
     ///
     /// [`uncharge`]: ResourceBudget::uncharge
     pub fn try_charge(&self, pool: Pool, bytes: u64) -> Result<(), OverBudget> {
+        self.charge(pool, bytes, false)
+    }
+
+    /// Like [`try_charge`](Self::try_charge), for bytes whose refusal the
+    /// application sees as a catchable JavaScript error: an embedder
+    /// accountant is asked through [`NapiMemoryAccountant::try_charge_soft`],
+    /// so a refusal does not stop the application.
+    pub fn try_charge_soft(&self, pool: Pool, bytes: u64) -> Result<(), OverBudget> {
+        self.charge(pool, bytes, true)
+    }
+
+    fn charge(&self, pool: Pool, bytes: u64, soft: bool) -> Result<(), OverBudget> {
         if bytes == 0 {
             return Ok(());
         }
 
         if let Some(accountant) = &self.accountant {
-            if !accountant.try_charge(bytes) {
+            let granted = if soft {
+                accountant.try_charge_soft(bytes)
+            } else {
+                accountant.try_charge(bytes)
+            };
+            if !granted {
                 return Err(OverBudget {
                     pool,
                     requested: bytes,
@@ -368,6 +451,9 @@ impl ResourceBudget {
             Pool::WasmLinear => &self.wasm_linear,
             Pool::V8HeapReserved => &self.v8_heap_reserved,
             Pool::V8External => &self.v8_external,
+            Pool::HostBookkeeping => &self.host_bookkeeping,
+            Pool::HostTransient => &self.host_transient,
+            Pool::SerializedMessage => &self.serialized_message,
         }
     }
 
@@ -379,6 +465,9 @@ impl ResourceBudget {
             wasm_linear: self.wasm_linear.load(Ordering::Acquire),
             v8_heap_reserved: self.v8_heap_reserved.load(Ordering::Acquire),
             v8_external: self.v8_external.load(Ordering::Acquire),
+            host_bookkeeping: self.host_bookkeeping.load(Ordering::Acquire),
+            host_transient: self.host_transient.load(Ordering::Acquire),
+            serialized_message: self.serialized_message.load(Ordering::Acquire),
             live_isolates: self.live_isolates.load(Ordering::Acquire),
         }
     }
@@ -386,18 +475,6 @@ impl ResourceBudget {
     /// Number of live V8 isolates counted against `max_envs`.
     pub fn live_isolates(&self) -> usize {
         self.live_isolates.load(Ordering::Acquire)
-    }
-
-    /// Cap on the number of live per-value host handles an env may hold, derived
-    /// from the memory budget so this bookkeeping (which the byte pools don't
-    /// see) cannot grow the host RSS without bound. `None` under an unlimited
-    /// budget.
-    pub fn value_handle_limit(&self) -> Option<u64> {
-        if self.is_unlimited() {
-            None
-        } else {
-            Some((self.memory_limit() / EST_HOST_BYTES_PER_VALUE).max(1))
-        }
     }
 
     /// Reserve budget for a new V8 env: acquire an isolate slot against
@@ -576,6 +653,135 @@ pub extern "C" fn napi_host_near_heap_limit_grant(
                 current_limit
             }
         }
+    }
+}
+
+/// Charges `bytes` of host bookkeeping for the native bridge (see
+/// [`Pool::HostBookkeeping`]). Nonzero on success.
+///
+/// # Safety
+/// `budget` must be a reference to a [`ResourceBudget`] made by
+/// [`ResourceBudget::bridge_reference`] and not yet released.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_host_bookkeeping_charge(budget: *const c_void, bytes: u64) -> i32 {
+    if budget.is_null() {
+        return 0;
+    }
+    // SAFETY: see the function's safety contract.
+    let budget = unsafe { &*(budget as *const ResourceBudget) };
+    i32::from(budget.try_charge(Pool::HostBookkeeping, bytes).is_ok())
+}
+
+/// Returns `bytes` of host bookkeeping the bridge charged.
+///
+/// # Safety
+/// As [`napi_host_bookkeeping_charge`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_host_bookkeeping_uncharge(budget: *const c_void, bytes: u64) {
+    if budget.is_null() {
+        return;
+    }
+    // SAFETY: see the function's safety contract.
+    let budget = unsafe { &*(budget as *const ResourceBudget) };
+    budget.uncharge(Pool::HostBookkeeping, bytes);
+}
+
+/// Drops the bridge's reference to a budget.
+///
+/// # Safety
+/// `budget` must come from [`ResourceBudget::bridge_reference`], and is
+/// unusable afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_host_budget_release(budget: *const c_void) {
+    if !budget.is_null() {
+        // SAFETY: see the function's safety contract.
+        drop(unsafe { Arc::from_raw(budget as *const ResourceBudget) });
+    }
+}
+
+/// The budget pool a provider charge names (`NapiHostMemory::Pool` in
+/// v8/src/internal/napi_v8_agent.h).
+fn provider_pool(pool: u32) -> Option<Pool> {
+    match pool {
+        0 => Some(Pool::HostBookkeeping),
+        1 => Some(Pool::HostTransient),
+        2 => Some(Pool::SerializedMessage),
+        _ => None,
+    }
+}
+
+/// Charges `bytes` of host memory the provider is about to allocate to
+/// `pool`; a soft charge reaches the accountant's `try_charge_soft`. Nonzero
+/// on success.
+///
+/// # Safety
+/// As [`napi_host_bookkeeping_charge`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_host_memory_charge(
+    budget: *const c_void,
+    pool: u32,
+    bytes: u64,
+    soft: i32,
+) -> i32 {
+    let Some(pool) = provider_pool(pool) else {
+        return 0;
+    };
+    if budget.is_null() {
+        return 0;
+    }
+    // SAFETY: see the function's safety contract.
+    let budget = unsafe { &*(budget as *const ResourceBudget) };
+    let charged = if soft != 0 {
+        budget.try_charge_soft(pool, bytes)
+    } else {
+        budget.try_charge(pool, bytes)
+    };
+    i32::from(charged.is_ok())
+}
+
+/// Returns `bytes` the provider charged to `pool`.
+///
+/// # Safety
+/// As [`napi_host_bookkeeping_charge`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_host_memory_uncharge(budget: *const c_void, pool: u32, bytes: u64) {
+    let Some(pool) = provider_pool(pool) else {
+        return;
+    };
+    if budget.is_null() {
+        return;
+    }
+    // SAFETY: see the function's safety contract.
+    let budget = unsafe { &*(budget as *const ResourceBudget) };
+    budget.uncharge(pool, bytes);
+}
+
+/// Takes one more reference to a budget the bridge holds, which
+/// [`napi_host_budget_release`] returns.
+///
+/// # Safety
+/// `budget` must be a live reference from [`ResourceBudget::bridge_reference`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_host_budget_retain(budget: *const c_void) {
+    if !budget.is_null() {
+        // SAFETY: see the function's safety contract.
+        unsafe { Arc::increment_strong_count(budget as *const ResourceBudget) };
+    }
+}
+
+impl ResourceBudget {
+    /// A reference to `budget` for the native bridge, which returns it with
+    /// [`napi_host_budget_release`] (or the caller with
+    /// [`ResourceBudget::drop_bridge_reference`] if the bridge refused it).
+    pub(crate) fn bridge_reference(budget: &Arc<Self>) -> *const c_void {
+        Arc::into_raw(Arc::clone(budget)) as *const c_void
+    }
+
+    /// Drops a reference from [`ResourceBudget::bridge_reference`] that the
+    /// bridge did not take.
+    pub(crate) fn drop_bridge_reference(reference: *const c_void) {
+        // SAFETY: the bridge did not take it, so it is still the caller's.
+        unsafe { napi_host_budget_release(reference) };
     }
 }
 
@@ -1209,17 +1415,98 @@ mod tests {
     }
 
     #[test]
-    fn value_handle_limit_scales_with_budget() {
-        // Limit = budget / EST_HOST_BYTES_PER_VALUE.
-        let budget = ResourceBudget::with_memory_limit(1000 * EST_HOST_BYTES_PER_VALUE);
-        assert_eq!(budget.value_handle_limit(), Some(1000));
-        // Unlimited budget imposes no cap.
-        assert_eq!(ResourceBudget::unlimited().value_handle_limit(), None);
-        // A tiny budget still allows at least one handle.
-        assert_eq!(
-            ResourceBudget::with_memory_limit(1).value_handle_limit(),
-            Some(1)
-        );
+    fn the_bridge_charges_bookkeeping_through_its_budget_reference() {
+        let budget = ResourceBudget::with_memory_limit(HOST_BOOKKEEPING_CHUNK * 2);
+        let reference = ResourceBudget::bridge_reference(&budget);
+        assert_eq!(Arc::strong_count(&budget), 2);
+        unsafe {
+            assert_eq!(
+                napi_host_bookkeeping_charge(reference, HOST_BOOKKEEPING_CHUNK),
+                1
+            );
+            assert_eq!(
+                napi_host_bookkeeping_charge(reference, HOST_BOOKKEEPING_CHUNK),
+                1
+            );
+            // The budget is spent: the next chunk is refused.
+            assert_eq!(napi_host_bookkeeping_charge(reference, 1), 0);
+            assert_eq!(
+                budget.snapshot().host_bookkeeping,
+                2 * HOST_BOOKKEEPING_CHUNK
+            );
+            napi_host_bookkeeping_uncharge(reference, 2 * HOST_BOOKKEEPING_CHUNK);
+            assert_eq!(napi_host_bookkeeping_charge(std::ptr::null(), 1), 0);
+            napi_host_budget_release(reference);
+        }
+        assert_eq!(budget.memory_charged(), 0);
+        assert_eq!(Arc::strong_count(&budget), 1);
+    }
+
+    #[test]
+    fn soft_charges_reach_the_accountants_soft_path() {
+        #[derive(Default)]
+        struct Accountant {
+            charged: AtomicU64,
+            hard: AtomicUsize,
+            soft: AtomicUsize,
+        }
+        impl NapiMemoryAccountant for Accountant {
+            fn memory_limit(&self) -> u64 {
+                100
+            }
+            fn memory_charged(&self) -> u64 {
+                self.charged.load(Ordering::Acquire)
+            }
+            fn try_charge(&self, bytes: u64) -> bool {
+                self.hard.fetch_add(1, Ordering::AcqRel);
+                self.charged.fetch_add(bytes, Ordering::AcqRel);
+                true
+            }
+            fn try_charge_soft(&self, bytes: u64) -> bool {
+                self.soft.fetch_add(1, Ordering::AcqRel);
+                if self.memory_charged() + bytes > self.memory_limit() {
+                    return false;
+                }
+                self.charged.fetch_add(bytes, Ordering::AcqRel);
+                true
+            }
+            fn uncharge(&self, bytes: u64) {
+                self.charged.fetch_sub(bytes, Ordering::AcqRel);
+            }
+        }
+        let accountant = Arc::new(Accountant::default());
+        let budget = ResourceBudget::with_accountant(accountant.clone());
+        budget.try_charge_soft(Pool::SerializedMessage, 80).unwrap();
+        let refused = budget
+            .try_charge_soft(Pool::SerializedMessage, 40)
+            .unwrap_err();
+        assert_eq!(refused.pool, Pool::SerializedMessage);
+        assert_eq!(accountant.soft.load(Ordering::Acquire), 2);
+        assert_eq!(accountant.hard.load(Ordering::Acquire), 0);
+        assert_eq!(budget.snapshot().serialized_message, 80);
+        budget.uncharge(Pool::SerializedMessage, 80);
+        assert_eq!(accountant.memory_charged(), 0);
+
+        // Without an override the soft path is the hard one.
+        struct HardOnly(AtomicU64);
+        impl NapiMemoryAccountant for HardOnly {
+            fn memory_limit(&self) -> u64 {
+                10
+            }
+            fn memory_charged(&self) -> u64 {
+                self.0.load(Ordering::Acquire)
+            }
+            fn try_charge(&self, bytes: u64) -> bool {
+                bytes <= 10 && self.0.fetch_add(bytes, Ordering::AcqRel) == 0
+            }
+            fn uncharge(&self, bytes: u64) {
+                self.0.fetch_sub(bytes, Ordering::AcqRel);
+            }
+        }
+        let budget = ResourceBudget::with_accountant(Arc::new(HardOnly(AtomicU64::new(0))));
+        assert!(budget.try_charge_soft(Pool::HostTransient, 11).is_err());
+        budget.try_charge_soft(Pool::HostTransient, 10).unwrap();
+        budget.uncharge(Pool::HostTransient, 10);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use wasmer_wasix::WasiError;
 
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv, RequestedHeap,
+    budget::UNCHARGED_HOST_COPY_BYTES,
     guest::{
         MAX_GUEST_CSTRING_SCAN, MAX_NAPI_BIGINT_WORDS, MAX_NAPI_CALLBACK_ARGS,
         callback::{take_pending_guest_exit, with_callback_state},
@@ -222,6 +223,7 @@ fn guest_unofficial_napi_configure_runtime(
     let Some(flags) = abi::read_runtime_options_up_to(&mut env, options_ptr, max_length) else {
         return 1;
     };
+    let (flags, _flags_charge) = flags.into_parts();
     let Ok(flags) = CString::new(flags) else {
         return 1;
     };
@@ -599,11 +601,12 @@ fn guest_unofficial_napi_create_private_symbol(
             read_guest_bytes(&mut env, desc_ptr, wl as usize)
         }
     } else {
-        Some(Vec::new())
+        Some(HostCopy::default())
     };
     let Some(desc) = desc else {
         return 1;
     };
+    let (desc, _desc_charge) = desc.into_parts();
     let desc = BridgeName::new(desc_ptr, wl, desc);
     let mut out = 0u32;
     let status = unsafe {
@@ -730,12 +733,78 @@ fn guest_unofficial_napi_message_create(
         return 1;
     }
     let env_handle = snapi_env(&env, napi_env);
+    // The provider charges the message to the budget before it allocates it;
+    // a message that does not fit is a clone error the sender can catch.
+    // Shared buffers with bytes in this store's guest heap: lease the memory
+    // while the message is queued, and let only a receiver on it take it.
+    let heap = env.data().guest_heap.clone();
+    let (range_begin, range_end) = heap.as_ref().map_or((0, 0), |heap| {
+        let begin = heap.base() as u64;
+        (begin, begin.saturating_add(heap.range_len()))
+    });
     let mut message = 0u32;
-    let status = unsafe { snapi_bridge_unofficial_message_create(env_handle, value, &mut message) };
-    if status == 0 {
-        write_guest_u32(&mut env, payload_out_ptr, message);
+    let mut in_range = 0i32;
+    let status = unsafe {
+        snapi_bridge_unofficial_message_create(
+            env_handle,
+            value,
+            range_begin,
+            range_end,
+            &mut message,
+            &mut in_range,
+        )
+    };
+    if status != 0 {
+        return status;
     }
-    status
+    let memory = match heap.filter(|_| in_range != 0) {
+        None => None,
+        Some(heap) => match message_memory(&mut env, heap) {
+            Some(memory) => Some(memory),
+            None => {
+                unsafe {
+                    snapi_bridge_unofficial_message_drop(message);
+                    snapi_bridge_throw_error(
+                        env_handle,
+                        std::ptr::null(),
+                        c"Data cannot be cloned: its SharedArrayBuffer memory cannot be shared."
+                            .as_ptr(),
+                    );
+                }
+                return 10; // napi_pending_exception
+            }
+        },
+    };
+    let queued = crate::message::QueuedMessage::in_memory(memory);
+    if !env.data().messages.insert(message, queued) {
+        return 9; // the context stopped meanwhile
+    }
+    if !write_guest_u32(&mut env, payload_out_ptr, message) {
+        guest_unofficial_napi_message_drop(env, message);
+        return 1; // napi_invalid_arg
+    }
+    0
+}
+
+/// The lease a queued message holds on `heap`, this store's guest heap, which
+/// its `SharedArrayBuffer`s point into. `None` if the memory is shared but
+/// cannot be detached from the store.
+fn message_memory(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    heap: std::sync::Arc<crate::guest_heap::GuestHeap>,
+) -> Option<crate::message::MessageMemory> {
+    let (state, store) = env.data_and_store_mut();
+    let memory = state.memory.clone()?;
+    if !memory.ty(&store).shared {
+        return Some(crate::message::MessageMemory::Owned {
+            heap: std::sync::Arc::downgrade(&heap),
+        });
+    }
+    let mapping = memory.as_shared(&store)?;
+    Some(crate::message::MessageMemory::Shared {
+        heap,
+        _mapping: mapping,
+    })
 }
 
 fn guest_unofficial_napi_message_take(
@@ -744,14 +813,29 @@ fn guest_unofficial_napi_message_take(
     payload: u32,
     result_out_ptr: u32,
 ) -> i32 {
-    if payload == 0 {
+    // Only a message of this context. The entry, which may lease the memory
+    // the message points into, outlives the provider call below.
+    let Some(queued) = env.data().messages.remove(payload) else {
         return 1;
-    }
+    };
     if result_out_ptr == 0 {
         unsafe { snapi_bridge_unofficial_message_drop(payload) };
         return 1;
     }
     let env_handle = snapi_env(&env, napi_env);
+    if !queued.readable_by(env.data().guest_heap.as_ref()) {
+        // Its SharedArrayBuffers are in a memory this env cannot address. The
+        // message is consumed, as the provider consumes a refused one.
+        unsafe {
+            snapi_bridge_unofficial_message_drop(payload);
+            snapi_bridge_throw_error(
+                env_handle,
+                std::ptr::null(),
+                c"This message's SharedArrayBuffer belongs to another instance's memory.".as_ptr(),
+            );
+        }
+        return 10; // napi_pending_exception
+    }
     let mut value = 0u32;
     let status = unsafe { snapi_bridge_unofficial_message_take(env_handle, payload, &mut value) };
     if status == 0 {
@@ -760,8 +844,11 @@ fn guest_unofficial_napi_message_take(
     status
 }
 
-fn guest_unofficial_napi_message_drop(_env: FunctionEnvMut<NapiEnv>, payload: u32) {
-    unsafe { snapi_bridge_unofficial_message_drop(payload) };
+fn guest_unofficial_napi_message_drop(env: FunctionEnvMut<NapiEnv>, payload: u32) {
+    // Only a message of this context; its entry outlives the provider call.
+    if let Some(_queued) = env.data().messages.remove(payload) {
+        unsafe { snapi_bridge_unofficial_message_drop(payload) };
+    }
 }
 
 fn guest_unofficial_napi_create_trusted_script(
@@ -1719,7 +1806,7 @@ fn guest_unofficial_napi_module_wrap_link(
         };
         ids
     } else {
-        Vec::new()
+        HostCopy::default()
     };
     unsafe {
         snapi_bridge_unofficial_module_wrap_link(
@@ -2779,7 +2866,7 @@ fn guest_napi_has_element(
 /// goes through `read_guest_c_string_max` and a `CString` as before.
 struct GuestName {
     inline: [u8; GUEST_NAME_INLINE],
-    long: Option<CString>,
+    long: Option<Charged<CString>>,
 }
 
 impl GuestName {
@@ -2792,7 +2879,7 @@ impl GuestName {
         };
         if read_guest_name_inline(env, guest_ptr, &mut name.inline).is_none() {
             let bytes = read_guest_c_string_max(env, guest_ptr, V8_MAX_STRING_BYTES)?;
-            name.long = Some(CString::new(bytes).unwrap_or_default());
+            name.long = Some(bytes.map(|bytes| CString::new(bytes).unwrap_or_default()));
         }
         Some(name)
     }
@@ -2923,15 +3010,18 @@ fn guest_napi_throw_error(
     msg_ptr: u32,
 ) -> i32 {
     let code_bytes = if code_ptr != 0 {
-        read_guest_c_string_max(&mut env, code_ptr, V8_MAX_STRING_BYTES)
+        match try_read_guest_c_string_max(&mut env, code_ptr, V8_MAX_STRING_BYTES) {
+            Ok(code) => code,
+            Err(CopyRefused) => return 9,
+        }
     } else {
         None
     };
     let Some(msg_bytes) = read_guest_c_string_max(&mut env, msg_ptr, V8_MAX_STRING_BYTES) else {
         return 1;
     };
-    let c_code = code_bytes.map(|b| CString::new(b).unwrap_or_default());
-    let c_msg = CString::new(msg_bytes).unwrap_or_default();
+    let c_code = code_bytes.map(|b| b.map(|b| CString::new(b).unwrap_or_default()));
+    let c_msg = msg_bytes.map(|b| CString::new(b).unwrap_or_default());
     unsafe {
         snapi_bridge_throw_error(
             snapi_env(&env, e),
@@ -2948,15 +3038,18 @@ fn guest_napi_throw_type_error(
     msg_ptr: u32,
 ) -> i32 {
     let code_bytes = if code_ptr != 0 {
-        read_guest_c_string_max(&mut env, code_ptr, V8_MAX_STRING_BYTES)
+        match try_read_guest_c_string_max(&mut env, code_ptr, V8_MAX_STRING_BYTES) {
+            Ok(code) => code,
+            Err(CopyRefused) => return 9,
+        }
     } else {
         None
     };
     let Some(msg_bytes) = read_guest_c_string_max(&mut env, msg_ptr, V8_MAX_STRING_BYTES) else {
         return 1;
     };
-    let c_code = code_bytes.map(|b| CString::new(b).unwrap_or_default());
-    let c_msg = CString::new(msg_bytes).unwrap_or_default();
+    let c_code = code_bytes.map(|b| b.map(|b| CString::new(b).unwrap_or_default()));
+    let c_msg = msg_bytes.map(|b| CString::new(b).unwrap_or_default());
     unsafe {
         snapi_bridge_throw_type_error(
             snapi_env(&env, e),
@@ -2973,15 +3066,18 @@ fn guest_napi_throw_range_error(
     msg_ptr: u32,
 ) -> i32 {
     let code_bytes = if code_ptr != 0 {
-        read_guest_c_string_max(&mut env, code_ptr, V8_MAX_STRING_BYTES)
+        match try_read_guest_c_string_max(&mut env, code_ptr, V8_MAX_STRING_BYTES) {
+            Ok(code) => code,
+            Err(CopyRefused) => return 9,
+        }
     } else {
         None
     };
     let Some(msg_bytes) = read_guest_c_string_max(&mut env, msg_ptr, V8_MAX_STRING_BYTES) else {
         return 1;
     };
-    let c_code = code_bytes.map(|b| CString::new(b).unwrap_or_default());
-    let c_msg = CString::new(msg_bytes).unwrap_or_default();
+    let c_code = code_bytes.map(|b| b.map(|b| CString::new(b).unwrap_or_default()));
+    let c_msg = msg_bytes.map(|b| CString::new(b).unwrap_or_default());
     unsafe {
         snapi_bridge_throw_range_error(
             snapi_env(&env, e),
@@ -3613,7 +3709,7 @@ fn guest_napi_call_function(
         };
         ids
     } else {
-        vec![]
+        HostCopy::default()
     };
 
     let snapi = snapi_env(&env, e);
@@ -3641,21 +3737,28 @@ fn guest_napi_create_function(
 ) -> i32 {
     // Read function name
     let wl = name_len;
-    let name_bytes: Vec<u8> = if wl == 0xFFFFFFFFu32 {
-        // NAPI_AUTO_LENGTH: read null-terminated string
-        read_guest_c_string_max(&mut env, name_ptr, V8_MAX_STRING_BYTES).unwrap_or_default()
+    let name_bytes: HostCopy = if wl == 0xFFFFFFFFu32 {
+        // NAPI_AUTO_LENGTH: read null-terminated string. A missing one names
+        // the function "", a refused copy fails the call.
+        match try_read_guest_c_string_max(&mut env, name_ptr, V8_MAX_STRING_BYTES) {
+            Ok(name) => name.unwrap_or_default(),
+            Err(CopyRefused) => return 9,
+        }
     } else if wl > 0 && name_ptr != 0 {
         let Some(bytes) = read_guest_bytes(&mut env, name_ptr, wl as usize) else {
             return 1;
         };
         bytes
     } else {
-        vec![]
+        HostCopy::default()
     };
 
     // Allocate a registration ID in the C++ callback registry
     let snapi = snapi_env(&env, e);
     let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
+    if reg_id == 0 {
+        return 9; // the bookkeeping budget refused the registration
+    }
 
     // Register the WASM callback and data pointer in the C++ registry
     unsafe { snapi_bridge_register_callback(snapi, reg_id, e, cb, data as u64) };
@@ -3663,6 +3766,7 @@ fn guest_napi_create_function(
     // Create a JS function in V8 with generic_wasm_callback as its native callback.
     // The reg_id is stored as the function's data pointer so generic_wasm_callback
     // can look up which WASM function to invoke.
+    let (name_bytes, _name_charge) = name_bytes.into_parts();
     let name = BridgeName::new(name_ptr, wl, name_bytes);
     let mut out: u32 = 0;
     let s =
@@ -3794,6 +3898,9 @@ fn guest_napi_get_new_target(
 //   offset 24: napi_property_attributes (4 bytes, enum)
 //   offset 28: void* data               (4 bytes, guest pointer)
 const PROP_DESC_SIZE: usize = 32;
+/// Host bytes the define-properties imports keep per descriptor besides its
+/// name: the descriptor copy and the per-property arrays passed to the bridge.
+const PROP_SCRATCH_BYTES: usize = PROP_DESC_SIZE + 64;
 
 #[allow(clippy::too_many_arguments)]
 fn guest_napi_define_class(
@@ -3809,23 +3916,30 @@ fn guest_napi_define_class(
 ) -> i32 {
     // Read class name
     let wl = name_len;
-    let name_bytes: Vec<u8> = if wl == 0xFFFFFFFFu32 {
-        read_guest_c_string_max(&mut env, name_ptr, V8_MAX_STRING_BYTES).unwrap_or_default()
+    let name_bytes: HostCopy = if wl == 0xFFFFFFFFu32 {
+        match try_read_guest_c_string_max(&mut env, name_ptr, V8_MAX_STRING_BYTES) {
+            Ok(name) => name.unwrap_or_default(),
+            Err(CopyRefused) => return 9,
+        }
     } else if wl > 0 && name_ptr != 0 {
         let Some(bytes) = read_guest_bytes(&mut env, name_ptr, wl as usize) else {
             return 1;
         };
         bytes
     } else {
-        vec![]
+        HostCopy::default()
     };
 
     // Register the constructor callback
     let snapi = snapi_env(&env, e);
     let ctor_reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
+    if ctor_reg_id == 0 {
+        return 9; // the bookkeeping budget refused the registration
+    }
     unsafe { snapi_bridge_register_callback(snapi, ctor_reg_id, e, constructor, ctor_data as u64) };
 
     let pc = prop_count;
+    let (name_bytes, _name_charge) = name_bytes.into_parts();
     let name = BridgeName::new(name_ptr, wl, name_bytes);
 
     if pc == 0 {
@@ -3861,6 +3975,12 @@ fn guest_napi_define_class(
     let Some(raw) = read_guest_bytes(&mut env, props_ptr, total_bytes) else {
         return 1;
     };
+    // The per-property arrays below and every name, however short, stay
+    // charged until the bridge call returns.
+    let mut names_charge = TransientCharge::default();
+    if !names_charge.add(&env.data().budget, pc as usize * PROP_SCRATCH_BYTES) {
+        return 1;
+    }
 
     let mut prop_names_c: Vec<CString> = Vec::with_capacity(pc as usize);
     let mut prop_names_ptrs: Vec<*const std::ffi::c_char> = Vec::with_capacity(pc as usize);
@@ -3913,11 +4033,20 @@ fn guest_napi_define_class(
 
         // Read property name
         let pname = if utf8name_guest != 0 {
-            read_guest_c_string_max(&mut env, utf8name_guest, V8_MAX_STRING_BYTES)
-                .unwrap_or_default()
+            match try_read_guest_c_string_max(&mut env, utf8name_guest, V8_MAX_STRING_BYTES) {
+                Ok(name) => name.unwrap_or_default(),
+                Err(CopyRefused) => return 9,
+            }
         } else {
-            vec![]
+            HostCopy::default()
         };
+        let (pname, pname_charge) = pname.into_parts();
+        names_charge.absorb(pname_charge);
+        if pname.len() < UNCHARGED_HOST_COPY_BYTES
+            && !names_charge.add(&env.data().budget, pname.len() + 1)
+        {
+            return 1;
+        }
         let c_pname = CString::new(pname).unwrap_or_default();
         prop_name_ids.push(name_id);
 
@@ -3925,6 +4054,9 @@ fn guest_napi_define_class(
         if method_ptr != 0 {
             // Method property
             let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
+            if reg_id == 0 {
+                return 9; // the bookkeeping budget refused the registration
+            }
             unsafe {
                 snapi_bridge_register_callback(snapi, reg_id, e, method_ptr, data_ptr as u64)
             };
@@ -3936,6 +4068,9 @@ fn guest_napi_define_class(
         } else if getter_ptr != 0 && setter_ptr != 0 {
             // Getter + Setter
             let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
+            if reg_id == 0 {
+                return 9; // the bookkeeping budget refused the registration
+            }
             unsafe {
                 snapi_bridge_register_callback_pair(
                     snapi,
@@ -3954,6 +4089,9 @@ fn guest_napi_define_class(
         } else if getter_ptr != 0 {
             // Getter only
             let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
+            if reg_id == 0 {
+                return 9; // the bookkeeping budget refused the registration
+            }
             unsafe {
                 snapi_bridge_register_callback(snapi, reg_id, e, getter_ptr, data_ptr as u64)
             };
@@ -3965,6 +4103,9 @@ fn guest_napi_define_class(
         } else if setter_ptr != 0 {
             // Setter only
             let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
+            if reg_id == 0 {
+                return 9; // the bookkeeping budget refused the registration
+            }
             unsafe {
                 snapi_bridge_register_callback(snapi, reg_id, e, setter_ptr, data_ptr as u64)
             };
@@ -4048,6 +4189,12 @@ fn guest_napi_define_properties(
     let Some(raw) = read_guest_bytes(&mut env, props_ptr, total_bytes) else {
         return 1;
     };
+    // The per-property arrays below and every name, however short, stay
+    // charged until the bridge call returns.
+    let mut names_charge = TransientCharge::default();
+    if !names_charge.add(&env.data().budget, pc as usize * PROP_SCRATCH_BYTES) {
+        return 1;
+    }
 
     let mut prop_names_c: Vec<CString> = Vec::with_capacity(pc as usize);
     let mut prop_names_ptrs: Vec<*const std::ffi::c_char> = Vec::with_capacity(pc as usize);
@@ -4099,16 +4246,28 @@ fn guest_napi_define_properties(
         ]);
 
         let pname = if utf8name_guest != 0 {
-            read_guest_c_string_max(&mut env, utf8name_guest, V8_MAX_STRING_BYTES)
-                .unwrap_or_default()
+            match try_read_guest_c_string_max(&mut env, utf8name_guest, V8_MAX_STRING_BYTES) {
+                Ok(name) => name.unwrap_or_default(),
+                Err(CopyRefused) => return 9,
+            }
         } else {
-            vec![]
+            HostCopy::default()
         };
+        let (pname, pname_charge) = pname.into_parts();
+        names_charge.absorb(pname_charge);
+        if pname.len() < UNCHARGED_HOST_COPY_BYTES
+            && !names_charge.add(&env.data().budget, pname.len() + 1)
+        {
+            return 1;
+        }
         let c_pname = CString::new(pname).unwrap_or_default();
         prop_name_ids.push(name_id);
 
         if method_ptr != 0 {
             let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
+            if reg_id == 0 {
+                return 9; // the bookkeeping budget refused the registration
+            }
             unsafe {
                 snapi_bridge_register_callback(snapi, reg_id, e, method_ptr, data_ptr as u64)
             };
@@ -4119,6 +4278,9 @@ fn guest_napi_define_properties(
             prop_setter_reg_ids.push(0);
         } else if getter_ptr != 0 && setter_ptr != 0 {
             let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
+            if reg_id == 0 {
+                return 9; // the bookkeeping budget refused the registration
+            }
             unsafe {
                 snapi_bridge_register_callback_pair(
                     snapi,
@@ -4136,6 +4298,9 @@ fn guest_napi_define_properties(
             prop_setter_reg_ids.push(0);
         } else if getter_ptr != 0 {
             let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
+            if reg_id == 0 {
+                return 9; // the bookkeeping budget refused the registration
+            }
             unsafe {
                 snapi_bridge_register_callback(snapi, reg_id, e, getter_ptr, data_ptr as u64)
             };
@@ -4146,6 +4311,9 @@ fn guest_napi_define_properties(
             prop_setter_reg_ids.push(0);
         } else if setter_ptr != 0 {
             let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
+            if reg_id == 0 {
+                return 9; // the bookkeeping budget refused the registration
+            }
             unsafe {
                 snapi_bridge_register_callback(snapi, reg_id, e, setter_ptr, data_ptr as u64)
             };
@@ -4351,7 +4519,7 @@ fn guest_napi_get_value_bigint_words(
     let Some(wc_bytes) = read_guest_bytes(&mut env, wc_ptr, 4) else {
         return 1;
     };
-    let mut word_count = u32::from_le_bytes(wc_bytes.try_into().unwrap()) as usize;
+    let mut word_count = u32::from_le_bytes(wc_bytes.into_inner().try_into().unwrap()) as usize;
 
     if words_ptr == 0 {
         // Query mode: just get the word count
@@ -4938,6 +5106,10 @@ fn guest_napi_wrap(
         let mut ref_out: u32 = 0;
         let rs = unsafe { snapi_bridge_create_reference(snapi_env(&env, e), obj, 0, &mut ref_out) };
         if rs != 0 {
+            // The wrap fails as a whole: take it off again, so the object
+            // does not keep a pointer the guest was told it never stored.
+            let mut unwrapped: u64 = 0;
+            unsafe { snapi_bridge_remove_wrap(snapi_env(&env, e), obj, &mut unwrapped) };
             return rs;
         }
         write_guest_u32(&mut env, ref_ptr, ref_out);
@@ -5069,7 +5241,7 @@ fn guest_napi_new_instance(
         };
         ids
     } else {
-        vec![]
+        HostCopy::default()
     };
 
     let snapi = snapi_env(&env, e);

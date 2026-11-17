@@ -1095,14 +1095,28 @@ fn guest_unofficial_napi_message_create(
     }
     let env_handle = snapi_env(&env, napi_env);
     let mut payload = 0u32;
+    let mut in_range = 0i32;
     // Sharing serializes the value, as structured_clone does.
     let status = with_cb_context(&mut env, napi_env, || unsafe {
-        snapi_bridge_unofficial_message_create(env_handle, value, &mut payload)
+        snapi_bridge_unofficial_message_create(env_handle, value, 0, 0, &mut payload, &mut in_range)
     });
-    if status == 0 && payload_out_ptr != 0 {
-        write_guest_u32(&mut env, payload_out_ptr, payload);
+    if status != 0 {
+        return status;
     }
-    status
+    // Only this context may take or drop it. Host JavaScript keeps its shared
+    // buffers alive: there is no guest memory to lease.
+    if !env
+        .data()
+        .messages
+        .insert(payload, crate::message::QueuedMessage::default())
+    {
+        return 9;
+    }
+    if !write_guest_u32(&mut env, payload_out_ptr, payload) {
+        guest_unofficial_napi_message_drop(env, payload);
+        return 1; // napi_invalid_arg
+    }
+    0
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -1112,17 +1126,21 @@ async fn guest_unofficial_napi_message_take_async(
     payload: u32,
     result_out_ptr: u32,
 ) -> i32 {
-    if payload == 0 {
+    let (owned, env_handle) = {
+        let env = env.read().await;
+        (
+            env.data().messages.remove(payload),
+            env.data().resolve_napi_env(napi_env),
+        )
+    };
+    // Only a message of this context.
+    let Some(_queued) = owned else {
         return 1;
-    }
+    };
     if result_out_ptr == 0 {
         unsafe { snapi_bridge_unofficial_message_drop(payload) };
         return 1;
     }
-    let env_handle = {
-        let env = env.read().await;
-        env.data().resolve_napi_env(napi_env)
-    };
     let (status, value) = with_callback_state_async(env.as_mut(), env_handle, async move {
         if crate::snapi_js::wait_for_message(payload).await.is_err() {
             unsafe { snapi_bridge_unofficial_message_drop(payload) };
@@ -1149,9 +1167,10 @@ fn guest_unofficial_napi_message_take_sync(
     payload: u32,
     result_out_ptr: u32,
 ) -> i32 {
-    if payload == 0 {
+    // Only a message of this context.
+    let Some(_queued) = env.data().messages.remove(payload) else {
         return 1;
-    }
+    };
     if result_out_ptr == 0 {
         unsafe { snapi_bridge_unofficial_message_drop(payload) };
         return 1;
@@ -1175,8 +1194,11 @@ fn message_take_import(store: &mut impl AsStoreMut, fe: &FunctionEnv<NapiEnv>) -
     Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_take_sync)
 }
 
-fn guest_unofficial_napi_message_drop(_env: FunctionEnvMut<NapiEnv>, payload: u32) {
-    unsafe { snapi_bridge_unofficial_message_drop(payload) };
+fn guest_unofficial_napi_message_drop(env: FunctionEnvMut<NapiEnv>, payload: u32) {
+    // Only a message of this context.
+    if let Some(_queued) = env.data().messages.remove(payload) {
+        unsafe { snapi_bridge_unofficial_message_drop(payload) };
+    }
 }
 
 fn guest_unofficial_napi_create_trusted_script(
@@ -1262,7 +1284,11 @@ fn guest_unofficial_napi_define_lazy_data_properties(
     let env_handle = snapi_env(&env, napi_env);
     with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_define_lazy_data_properties(
-            env_handle, object, names, initializer, attributes,
+            env_handle,
+            object,
+            names,
+            initializer,
+            attributes,
         )
     })
 }

@@ -2,9 +2,132 @@
 // Guest memory helpers
 // ============================================================
 
+use std::{
+    ops::{Deref, DerefMut},
+    sync::Arc,
+};
+
 use wasmer::{AsStoreMut, FunctionEnvMut};
 
-use crate::NapiEnv;
+use crate::{
+    NapiEnv,
+    budget::{Pool, ResourceBudget, UNCHARGED_HOST_COPY_BYTES},
+};
+
+/// Bytes charged to [`Pool::HostTransient`] for host copies of guest memory,
+/// returned when dropped.
+#[derive(Debug, Default)]
+pub struct TransientCharge {
+    budget: Option<Arc<ResourceBudget>>,
+    bytes: u64,
+}
+
+impl TransientCharge {
+    /// Charges `bytes` more to `budget`. False, charging nothing, if the
+    /// budget refused them.
+    pub fn add(&mut self, budget: &Arc<ResourceBudget>, bytes: usize) -> bool {
+        let Ok(bytes) = u64::try_from(bytes) else {
+            return false;
+        };
+        if bytes == 0 {
+            return true;
+        }
+        if budget.try_charge(Pool::HostTransient, bytes).is_err() {
+            return false;
+        }
+        match &self.budget {
+            Some(held) => debug_assert!(Arc::ptr_eq(held, budget)),
+            None => self.budget = Some(Arc::clone(budget)),
+        }
+        self.bytes += bytes;
+        true
+    }
+
+    /// Takes over `other`'s charge.
+    pub fn absorb(&mut self, mut other: TransientCharge) {
+        let Some(budget) = other.budget.take() else {
+            return;
+        };
+        match &self.budget {
+            Some(held) => debug_assert!(Arc::ptr_eq(held, &budget)),
+            None => self.budget = Some(budget),
+        }
+        self.bytes += std::mem::take(&mut other.bytes);
+    }
+
+    /// The charge for a host copy of `bytes` guest bytes: nothing below
+    /// [`UNCHARGED_HOST_COPY_BYTES`]. `None` if the budget refused it.
+    fn for_copy(env: &FunctionEnvMut<NapiEnv>, bytes: usize) -> Option<Self> {
+        let mut charge = Self::default();
+        if bytes >= UNCHARGED_HOST_COPY_BYTES && !charge.add(&env.data().budget, bytes) {
+            return None;
+        }
+        Some(charge)
+    }
+}
+
+impl Drop for TransientCharge {
+    fn drop(&mut self) {
+        if let Some(budget) = &self.budget {
+            budget.uncharge(Pool::HostTransient, self.bytes);
+        }
+    }
+}
+
+/// A value made from guest memory with its [`TransientCharge`]: the bytes
+/// stay charged for as long as the value lives.
+#[derive(Debug, Default)]
+pub struct Charged<T> {
+    // Dropped before `charge`, so the budget never sees bytes that are still
+    // allocated as free.
+    value: T,
+    charge: TransientCharge,
+}
+
+/// A host copy of guest memory, charged while it lives.
+pub type HostCopy<T = u8> = Charged<Vec<T>>;
+
+impl<T> Charged<T> {
+    /// The value made from this one by `f`, keeping the charge: for a copy
+    /// converted in place (a `CString` from its bytes).
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Charged<U> {
+        let (value, charge) = self.into_parts();
+        Charged {
+            value: f(value),
+            charge,
+        }
+    }
+
+    /// The value, dropping its charge: only for copies too small to be
+    /// charged (fixed-size structs).
+    pub fn into_inner(self) -> T {
+        debug_assert_eq!(self.charge.bytes, 0);
+        self.into_parts().0
+    }
+
+    /// The value and its charge, for a caller that must keep the charge for
+    /// as long as it keeps the value in another form.
+    pub fn into_parts(self) -> (T, TransientCharge) {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: both fields are moved out exactly once and `this` is never
+        // used or dropped again.
+        unsafe { (std::ptr::read(&this.value), std::ptr::read(&this.charge)) }
+    }
+}
+
+impl<T> Deref for Charged<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T> DerefMut for Charged<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+}
 
 /// Host address of a non-empty guest range, through the env's guest heap,
 /// which maps the whole memory at a fixed base. `None` (no heap, out of
@@ -122,12 +245,18 @@ pub fn write_guest_u8(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, val: u8
     write_guest_bytes(env, guest_ptr, &[val])
 }
 
-/// A copy of the `len` guest bytes at `src`.
+/// A copy of the `len` guest bytes at `src`, charged to the env's budget.
+/// `None` if the budget refused it.
 ///
 /// # Safety
 /// They must be mapped guest memory.
 #[inline]
-unsafe fn guest_bytes_at(src: *const u8, len: usize) -> Vec<u8> {
+unsafe fn guest_bytes_at(
+    env: &FunctionEnvMut<NapiEnv>,
+    src: *const u8,
+    len: usize,
+) -> Option<HostCopy> {
+    let charge = TransientCharge::for_copy(env, len)?;
     let mut out = Vec::with_capacity(len);
     // SAFETY: as the caller ensures; `out` has `len` bytes of capacity, all
     // written before `set_len`.
@@ -135,32 +264,39 @@ unsafe fn guest_bytes_at(src: *const u8, len: usize) -> Vec<u8> {
         copy_from_guest(src, out.as_mut_ptr(), len);
         out.set_len(len);
     }
-    out
+    Some(Charged { value: out, charge })
 }
 
+/// A charged host copy of `len` guest bytes from `guest_ptr`. `None` if they
+/// are not in guest memory or the budget refused the copy.
 pub fn read_guest_bytes(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: u32,
     len: usize,
-) -> Option<Vec<u8>> {
+) -> Option<HostCopy> {
     if let Some(src) = guest_range(env, guest_ptr, len) {
         // SAFETY: the range is mapped guest memory.
-        return Some(unsafe { guest_bytes_at(src, len) });
+        return unsafe { guest_bytes_at(env, src, len) };
     }
-    let (state, store) = env.data_and_store_mut();
-    let memory = state.memory.clone()?;
-    let view = memory.view(&store);
     // A guest cannot legitimately reference more bytes than its own linear
     // memory holds, so reject a length that exceeds it before allocating. This
     // bounds the host copy to memory the guest was already charged for and
     // stops a bogus guest-supplied length from allocating gigabytes here (the
     // subsequent bounds-checked read would fail, but only after the `vec!`).
-    if len as u64 > view.data_size() {
+    env.data().memory.as_ref()?;
+    if len as u64 > guest_data_size(env) {
         return None;
     }
+    let charge = TransientCharge::for_copy(env, len)?;
     let mut out = vec![0u8; len];
-    view.read(guest_ptr as u64, &mut out).ok()?;
-    Some(out)
+    let (state, store) = env.data_and_store_mut();
+    state
+        .memory
+        .as_ref()?
+        .view(&store)
+        .read(guest_ptr as u64, &mut out)
+        .ok()?;
+    Some(Charged { value: out, charge })
 }
 
 /// Reads a little-endian u32 from guest memory without allocating.
@@ -235,16 +371,23 @@ pub fn read_guest_u32_array(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: u32,
     count: usize,
-) -> Option<Vec<u32>> {
+) -> Option<HostCopy<u32>> {
     // Guard the byte-length multiply against overflow; the read below is then
     // clamped to the guest's memory size by `read_guest_bytes`.
     let byte_len = count.checked_mul(4)?;
-    let bytes = read_guest_bytes(env, guest_ptr, byte_len)?;
+    let (bytes, mut charge) = read_guest_bytes(env, guest_ptr, byte_len)?.into_parts();
+    // The words take as much memory again until the bytes are freed.
+    if byte_len >= UNCHARGED_HOST_COPY_BYTES && !charge.add(&env.data().budget, byte_len) {
+        return None;
+    }
     let mut result = Vec::with_capacity(count);
     for chunk in bytes.chunks_exact(4) {
         result.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
-    Some(result)
+    Some(Charged {
+        value: result,
+        charge,
+    })
 }
 
 /// Length of the bytes before the first NUL among the `len` guest bytes at
@@ -305,7 +448,7 @@ fn c_string_search_len(size: u64, start: u64, max: usize) -> Option<usize> {
 /// argument), without the NUL. `None` if no NUL comes before the end of guest
 /// memory (or within `u32::MAX` bytes, see `c_string_search_len`), or
 /// `guest_ptr` is outside it.
-pub fn read_guest_c_string(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32) -> Option<Vec<u8>> {
+pub fn read_guest_c_string(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32) -> Option<HostCopy> {
     read_guest_c_string_max(env, guest_ptr, usize::MAX)
 }
 
@@ -346,7 +489,25 @@ pub fn read_guest_c_string_max(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: u32,
     max: usize,
-) -> Option<Vec<u8>> {
+) -> Option<HostCopy> {
+    try_read_guest_c_string_max(env, guest_ptr, max)
+        .ok()
+        .flatten()
+}
+
+/// The budget refused a host copy of guest memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CopyRefused;
+
+/// As [`read_guest_c_string_max`], telling a copy the budget refused
+/// (`Err`) from a string that is not there (`Ok(None)`: a bad pointer, no
+/// NUL, or longer than `max`). An import that used to take a missing string
+/// as empty must still fail on a refusal, or it acts on a different string.
+pub fn try_read_guest_c_string_max(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: u32,
+    max: usize,
+) -> Result<Option<HostCopy>, CopyRefused> {
     // Names are short: scan a first chunk in place, which needs no lookup of
     // the memory's size while it lies within the length already seen.
     const CHUNK: usize = 256;
@@ -356,43 +517,62 @@ pub fn read_guest_c_string_max(
         // SAFETY: the chunk is mapped guest memory.
         if let Some(len) = unsafe { guest_nul_offset(src, chunk) } {
             // SAFETY: the string's bytes are in the chunk.
-            return Some(unsafe { guest_bytes_at(src, len) });
+            return unsafe { guest_bytes_at(env, src, len) }
+                .map(Some)
+                .ok_or(CopyRefused);
         }
         scanned = chunk;
     }
     // A longer string (script sources can reach megabytes), or one that starts
     // within a chunk of the memory's end: the rest of the memory, in place.
     let start = u64::from(guest_ptr);
-    let search = c_string_search_len(guest_data_size(env), start, max)?;
+    let Some(search) = c_string_search_len(guest_data_size(env), start, max) else {
+        return Ok(None);
+    };
     if let Some(src) = guest_range(env, guest_ptr, search) {
         // The chunk lay within the memory and `max + 1` bytes, so within
         // `search`. That length comes from this env's view, the chunk's from
         // the heap: check anyway.
-        let tail = search.checked_sub(scanned)?;
+        let Some(tail) = search.checked_sub(scanned) else {
+            return Ok(None);
+        };
         // SAFETY: the range is mapped guest memory, and `scanned` <= `search`.
-        let len = scanned + unsafe { guest_nul_offset(src.add(scanned), tail) }?;
+        let Some(nul) = (unsafe { guest_nul_offset(src.add(scanned), tail) }) else {
+            return Ok(None);
+        };
+        let len = scanned + nul;
         // SAFETY: the string's bytes are in the range.
-        return Some(unsafe { guest_bytes_at(src, len) });
+        return unsafe { guest_bytes_at(env, src, len) }
+            .map(Some)
+            .ok_or(CopyRefused);
     }
     // No guest heap: through the `MemoryView`. Find the NUL a block at a
     // time, then read the string once.
     let (state, store) = env.data_and_store_mut();
-    let memory = state.memory.clone()?;
+    let Some(memory) = state.memory.clone() else {
+        return Ok(None);
+    };
     let view = memory.view(&store);
     let end = start + search as u64;
     let mut block = [0u8; 4096];
     let mut offset = start;
     while offset < end {
         let len = (end - offset).min(block.len() as u64) as usize;
-        view.read(offset, &mut block[..len]).ok()?;
+        if view.read(offset, &mut block[..len]).is_err() {
+            return Ok(None);
+        }
         if let Some(nul) = block[..len].iter().position(|&byte| byte == 0) {
-            let mut out = vec![0u8; usize::try_from(offset - start).ok()? + nul];
-            view.read(start, &mut out).ok()?;
-            return Some(out);
+            let Ok(prefix) = usize::try_from(offset - start) else {
+                return Ok(None);
+            };
+            // The bytes were just read, so only the budget can refuse them.
+            return read_guest_bytes(env, guest_ptr, prefix + nul)
+                .map(Some)
+                .ok_or(CopyRefused);
         }
         offset += len as u64;
     }
-    None
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -569,18 +749,19 @@ mod tests {
                 put(&mut env, 4096, &with_nul(max));
                 let case = format!("{path}, max {max}");
                 assert_eq!(
-                    read_guest_c_string_max(&mut env, 4096, max),
+                    read_guest_c_string_max(&mut env, 4096, max).map(|copy| copy.into_parts().0),
                     Some(text(max)),
                     "{case}"
                 );
                 put(&mut env, 4096, &with_nul(max + 1));
                 assert_eq!(
-                    read_guest_c_string_max(&mut env, 4096, max),
+                    read_guest_c_string_max(&mut env, 4096, max).map(|copy| copy.into_parts().0),
                     None,
                     "{case}, one more"
                 );
                 assert_eq!(
-                    read_guest_c_string_max(&mut env, 4096, usize::MAX),
+                    read_guest_c_string_max(&mut env, 4096, usize::MAX)
+                        .map(|copy| copy.into_parts().0),
                     Some(text(max + 1))
                 );
                 // The NUL is the memory's last byte.
@@ -588,31 +769,34 @@ mod tests {
                 put(&mut env, at_end, &with_nul(max));
                 let case = format!("{path}, max {max}, ending at the end");
                 assert_eq!(
-                    read_guest_c_string_max(&mut env, at_end, max),
+                    read_guest_c_string_max(&mut env, at_end, max).map(|copy| copy.into_parts().0),
                     Some(text(max)),
                     "{case}"
                 );
                 let one_more = size - max_u32 - 2;
                 put(&mut env, one_more, &with_nul(max + 1));
                 assert_eq!(
-                    read_guest_c_string_max(&mut env, one_more, max),
+                    read_guest_c_string_max(&mut env, one_more, max)
+                        .map(|copy| copy.into_parts().0),
                     None,
                     "{case}, one more"
                 );
                 assert_eq!(
-                    read_guest_c_string_max(&mut env, one_more, usize::MAX),
+                    read_guest_c_string_max(&mut env, one_more, usize::MAX)
+                        .map(|copy| copy.into_parts().0),
                     Some(text(max + 1))
                 );
                 // `max + 1` bytes up to the end and no NUL.
                 put(&mut env, at_end, &text(max + 1));
                 let case = format!("{path}, max {max}, unterminated");
                 assert_eq!(
-                    read_guest_c_string_max(&mut env, at_end, max),
+                    read_guest_c_string_max(&mut env, at_end, max).map(|copy| copy.into_parts().0),
                     None,
                     "{case}"
                 );
                 assert_eq!(
-                    read_guest_c_string_max(&mut env, at_end, usize::MAX),
+                    read_guest_c_string_max(&mut env, at_end, usize::MAX)
+                        .map(|copy| copy.into_parts().0),
                     None,
                     "{case}"
                 );
@@ -681,7 +865,8 @@ mod tests {
                     assert_eq!(read, None, "length {len}, heap {inline}");
                 }
                 assert_eq!(
-                    read_guest_c_string_max(&mut env, 4096, V8_MAX_STRING_BYTES),
+                    read_guest_c_string_max(&mut env, 4096, V8_MAX_STRING_BYTES)
+                        .map(|copy| copy.into_parts().0),
                     Some(name),
                     "length {len}"
                 );
@@ -700,7 +885,8 @@ mod tests {
                 None
             );
             assert_eq!(
-                read_guest_c_string_max(&mut env, size - window + 1, V8_MAX_STRING_BYTES),
+                read_guest_c_string_max(&mut env, size - window + 1, V8_MAX_STRING_BYTES)
+                    .map(|copy| copy.into_parts().0),
                 Some(b"past".to_vec())
             );
             assert_eq!(read_guest_name_inline(&mut env, size, &mut out), None);
