@@ -567,29 +567,6 @@ extern "C"
         return napi_ok;
     }
 
-    // QuickJS has no generational heap limit to overshoot.
-    napi_status NAPI_CDECL unofficial_napi_get_heap_usage(
-        napi_env env,
-        unofficial_napi_heap_usage *result)
-    {
-        (void)env;
-        if (result == nullptr)
-            return napi_invalid_arg;
-        *result = {};
-        return napi_ok;
-    }
-
-    napi_status NAPI_CDECL unofficial_napi_collect_garbage_if_over_heap_limit(
-        napi_env env,
-        size_t /*old_generation_limit*/,
-        bool *collected)
-    {
-        if (env == nullptr || collected == nullptr)
-            return napi_invalid_arg;
-        *collected = false;
-        return napi_ok;
-    }
-
     napi_status NAPI_CDECL unofficial_napi_configure_near_heap_limit_callback(
         napi_env env,
         unofficial_napi_near_heap_limit_callback callback_or_null,
@@ -875,20 +852,6 @@ extern "C"
     void NAPI_CDECL unofficial_napi_message_drop(unofficial_napi_message message)
     {
         napi_serdes__::release_serialized_value(reinterpret_cast<void *>(message));
-    }
-
-    // QuickJS SharedArrayBuffers are refcounted host memory the payload
-    // keeps alive, never a guest's memory.
-    napi_status NAPI_CDECL unofficial_napi_message_shares_range(
-        unofficial_napi_message message,
-        uintptr_t /*begin*/,
-        uintptr_t /*end*/,
-        bool *result)
-    {
-        if (message == nullptr || result == nullptr)
-            return napi_invalid_arg;
-        *result = false;
-        return napi_ok;
     }
 
     napi_status NAPI_CDECL unofficial_napi_get_own_non_index_properties(

@@ -1799,7 +1799,7 @@ bool SetConstructorFunction(v8::Local<v8::Context> context,
 
 class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Delegate {
  public:
-  // `charge` (may be null) pays for the serializer's buffer as it grows.
+  // `charge` (may be null) pays for the buffer and side tables as they grow.
   explicit StructuredCloneSerializerDelegate(v8::Isolate* isolate,
                                              NapiHostCharge* charge = nullptr)
       : isolate_(isolate), charge_(charge) {}
@@ -1839,6 +1839,7 @@ class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Dele
         return v8::Just(i);
       }
     }
+    if (!ReserveSideTableSlot(shared_array_buffers_)) return v8::Nothing<uint32_t>();
     shared_array_buffers_.push_back(std::move(backing_store));
     return v8::Just(static_cast<uint32_t>(shared_array_buffers_.size() - 1));
   }
@@ -1846,6 +1847,7 @@ class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Dele
   v8::Maybe<uint32_t> GetWasmModuleTransferId(
       v8::Isolate* /*isolate*/,
       v8::Local<v8::WasmModuleObject> module) override {
+    if (!ReserveSideTableSlot(wasm_modules_)) return v8::Nothing<uint32_t>();
     wasm_modules_.push_back(module->GetCompiledModule());
     return v8::Just(static_cast<uint32_t>(wasm_modules_.size() - 1));
   }
@@ -1858,11 +1860,40 @@ class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Dele
     return wasm_modules_;
   }
 
+  std::vector<std::shared_ptr<v8::BackingStore>> TakeSharedArrayBuffers() {
+    return std::move(shared_array_buffers_);
+  }
+
   std::vector<v8::CompiledWasmModule> TakeWasmModules() {
     return std::move(wasm_modules_);
   }
 
  private:
+  template <typename Entry>
+  bool ReserveSideTableSlot(std::vector<Entry>& table) {
+    const size_t old_capacity = table.capacity();
+    if (table.size() < old_capacity) return true;
+    const size_t max_capacity = std::min<size_t>(table.max_size(), UINT32_MAX);
+    if (old_capacity < max_capacity) {
+      const size_t new_capacity =
+          old_capacity == 0 ? 1 : old_capacity + std::min(old_capacity, max_capacity - old_capacity);
+      const size_t new_bytes = new_capacity * sizeof(Entry);
+      // The old storage remains live until reserve finishes moving its entries.
+      if (charge_ == nullptr || charge_->Grow(new_bytes, /*soft=*/true)) {
+        try {
+          table.reserve(new_capacity);
+          if (charge_ != nullptr) charge_->Shrink(old_capacity * sizeof(Entry));
+          return true;
+        } catch (const std::bad_alloc&) {
+          if (charge_ != nullptr) charge_->Shrink(new_bytes);
+        }
+      }
+    }
+    ThrowDataCloneError(v8::String::NewFromUtf8Literal(
+        isolate_, "Data cannot be cloned, out of memory."));
+    return false;
+  }
+
   v8::Isolate* isolate_ = nullptr;
   NapiHostCharge* charge_ = nullptr;
   size_t buffer_bytes_ = 0;
@@ -2206,6 +2237,25 @@ void NapiV8DetachEnvOwner(unofficial_napi_env_owner owner) {
   reinterpret_cast<UnofficialEnvScope*>(owner)->isolate_scope.reset();
 }
 
+napi_status NapiV8MessageSharesRange(unofficial_napi_message message,
+                                     uintptr_t begin,
+                                     uintptr_t end,
+                                     bool* result) {
+  if (message == nullptr || result == nullptr) return napi_invalid_arg;
+  const auto* payload = reinterpret_cast<const SerializedClonePayload*>(message);
+  *result = false;
+  for (const std::shared_ptr<v8::BackingStore>& store : payload->shared_array_buffers) {
+    if (store == nullptr || store->Data() == nullptr || store->ByteLength() == 0) continue;
+    const uintptr_t first = reinterpret_cast<uintptr_t>(store->Data());
+    const uintptr_t last = first + store->ByteLength();
+    if (first < end && begin < last) {
+      *result = true;
+      break;
+    }
+  }
+  return napi_ok;
+}
+
 extern "C" {
 
 napi_status NAPI_CDECL unofficial_napi_configure_runtime(
@@ -2355,6 +2405,8 @@ napi_status NAPI_CDECL unofficial_napi_configure_near_heap_limit_callback(
   return napi_ok;
 }
 
+}  // extern "C"
+
 namespace {
 
 struct HeapSpaces {
@@ -2417,8 +2469,7 @@ size_t SpaceSize(v8::Isolate* isolate, size_t index) {
 // Reading space statistics neither allocates nor collects, so this is safe
 // inside a near-heap-limit callback. The committed figure bounds V8's
 // capacity from above, so a limit raised to cover it satisfies V8.
-napi_status NAPI_CDECL unofficial_napi_get_heap_usage(napi_env env,
-                                                      unofficial_napi_heap_usage* result) {
+napi_status NapiV8GetHeapUsage(napi_env env, NapiV8HeapUsage* result) {
   if (result == nullptr) return napi_invalid_arg;
   *result = {};
   v8::Isolate* isolate =
@@ -2439,7 +2490,7 @@ napi_status NAPI_CDECL unofficial_napi_get_heap_usage(napi_env env,
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_collect_garbage_if_over_heap_limit(
+napi_status NapiV8CollectGarbageIfOverHeapLimit(
     napi_env env, size_t old_generation_limit, bool* collected) {
   if (env == nullptr || env->isolate == nullptr || collected == nullptr) {
     return napi_invalid_arg;
@@ -2477,6 +2528,31 @@ napi_status NAPI_CDECL unofficial_napi_collect_garbage_if_over_heap_limit(
   *collected = true;
   return napi_ok;
 }
+
+// This part of cancellation neither enters JavaScript nor calls the waker.
+napi_status NapiV8ClearTermination(napi_env env) {
+  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  if (env->agent != nullptr) {
+    env->agent->termination_requested.store(false, std::memory_order_release);
+  }
+  env->isolate->CancelTerminateExecution();
+  // Drop the termination sentinel so a later call cannot throw it as null.
+  napi_v8_drop_pending_termination(env);
+  return napi_ok;
+}
+
+void NapiV8WakeAfterTermination(napi_env env) {
+  // Checkpoints refused during termination left work queued. Wake the host
+  // again so it can take the checkpoint that runs it.
+  EdgeV8Platform* platform = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    platform = g_runtime.platform.get();
+  }
+  if (platform != nullptr) platform->WakeForQueuedForegroundTasks(env->isolate);
+}
+
+extern "C" {
 
 napi_status NAPI_CDECL unofficial_napi_wrap_existing_value(napi_env env,
                                                            v8::Local<v8::Value> value,
@@ -2893,26 +2969,9 @@ napi_status NAPI_CDECL unofficial_napi_terminate_execution(napi_env env) {
 }
 
 napi_status NAPI_CDECL unofficial_napi_cancel_terminate_execution(napi_env env) {
-  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
-  if (env->agent != nullptr) {
-    env->agent->termination_requested.store(false, std::memory_order_release);
-  }
-  env->isolate->CancelTerminateExecution();
-  // A call the termination failed left its null pending. Nothing threw it:
-  // left there, the native function that cancels would throw it into its
-  // caller as a catchable null.
-  napi_v8_drop_pending_termination(env);
-  // The checkpoints the termination refused ran none of the tasks V8 queued
-  // for them, and the host's foreground task waker was called only when each
-  // was posted: call it again, so that a host that sleeps until it is woken
-  // takes the checkpoint that runs them now.
-  EdgeV8Platform* platform = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_runtime_mu);
-    platform = g_runtime.platform.get();
-  }
-  if (platform != nullptr) platform->WakeForQueuedForegroundTasks(env->isolate);
-  return napi_ok;
+  const napi_status status = NapiV8ClearTermination(env);
+  if (status == napi_ok) NapiV8WakeAfterTermination(env);
+  return status;
 }
 
 napi_status NAPI_CDECL unofficial_napi_request_interrupt(
@@ -3015,22 +3074,17 @@ napi_status NAPI_CDECL unofficial_napi_message_create(
   std::pair<uint8_t*, size_t> released = serializer.Release();
   if (released.first == nullptr) return napi_generic_failure;
   std::unique_ptr<uint8_t, FreeDeleter> data(released.first);
-  std::vector<std::shared_ptr<v8::BackingStore>> shared_array_buffers =
-      serializer_delegate.shared_array_buffers();
-  std::vector<v8::CompiledWasmModule> wasm_modules = serializer_delegate.TakeWasmModules();
-  // The payload itself and its side tables; the buffer is already charged.
-  const uint64_t overhead =
-      sizeof(SerializedClonePayload) +
-      shared_array_buffers.capacity() * sizeof(std::shared_ptr<v8::BackingStore>) +
-      wasm_modules.capacity() * sizeof(v8::CompiledWasmModule);
-  if (!charge.Grow(overhead, /*soft=*/true)) return ThrowCloneOutOfMemory(env, try_catch);
+  // The serializer already charged the buffer and side tables.
+  if (!charge.Grow(sizeof(SerializedClonePayload), /*soft=*/true)) {
+    return ThrowCloneOutOfMemory(env, try_catch);
+  }
   auto* payload = new (std::nothrow) SerializedClonePayload();
   if (payload == nullptr) return napi_generic_failure;
   payload->charge = std::move(charge);
   payload->data = std::move(data);
   payload->size = released.second;
-  payload->shared_array_buffers = std::move(shared_array_buffers);
-  payload->wasm_modules = std::move(wasm_modules);
+  payload->shared_array_buffers = serializer_delegate.TakeSharedArrayBuffers();
+  payload->wasm_modules = serializer_delegate.TakeWasmModules();
   payload->sender_allows_webassembly = EnvAllowsWebAssembly(env);
   payload->sender_lane = EnvLaneId(env);
   *message_out = reinterpret_cast<unofficial_napi_message>(payload);
@@ -3077,26 +3131,6 @@ napi_status NAPI_CDECL unofficial_napi_message_take(
 
 void NAPI_CDECL unofficial_napi_message_drop(unofficial_napi_message message) {
   delete reinterpret_cast<SerializedClonePayload*>(message);
-}
-
-napi_status NAPI_CDECL unofficial_napi_message_shares_range(
-    unofficial_napi_message message,
-    uintptr_t begin,
-    uintptr_t end,
-    bool* result) {
-  if (message == nullptr || result == nullptr) return napi_invalid_arg;
-  const auto* payload = reinterpret_cast<const SerializedClonePayload*>(message);
-  *result = false;
-  for (const std::shared_ptr<v8::BackingStore>& store : payload->shared_array_buffers) {
-    if (store == nullptr || store->Data() == nullptr || store->ByteLength() == 0) continue;
-    const uintptr_t first = reinterpret_cast<uintptr_t>(store->Data());
-    const uintptr_t last = first + store->ByteLength();
-    if (first < end && begin < last) {
-      *result = true;
-      break;
-    }
-  }
-  return napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_create_trusted_script(

@@ -778,7 +778,10 @@ fn guest_unofficial_napi_message_create(
     if !env.data().messages.insert(message, queued) {
         return 9; // the context stopped meanwhile
     }
-    write_guest_u32(&mut env, payload_out_ptr, message);
+    if !write_guest_u32(&mut env, payload_out_ptr, message) {
+        guest_unofficial_napi_message_drop(env, message);
+        return 1; // napi_invalid_arg
+    }
     0
 }
 

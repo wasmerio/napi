@@ -3725,8 +3725,8 @@ void ReconcileHeapLease(SnapiAgentState& agent, napi_env env) {
   agent.heap_lease_pending = false;
   if (agent.heap_tracker == nullptr || env == nullptr) return;
   if (napi_host_heap_lease_pending(agent.heap_tracker) == 0) return;
-  unofficial_napi_heap_usage usage{};
-  if (unofficial_napi_get_heap_usage(env, &usage) != napi_ok) return;
+  NapiV8HeapUsage usage{};
+  if (NapiV8GetHeapUsage(env, &usage) != napi_ok) return;
   size_t limit = 0;
   if (napi_host_heap_reconcile(agent.heap_tracker, usage.committed_old_generation,
                                usage.young_large_objects, usage.used, &limit) == 0) {
@@ -3756,8 +3756,8 @@ size_t HostNearHeapLimitTrampoline(napi_env env, void* data,
                                    size_t initial_limit) {
   auto* agent = static_cast<SnapiAgentState*>(data);
   if (agent == nullptr || agent->heap_tracker == nullptr) return current_limit;
-  unofficial_napi_heap_usage usage{};
-  if (unofficial_napi_get_heap_usage(env, &usage) != napi_ok) usage = {};
+  NapiV8HeapUsage usage{};
+  if (NapiV8GetHeapUsage(env, &usage) != napi_ok) usage = {};
   int32_t reconcile = 0;
   const size_t answer = napi_host_near_heap_limit_grant(
       agent->heap_tracker, current_limit, initial_limit, usage.committed_old_generation,
@@ -3786,7 +3786,7 @@ extern "C" int snapi_bridge_unofficial_settle_heap(SnapiEnvState* env_state) {
   if (state == nullptr || state->agent->heap_tracker == nullptr) return 0;
   ReconcileHeapLease(*state->agent, state->env);
   bool collected = false;
-  const napi_status status = unofficial_napi_collect_garbage_if_over_heap_limit(
+  const napi_status status = NapiV8CollectGarbageIfOverHeapLimit(
       state->env, static_cast<size_t>(napi_host_heap_old_limit(state->agent->heap_tracker)),
       &collected);
   return status == napi_ok && collected ? 1 : 0;
@@ -4131,12 +4131,15 @@ extern "C" int snapi_bridge_unofficial_cancel_terminate_execution(
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   {
-    // A host stop is not the guest's to cancel, also when it lands between
-    // the caller's own check and this call.
+    // Check the sticky stop and clear V8's termination under the same lock
+    // used by the host stop. The waker can re-enter the bridge.
     std::lock_guard<std::mutex> lock(g_mu);
     if (bridge_state->agent->stop_requested) return napi_generic_failure;
+    const napi_status status = NapiV8ClearTermination(env);
+    if (status != napi_ok) return status;
   }
-  return unofficial_napi_cancel_terminate_execution(env);
+  NapiV8WakeAfterTermination(env);
+  return napi_ok;
 }
 
 extern "C" int snapi_bridge_unofficial_request_interrupt(SnapiEnvState* env_state,
@@ -4563,9 +4566,8 @@ extern "C" int snapi_bridge_unofficial_message_create(
   if (status != napi_ok) return status;
   bool in_range = false;
   if (range_begin < range_end &&
-      unofficial_napi_message_shares_range(message, static_cast<uintptr_t>(range_begin),
-                                           static_cast<uintptr_t>(range_end),
-                                           &in_range) != napi_ok) {
+      NapiV8MessageSharesRange(message, static_cast<uintptr_t>(range_begin),
+                               static_cast<uintptr_t>(range_end), &in_range) != napi_ok) {
     unofficial_napi_message_drop(message);
     return napi_generic_failure;
   }
