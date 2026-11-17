@@ -392,6 +392,22 @@ pub fn write_guest_number_value(
     wasmer_napi_guest_write_number(&memory, value, guest_ptr, kind as u32)
 }
 
+/// The host-JavaScript build does not charge host copies: a copy is a plain
+/// `Vec`. Shared code (`abi.rs`) names it as the native build does.
+pub type HostCopy<T = u8> = Vec<T>;
+
+/// [`HostCopy`]'s native API, for the shared code.
+pub trait HostCopyExt<T> {
+    /// The copy itself.
+    fn into_inner(self) -> Vec<T>;
+}
+
+impl<T> HostCopyExt<T> for Vec<T> {
+    fn into_inner(self) -> Vec<T> {
+        self
+    }
+}
+
 pub fn read_guest_bytes(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: u32,

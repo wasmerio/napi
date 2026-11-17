@@ -1706,8 +1706,25 @@ bool SetConstructorFunction(v8::Local<v8::Context> context,
 
 class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Delegate {
  public:
-  explicit StructuredCloneSerializerDelegate(v8::Isolate* isolate)
-      : isolate_(isolate) {}
+  explicit StructuredCloneSerializerDelegate(
+      v8::Isolate* isolate,
+      size_t max_buffer_bytes = std::numeric_limits<size_t>::max())
+      : isolate_(isolate), max_buffer_bytes_(max_buffer_bytes) {}
+
+  // The serializer's buffer, released to the caller with
+  // ValueSerializer::Release and freed with std::free like the default. A
+  // growth past max_buffer_bytes_ fails, which the serializer reports as its
+  // out-of-memory clone error.
+  void* ReallocateBufferMemory(void* old_buffer,
+                               size_t size,
+                               size_t* actual_size) override {
+    if (size > max_buffer_bytes_) return nullptr;
+    void* buffer = std::realloc(old_buffer, size);
+    if (buffer != nullptr) *actual_size = size;
+    return buffer;
+  }
+
+  void FreeBufferMemory(void* buffer) override { std::free(buffer); }
 
   void ThrowDataCloneError(v8::Local<v8::String> message) override {
     isolate_->ThrowException(v8::Exception::Error(message));
@@ -1748,6 +1765,7 @@ class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Dele
 
  private:
   v8::Isolate* isolate_ = nullptr;
+  size_t max_buffer_bytes_;
   std::vector<std::shared_ptr<v8::BackingStore>> shared_array_buffers_;
   std::vector<v8::CompiledWasmModule> wasm_modules_;
 };
@@ -2667,10 +2685,13 @@ napi_status NAPI_CDECL unofficial_napi_structured_clone(
   return StructuredCloneImpl(env, value, transfer_list_or_null, result_out);
 }
 
-napi_status NAPI_CDECL unofficial_napi_message_create(
-    napi_env env,
-    napi_value value,
-    unofficial_napi_message* message_out) {
+namespace {
+
+napi_status MessageCreateImpl(napi_env env,
+                              napi_value value,
+                              size_t max_bytes,
+                              unofficial_napi_message* message_out,
+                              size_t* retained_bytes_out) {
   if (env == nullptr || env->isolate == nullptr || value == nullptr || message_out == nullptr) {
     return napi_invalid_arg;
   }
@@ -2683,11 +2704,18 @@ napi_status NAPI_CDECL unofficial_napi_message_create(
   v8::Context::Scope context_scope(context);
 
   v8::Local<v8::Value> input = napi_v8_unwrap_value(value);
-  StructuredCloneSerializerDelegate serializer_delegate(isolate);
+  StructuredCloneSerializerDelegate serializer_delegate(isolate, max_bytes);
   v8::ValueSerializer serializer(isolate, &serializer_delegate);
 
+  // A clone error (an uncloneable value, or a message over max_bytes) is the
+  // env's last exception, as N-API reports exceptions; a termination stays
+  // with V8.
+  v8::TryCatch try_catch(isolate);
   serializer.WriteHeader();
   if (serializer.WriteValue(context, input).IsNothing()) {
+    if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
+      napi_v8_set_last_exception(env, try_catch.Exception(), try_catch.Message());
+    }
     return napi_pending_exception;
   }
 
@@ -2705,8 +2733,36 @@ napi_status NAPI_CDECL unofficial_napi_message_create(
   payload->wasm_modules = serializer_delegate.TakeWasmModules();
   payload->sender_allows_webassembly = EnvAllowsWebAssembly(env);
   payload->sender_lane = EnvLaneId(env);
+  if (retained_bytes_out != nullptr) {
+    *retained_bytes_out =
+        sizeof(SerializedClonePayload) + payload->bytes.capacity() +
+        payload->shared_array_buffers.capacity() *
+            sizeof(std::shared_ptr<v8::BackingStore>) +
+        payload->wasm_modules.capacity() * sizeof(v8::CompiledWasmModule);
+  }
   *message_out = reinterpret_cast<unofficial_napi_message>(payload);
   return napi_ok;
+}
+
+}  // namespace
+
+napi_status NAPI_CDECL unofficial_napi_message_create(
+    napi_env env,
+    napi_value value,
+    unofficial_napi_message* message_out) {
+  return MessageCreateImpl(env, value, std::numeric_limits<size_t>::max(),
+                           message_out, nullptr);
+}
+
+napi_status NAPI_CDECL unofficial_napi_message_create_bounded(
+    napi_env env,
+    napi_value value,
+    size_t max_bytes,
+    unofficial_napi_message* message_out,
+    size_t* retained_bytes_out) {
+  if (retained_bytes_out == nullptr) return napi_invalid_arg;
+  *retained_bytes_out = 0;
+  return MessageCreateImpl(env, value, max_bytes, message_out, retained_bytes_out);
 }
 
 napi_status NAPI_CDECL unofficial_napi_message_take(

@@ -2,7 +2,9 @@ use wasmer::FunctionEnvMut;
 
 use crate::NapiEnv;
 
-use super::util::read_guest_bytes;
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
+use super::util::HostCopyExt;
+use super::util::{HostCopy, read_guest_bytes};
 
 #[repr(C)]
 struct Wasm32VersionedHeader {
@@ -176,7 +178,7 @@ fn read_versioned(
     if guest_ptr == 0 {
         return None;
     }
-    let bytes = read_guest_bytes(env, guest_ptr, prefix_size)?;
+    let bytes = read_guest_bytes(env, guest_ptr, prefix_size)?.into_inner();
     if u32_at(&bytes, std::mem::offset_of!(Wasm32VersionedHeader, size))? < prefix_size as u32
         || u32_at(&bytes, std::mem::offset_of!(Wasm32VersionedHeader, version))? != version
     {
@@ -205,7 +207,10 @@ fn read_grown(
     if size < prefix_size as u32 {
         return None;
     }
-    Some((version, read_guest_bytes(env, guest_ptr, prefix_size)?))
+    Some((
+        version,
+        read_guest_bytes(env, guest_ptr, prefix_size)?.into_inner(),
+    ))
 }
 
 pub(crate) fn read_output_header(
@@ -233,7 +238,7 @@ pub(crate) struct EnvCreate {
 pub(crate) fn read_runtime_options(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: u32,
-) -> Option<Vec<u8>> {
+) -> Option<HostCopy> {
     read_runtime_options_up_to(env, guest_ptr, usize::MAX)
 }
 
@@ -243,9 +248,9 @@ pub(crate) fn read_runtime_options_up_to(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_ptr: u32,
     max_length: usize,
-) -> Option<Vec<u8>> {
+) -> Option<HostCopy> {
     if guest_ptr == 0 {
-        return Some(Vec::new());
+        return Some(HostCopy::default());
     }
     let bytes = read_versioned(env, guest_ptr, RUNTIME_OPTIONS_SIZE, 1)?;
     let flags_ptr = u32_at(
@@ -257,7 +262,7 @@ pub(crate) fn read_runtime_options_up_to(
         std::mem::offset_of!(Wasm32RuntimeOptionsV1, engine_flags_length),
     )? as usize;
     if flags_length == 0 {
-        return Some(Vec::new());
+        return Some(HostCopy::default());
     }
     if flags_ptr == 0 || flags_length > max_length {
         return None;
@@ -351,7 +356,7 @@ pub(crate) struct BytecodeOpen {
     pub host_defined_option_id: u32,
     pub line_offset: i32,
     pub column_offset: i32,
-    pub cache: Vec<u8>,
+    pub cache: HostCopy,
     pub has_cache: u8,
     pub cache_policy: u8,
 }
@@ -384,7 +389,7 @@ pub(crate) fn read_bytecode_open(
         }
         read_guest_bytes(env, cache_ptr, cache_length)?
     } else {
-        Vec::new()
+        HostCopy::default()
     };
     Some(BytecodeOpen {
         version,

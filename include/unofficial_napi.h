@@ -841,6 +841,18 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_message_take(
 
 NAPI_EXTENSION_WASMER_EXTERN void unofficial_napi_message_drop(unofficial_napi_message message);
 
+// As unofficial_napi_message_create, for an embedder that charges messages to
+// a memory budget. The serialized form may grow to about `max_bytes`; a
+// larger value fails with the engine's out-of-memory clone error pending
+// (napi_pending_exception). On success `*retained_bytes_out` receives the
+// host memory the message holds until it is taken or dropped.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_message_create_bounded(
+    napi_env env,
+    napi_value value,
+    size_t max_bytes,
+    unofficial_napi_message* message_out,
+    size_t* retained_bytes_out);
+
 // Returns own property keys while filtering indexed elements inside the
 // provider. This bulk operation avoids materializing every array index and
 // crossing the guest/host boundary once per key.

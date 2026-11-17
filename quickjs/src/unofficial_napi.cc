@@ -854,6 +854,34 @@ extern "C"
         napi_serdes__::release_serialized_value(reinterpret_cast<void *>(message));
     }
 
+    napi_status NAPI_CDECL unofficial_napi_message_create_bounded(
+        napi_env env,
+        napi_value value,
+        size_t max_bytes,
+        unofficial_napi_message *message_out,
+        size_t *retained_bytes_out)
+    {
+        if (retained_bytes_out == nullptr)
+            return napi_invalid_arg;
+        *retained_bytes_out = 0;
+        // QuickJS serializes into one buffer it sizes itself: measure the
+        // result and refuse it afterwards, with V8's clone error.
+        napi_status status = unofficial_napi_message_create(env, value, message_out);
+        if (status != napi_ok)
+            return status;
+        const size_t retained =
+            napi_serdes__::serialized_value_retained_bytes(reinterpret_cast<void *>(*message_out));
+        if (retained > max_bytes)
+        {
+            unofficial_napi_message_drop(*message_out);
+            *message_out = nullptr;
+            napi_throw_error(env, "DataCloneError", "Data cannot be cloned, out of memory.");
+            return napi_pending_exception;
+        }
+        *retained_bytes_out = retained;
+        return napi_ok;
+    }
+
     napi_status NAPI_CDECL unofficial_napi_get_own_non_index_properties(
         napi_env env,
         napi_value value,

@@ -19,9 +19,8 @@ use crate::budget::{
 };
 use crate::id_hash::IdHashMap;
 use crate::snapi::{
-    SnapiEnv, snapi_bridge_unofficial_release_env,
+    SnapiEnv, snapi_bridge_unofficial_release_env, snapi_bridge_unofficial_set_host_budget,
     snapi_bridge_unofficial_set_host_near_heap_limit_callback,
-    snapi_bridge_unofficial_set_value_limit,
 };
 
 /// The status the bridge returns when it refuses to release an env. Natively:
@@ -130,6 +129,9 @@ pub(crate) struct NapiEnv {
     managed_lane: Option<Arc<crate::ManagedV8Lane>>,
     env_registry: Arc<std::sync::Mutex<EnvRegistry>>,
     host_stopped: Arc<AtomicBool>,
+    /// The context's messages not received yet; ids a guest passes are
+    /// checked against it.
+    pub(crate) messages: Arc<crate::message::PendingMessages>,
     /// Heap charge per live V8 env, keyed by guest env id, so teardown releases
     /// exactly what creation charged plus what the callback later granted.
     env_heap_charges: HashMap<u32, EnvHeapChargeHandle>,
@@ -223,6 +225,7 @@ impl NapiEnv {
             managed_lane: None,
             env_registry,
             host_stopped,
+            messages: crate::message::PendingMessages::new(),
             env_heap_charges: HashMap::new(),
             external_declared: 0,
             callback_depth: 0,
@@ -397,14 +400,13 @@ impl NapiEnv {
                 );
             }
 
-            // Cap per-value host handles / callback registrations so the C++
-            // bookkeeping (invisible to the byte pools) cannot grow host RSS
-            // without bound; derived from the budget.
-            if let Some(limit) = self.budget.value_handle_limit() {
-                // SAFETY: `env` is the isolate just created.
-                unsafe {
-                    snapi_bridge_unofficial_set_value_limit(env, limit);
-                }
+            // Charge the bridge's handle tables for this isolate to the
+            // budget, so its host bookkeeping cannot grow host RSS past it.
+            let reference = ResourceBudget::bridge_reference(&self.budget);
+            // SAFETY: `env` is the isolate just created; on success the
+            // bridge owns `reference` until it releases the isolate.
+            if unsafe { snapi_bridge_unofficial_set_host_budget(env, reference) } != 0 {
+                ResourceBudget::drop_bridge_reference(reference);
             }
 
             boxed as usize

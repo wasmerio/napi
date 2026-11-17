@@ -141,6 +141,7 @@ pub struct NapiRuntimeHooks {
 pub struct NapiRuntimeControl {
     envs: Arc<Mutex<crate::env::EnvRegistry>>,
     host_stopped: Arc<AtomicBool>,
+    messages: Arc<crate::message::PendingMessages>,
 }
 
 impl NapiRuntimeControl {
@@ -154,17 +155,23 @@ impl NapiRuntimeControl {
     /// stay terminated ([`NapiEnv::commit_isolate`] re-checks the flag under
     /// the same registry lock this holds).
     ///
+    /// It also frees the messages the context's environments sent each other
+    /// and that were not received yet, returning their memory to the budget.
+    ///
     /// [`NapiEnv::commit_isolate`]: crate::env::NapiEnv::commit_isolate
     pub fn terminate_all(&self) {
         self.host_stopped.store(true, Ordering::Release);
-        let envs = self.envs.lock().expect("poisoned N-API env registry");
-        for env in envs.envs.values().copied() {
-            unsafe {
-                crate::snapi::snapi_bridge_unofficial_terminate_execution(
-                    env as crate::snapi::SnapiEnv,
-                );
+        {
+            let envs = self.envs.lock().expect("poisoned N-API env registry");
+            for env in envs.envs.values().copied() {
+                unsafe {
+                    crate::snapi::snapi_bridge_unofficial_terminate_execution(
+                        env as crate::snapi::SnapiEnv,
+                    );
+                }
             }
         }
+        self.messages.close();
     }
 }
 
@@ -178,6 +185,8 @@ struct NapiCtxInner {
     budget: Arc<ResourceBudget>,
     envs: Arc<Mutex<crate::env::EnvRegistry>>,
     host_stopped: Arc<AtomicBool>,
+    /// Messages between the context's environments not received yet.
+    messages: Arc<crate::message::PendingMessages>,
     /// Set for a managed embedder ([`NapiCtxBuilder::build_managed_imports`]).
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     managed_lane_activator: Option<crate::ManagedV8LaneActivator>,
@@ -314,6 +323,7 @@ impl NapiCtxBuilder {
                 budget,
                 envs: Arc::new(Mutex::new(crate::env::EnvRegistry::default())),
                 host_stopped: Arc::new(AtomicBool::new(false)),
+                messages: crate::message::PendingMessages::new(),
                 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
                 managed_lane_activator,
             }),
@@ -396,6 +406,7 @@ impl NapiCtx {
         NapiRuntimeControl {
             envs: Arc::clone(&self.inner.envs),
             host_stopped: Arc::clone(&self.inner.host_stopped),
+            messages: Arc::clone(&self.inner.messages),
         }
     }
 
@@ -545,6 +556,7 @@ impl NapiSession {
             Arc::clone(&self.inner.ctx.envs),
             Arc::clone(&self.inner.ctx.host_stopped),
         );
+        napi_env.messages = Arc::clone(&self.inner.ctx.messages);
         napi_env.webassembly = self.inner.ctx.webassembly;
         #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
         {
