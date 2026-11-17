@@ -257,7 +257,6 @@ impl NapiCtxBuilder {
         self
     }
 
-    /// Delegate total-memory admission to the embedder.
     /// Overrides the V8 heap headroom exposed to an isolate whose growth was
     /// refused (see [`NapiLimits::heap_emergency_headroom_bytes`]). Less than
     /// [`crate::budget::DEFAULT_HEAP_EMERGENCY_HEADROOM`] lets single
@@ -267,6 +266,7 @@ impl NapiCtxBuilder {
         self
     }
 
+    /// Delegate total-memory admission to the embedder.
     pub fn memory_accountant(mut self, accountant: Arc<dyn NapiMemoryAccountant>) -> Self {
         self.accountant = Some(accountant);
         self
