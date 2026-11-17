@@ -182,7 +182,7 @@ fn with_cb_context<R: Copy>(
     f: impl FnOnce() -> R,
 ) -> Result<R, RuntimeError> {
     let native = env.data().resolve_napi_env(guest_env);
-    let result = with_callback_state(env, native, f);
+    let result = with_callback_state(env, native, f)?;
     let budget = env.data().budget.clone();
     env.as_store_mut()
         .parked(|| budget.deliver_limits_exceeded());
@@ -201,7 +201,7 @@ fn with_cb_context<R: Copy>(
         stopped.store(true, std::sync::atomic::Ordering::Release);
         return Err(RuntimeError::new("N-API provider requested termination"));
     }
-    result
+    Ok(result)
 }
 
 fn snapi_env(env: &FunctionEnvMut<NapiEnv>, guest_env: i32) -> SnapiEnv {

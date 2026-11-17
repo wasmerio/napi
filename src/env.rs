@@ -7,6 +7,8 @@ use std::ffi::c_void;
 use std::sync::Arc;
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 use std::sync::atomic::AtomicU32;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
