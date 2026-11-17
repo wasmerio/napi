@@ -61,13 +61,17 @@ pub fn host_js_capabilities() -> Option<HostJsCapabilities> {
     }
 }
 
-/// Sets how many background worker threads V8 gets, process-wide.
+/// Sets how many threads V8's process-wide background worker pool gets.
 ///
-/// V8 sizes this pool from the host's processor count, which suits a process
-/// running one JS app. A host running many gets a pool whose threads compete
-/// with every tenant's foreground JS, and whose work is attributed to no one:
-/// GC marking and sweeping, parallel scavenging, and background compilation
-/// all land there.
+/// The pool runs the background work (GC marking and sweeping, parallel
+/// scavenging, background compilation) of standalone environments: those
+/// created with no instance lane. V8 sizes it from the host's processor
+/// count, which suits a process running one JS app; a host running many gets
+/// threads that compete with every tenant's foreground JS, for work
+/// attributed to no one. Managed environments
+/// ([`NapiCtxBuilder::build_managed_imports`]) run theirs on their
+/// instance's lane, one thread, whatever this says, and a process of managed
+/// environments never builds the pool.
 ///
 /// Passing `None` keeps V8's default. Lowering it doesn't strand work — V8's
 /// parallel jobs are cooperative and the posting thread participates, so the
@@ -79,9 +83,10 @@ pub fn host_js_capabilities() -> Option<HostJsCapabilities> {
 /// `kUserBlocking`, or joined) uses all of them. With a count of 1, every job
 /// gets the one thread.
 ///
-/// The pool is built with the process-wide platform, when the first V8 isolate
-/// is created, so this must be called before then. Afterwards, asking for the
-/// size already in place still succeeds — several components may configure the
+/// The setting freezes when V8 starts (the first runtime configuration or
+/// environment of the process), even though the pool itself is built only
+/// with the first standalone environment. Afterwards, asking for the size
+/// already in place still succeeds — several components may configure the
 /// runtime from one setting — and asking for a different one returns
 /// [`WorkerThreadsAlreadyFixed`].
 pub fn set_v8_worker_threads(count: Option<u32>) -> Result<(), WorkerThreadsAlreadyFixed> {

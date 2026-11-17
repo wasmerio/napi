@@ -604,7 +604,9 @@ EdgeV8Platform::~EdgeV8Platform() = default;
 bool EdgeV8Platform::EnableStandaloneWorkers() {
   std::lock_guard<std::mutex> lock(standalone_workers_mutex_);
   if (standalone_workers_ != nullptr) return true;
-  // The pool's threads inherit this thread's key rights.
+  // The pool's threads inherit this thread's key rights. (On Linux x64 the
+  // pool's platform also allocates a protection key of its own, which V8
+  // never uses: it takes the delegate's.)
   EdgeV8AllowJitKeyReads();
   std::unique_ptr<v8::Platform> workers =
       v8::platform::NewDefaultPlatform(g_worker_thread_count.load(std::memory_order_acquire));
@@ -840,6 +842,9 @@ void EdgeV8Platform::WakeForQueuedForegroundTasks(v8::Isolate* isolate) {
   WakeForForegroundTask();
 }
 
+// Per calling thread: an instance lane is one thread. V8 also caches this
+// once per process (scavenger and mark-compact task counts), so in a process
+// with both managed and standalone envs the first GC sizes those for all.
 int EdgeV8Platform::NumberOfWorkerThreads() {
   if (current_background_lane != nullptr) return 1;
   v8::Platform* workers = StandaloneWorkers();

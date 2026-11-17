@@ -211,6 +211,21 @@ fn guest_unofficial_napi_configure_runtime(
     mut env: FunctionEnvMut<NapiEnv>,
     options_ptr: u32,
 ) -> i32 {
+    // V8 flags are process-wide. A guest of a managed instance shares V8 with
+    // other tenants, so it may not set them: only the embedder does. EdgeJS's
+    // fixed defaults are accepted as no-ops; V8 starts when an env is
+    // created, under the instance's lane.
+    if env.data().is_managed() {
+        let flags = abi::read_runtime_options_up_to(
+            &mut env,
+            options_ptr,
+            abi::MAX_DEFAULT_ENGINE_FLAGS_LENGTH,
+        );
+        return match flags {
+            Some(flags) if abi::is_default_engine_flags(&flags) => 0,
+            _ => 1, // napi_invalid_arg
+        };
+    }
     let Some(flags) = abi::read_runtime_options(&mut env, options_ptr) else {
         return 1;
     };
@@ -256,6 +271,11 @@ fn guest_unofficial_napi_create_env(
     let Ok(_lane_scope) = env.data_mut().enter_background_lane() else {
         return 9; // napi_generic_failure: the instance stopped or refused its lane
     };
+    // A managed guest's configure_runtime started nothing; start V8 here
+    // with the embedder's flags. Fails harmlessly once V8 runs.
+    if env.data().is_managed() {
+        let _ = unsafe { snapi_bridge_unofficial_configure_runtime(std::ptr::null(), 0) };
+    }
     let requested = RequestedHeap {
         max_young: max_young_generation_size_in_bytes,
         max_old: max_old_generation_size_in_bytes,

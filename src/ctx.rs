@@ -269,10 +269,11 @@ impl NapiCtxBuilder {
     /// [`ManagedV8Lane`]: crate::ManagedV8Lane
     ///
     /// The first call puts the process in managed mode: V8 starts without the
-    /// background work that all isolates share (concurrent TurboFan compiles
-    /// and the page pool), which no lane could be charged for. Build managed
-    /// imports before the process's first environment: if V8 already started
-    /// without managed mode, managed environments are refused.
+    /// state its isolates share background work through (concurrent TurboFan
+    /// and Maglev compiles, the page pool, the wasm module cache), which no
+    /// lane could be charged for, and guests can no longer set V8 flags. Build
+    /// managed imports before the process's first environment: if V8 already
+    /// started without managed mode, managed environments are refused.
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn build_managed_imports(
         self,

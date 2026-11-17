@@ -97,17 +97,30 @@ struct SharedRuntime {
 // starts (snapi_v8_use_managed_runtime).
 std::atomic<bool> g_managed_runtime_requested{false};
 
-// V8 flags of a process that runs instances on their own lanes. Every
-// isolate of this build shares one isolate group (it can't create private
-// ones), and the group owns state whose background work no lane can be
-// charged for:
+// V8 flags of a process that runs instances on their own lanes. A lane only
+// keeps an instance's background work apart if no V8 state shared between
+// isolates posts work. Every isolate of this build shares one isolate group
+// (it can't create private ones), and V8 shares:
 // - TurboFan's concurrent compiles: one queue and one job per group, so a
 //   worker posted by one instance would run another's compiles on its lane,
-//   and a stopped lane would strand the job for all. Without it TurboFan
-//   compiles on the isolate's own thread.
+//   and a stopped lane would strand the job for all. --no-concurrent-
+//   recompilation also turns off concurrent Maglev, which is per isolate:
+//   both compile on the isolate's own thread, during its JS. The stress and
+//   builtin-generation flags would start the shared job again.
 // - The page pool: pages one isolate frees are kept for any other, and a
 //   group-wide release task reposts itself on whichever lane ran it.
-constexpr char kManagedV8Flags[] = "--no-concurrent-recompilation --no-memory-pool";
+// - Compiled wasm modules (the process-wide native module cache): instances
+//   compiling the same bytes share one module and its compile jobs, whose
+//   workers would run on whichever instance's lane tiered it up last, and
+//   one compile can block another instance's.
+// They are applied after the embedder's flags; guests of a managed process
+// cannot set flags (guest_unofficial_napi_configure_runtime). V8 applies flag
+// implications at initialization, so the embedder must not pass flags that
+// imply any of these back on.
+constexpr char kManagedV8Flags[] =
+    "--no-concurrent-recompilation --no-stress-concurrent-inlining "
+    "--no-concurrent-builtin-generation --no-memory-pool "
+    "--no-wasm-native-module-cache";
 
 class TrackingArrayBufferAllocator;
 
@@ -853,7 +866,7 @@ napi_status ConfigureRuntime(const char* engine_flags,
     v8::V8::SetFlagsFromString(engine_flags,
                                static_cast<int>(engine_flags_length));
   }
-  // After the caller's flags, so none of them turns these back on.
+  // After the caller's flags (see kManagedV8Flags).
   if (g_managed_runtime_requested.load(std::memory_order_acquire)) {
     v8::V8::SetFlagsFromString(kManagedV8Flags,
                                static_cast<int>(sizeof(kManagedV8Flags) - 1));

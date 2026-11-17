@@ -17,18 +17,24 @@ use common::build_wasix_test;
 
 unsafe extern "C" {
     fn snapi_v8_runtime_is_managed() -> bool;
+    fn snapi_v8_standalone_pool_created() -> bool;
+    fn snapi_v8_standalone_worker_posts() -> u64;
 }
 
 #[test]
 fn managed_envs_are_refused_once_v8_started_unmanaged() {
     let wasm = build_wasix_test("test_gc_once");
 
+    let standalone_posts_before = unsafe { snapi_v8_standalone_worker_posts() };
     let standalone = NapiCtx::default();
     let (exit_code, stdout, stderr) =
         run_wasix_main_capture_stdio_with_ctx(&standalone, &wasm, &[], &[])
             .expect("the standalone guest did not run");
     assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
     assert!(!unsafe { snapi_v8_runtime_is_managed() });
+    // A standalone env builds the pool and runs its background work there.
+    assert!(unsafe { snapi_v8_standalone_pool_created() });
+    assert!(unsafe { snapi_v8_standalone_worker_posts() } > standalone_posts_before);
 
     let activations = Arc::new(AtomicUsize::new(0));
     let lanes: Arc<std::sync::Mutex<Vec<Arc<ManagedV8Lane>>>> = Arc::default();

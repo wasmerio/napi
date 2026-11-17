@@ -297,6 +297,13 @@ impl NapiEnv {
             .unwrap_or(0)
     }
 
+    /// Whether this store belongs to a managed context
+    /// ([`crate::NapiCtxBuilder::build_managed_imports`]).
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn is_managed(&self) -> bool {
+        self.managed_lane_activator.is_some()
+    }
+
     /// Binds the instance's V8 lane to this thread for an env creation, so
     /// the isolate's V8 work goes to it. A managed context gets the lane from
     /// its embedder the first time. A standalone context has none, and binds

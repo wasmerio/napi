@@ -51,6 +51,12 @@ pub(crate) fn use_managed_runtime() -> bool {
 /// entered. Either way the instance's JavaScript can no longer make progress,
 /// so `on_overload` should stop the instance; it must not wait on V8.
 ///
+/// Size `max_queued_tasks` for legitimate bursts, not only for abuse: the
+/// bound counts delayed tasks too, and V8 queues work per operation. Each
+/// asynchronous `WebAssembly.compile` posts a decode task, and each compiled
+/// module adds compile-job workers and a delayed code-caching task, all run
+/// one at a time here.
+///
 /// Keep the lane alive while any environment created with it may still be
 /// alive: the provider holds it through its environments.
 ///

@@ -37,6 +37,7 @@ struct Lane {
     activations: AtomicUsize,
     tasks_started: Arc<AtomicUsize>,
     tasks_finished: Arc<AtomicUsize>,
+    overloads: Arc<AtomicUsize>,
     lane: Mutex<Option<Arc<ManagedV8Lane>>>,
     worker: Mutex<Option<(thread::JoinHandle<()>, mpsc::Receiver<()>)>>,
 }
@@ -62,13 +63,16 @@ impl Lane {
             }
             let started = Arc::clone(&this.tasks_started);
             let finished = Arc::clone(&this.tasks_finished);
+            let overloads = Arc::clone(&this.overloads);
             let lane = ManagedV8Lane::new(
                 256,
                 Arc::new(move || {
                     started.fetch_add(1, Ordering::SeqCst);
                     Box::new(TaskGuard(Arc::clone(&finished))) as Box<dyn Send>
                 }),
-                Arc::new(|| {}),
+                Arc::new(move || {
+                    overloads.fetch_add(1, Ordering::SeqCst);
+                }),
             )?;
             let (exited_tx, exited_rx) = mpsc::channel();
             let worker_lane = Arc::clone(&lane);
@@ -101,6 +105,17 @@ impl Lane {
         while self.tasks_started.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
+        self.stop();
+    }
+
+    /// Stops the lane, as an embedder does on completion or a kill, and waits
+    /// for its thread. The lane must not have overflowed before.
+    fn stop(&self) {
+        assert_eq!(
+            self.overloads.load(Ordering::SeqCst),
+            0,
+            "the lane overflowed"
+        );
         if let Some(lane) = &*self.lane.lock().unwrap() {
             lane.stop();
         }
@@ -209,9 +224,11 @@ fn instances_run_their_v8_work_on_their_own_lanes() {
 fn a_stopped_instance_starts_no_lane() {
     let lane = Arc::new(Lane::default());
     let hooks = lane.hooks();
+    let unattributed_before = unsafe { snapi_v8_unattributed_worker_posts() };
     hooks.runtime_control().terminate_all();
     assert_env_refused(&hooks);
     assert_eq!(lane.activations.load(Ordering::SeqCst), 0);
+    assert_all_v8_work_had_a_lane(unattributed_before);
 }
 
 #[test]
@@ -229,4 +246,54 @@ fn a_refused_lane_fails_env_creation() {
     assert_eq!(refusals.load(Ordering::SeqCst), 1);
     // The env was not made on the process-wide pool instead.
     assert_all_v8_work_had_a_lane(unattributed_before);
+}
+
+/// How an embedder kills a running instance (Edge's kill_callback): stop its
+/// lane, then terminate its JS. The spinning guest must stop, and its store
+/// must tear down with the lane already stopped.
+#[test]
+fn killing_an_instance_stops_its_js_with_the_lane_already_stopped() {
+    let unattributed_before = unsafe { snapi_v8_unattributed_worker_posts() };
+    let lane = Arc::new(Lane::default());
+    let hooks = lane.hooks();
+    let control = hooks.runtime_control();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let guest = thread::spawn(move || {
+        let outcome = try_run(&hooks, "test_js_infinite_loop");
+        let _ = finished_tx.send(());
+        outcome
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !lane.started() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(lane.started(), "the guest never created its env");
+    // Give the guest time to enter its loop.
+    thread::sleep(Duration::from_secs(1));
+    lane.stop();
+    control.terminate_all();
+    finished_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the killed instance did not stop");
+    if let Ok((_exit_code, stdout, stderr)) = guest.join().expect("the guest thread panicked") {
+        assert!(
+            stdout.contains("JS_LOOP_ENTERED") && !stdout.contains("RESUME_STATUS=0"),
+            "{stdout}\n{stderr}"
+        );
+    }
+    assert_all_v8_work_had_a_lane(unattributed_before);
+}
+
+/// A managed instance's guests cannot set process-wide V8 flags.
+#[test]
+fn managed_guests_cannot_set_v8_flags() {
+    let lane = Arc::new(Lane::default());
+    let hooks = lane.hooks();
+    let (exit_code, stdout, stderr) = run(&hooks, "test_managed_runtime_flags");
+    assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("MANAGED_RUNTIME_FLAGS_OK"),
+        "{stdout}\n{stderr}"
+    );
+    lane.stop_after_work();
 }
