@@ -1706,7 +1706,7 @@ bool SetConstructorFunction(v8::Local<v8::Context> context,
 
 class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Delegate {
  public:
-  // `charge` (may be null) pays for the serializer's buffer as it grows.
+  // `charge` (may be null) pays for the buffer and side tables as they grow.
   explicit StructuredCloneSerializerDelegate(v8::Isolate* isolate,
                                              NapiHostCharge* charge = nullptr)
       : isolate_(isolate), charge_(charge) {}
@@ -1746,6 +1746,7 @@ class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Dele
         return v8::Just(i);
       }
     }
+    if (!ReserveSideTableSlot(shared_array_buffers_)) return v8::Nothing<uint32_t>();
     shared_array_buffers_.push_back(std::move(backing_store));
     return v8::Just(static_cast<uint32_t>(shared_array_buffers_.size() - 1));
   }
@@ -1753,6 +1754,7 @@ class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Dele
   v8::Maybe<uint32_t> GetWasmModuleTransferId(
       v8::Isolate* /*isolate*/,
       v8::Local<v8::WasmModuleObject> module) override {
+    if (!ReserveSideTableSlot(wasm_modules_)) return v8::Nothing<uint32_t>();
     wasm_modules_.push_back(module->GetCompiledModule());
     return v8::Just(static_cast<uint32_t>(wasm_modules_.size() - 1));
   }
@@ -1765,11 +1767,40 @@ class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Dele
     return wasm_modules_;
   }
 
+  std::vector<std::shared_ptr<v8::BackingStore>> TakeSharedArrayBuffers() {
+    return std::move(shared_array_buffers_);
+  }
+
   std::vector<v8::CompiledWasmModule> TakeWasmModules() {
     return std::move(wasm_modules_);
   }
 
  private:
+  template <typename Entry>
+  bool ReserveSideTableSlot(std::vector<Entry>& table) {
+    const size_t old_capacity = table.capacity();
+    if (table.size() < old_capacity) return true;
+    const size_t max_capacity = std::min<size_t>(table.max_size(), UINT32_MAX);
+    if (old_capacity < max_capacity) {
+      const size_t new_capacity =
+          old_capacity == 0 ? 1 : old_capacity + std::min(old_capacity, max_capacity - old_capacity);
+      const size_t new_bytes = new_capacity * sizeof(Entry);
+      // The old storage remains live until reserve finishes moving its entries.
+      if (charge_ == nullptr || charge_->Grow(new_bytes, /*soft=*/true)) {
+        try {
+          table.reserve(new_capacity);
+          if (charge_ != nullptr) charge_->Shrink(old_capacity * sizeof(Entry));
+          return true;
+        } catch (const std::bad_alloc&) {
+          if (charge_ != nullptr) charge_->Shrink(new_bytes);
+        }
+      }
+    }
+    ThrowDataCloneError(v8::String::NewFromUtf8Literal(
+        isolate_, "Data cannot be cloned, out of memory."));
+    return false;
+  }
+
   v8::Isolate* isolate_ = nullptr;
   NapiHostCharge* charge_ = nullptr;
   size_t buffer_bytes_ = 0;
@@ -2805,22 +2836,17 @@ napi_status NAPI_CDECL unofficial_napi_message_create(
   std::pair<uint8_t*, size_t> released = serializer.Release();
   if (released.first == nullptr) return napi_generic_failure;
   std::unique_ptr<uint8_t, FreeDeleter> data(released.first);
-  std::vector<std::shared_ptr<v8::BackingStore>> shared_array_buffers =
-      serializer_delegate.shared_array_buffers();
-  std::vector<v8::CompiledWasmModule> wasm_modules = serializer_delegate.TakeWasmModules();
-  // The payload itself and its side tables; the buffer is already charged.
-  const uint64_t overhead =
-      sizeof(SerializedClonePayload) +
-      shared_array_buffers.capacity() * sizeof(std::shared_ptr<v8::BackingStore>) +
-      wasm_modules.capacity() * sizeof(v8::CompiledWasmModule);
-  if (!charge.Grow(overhead, /*soft=*/true)) return ThrowCloneOutOfMemory(env, try_catch);
+  // The serializer already charged the buffer and side tables.
+  if (!charge.Grow(sizeof(SerializedClonePayload), /*soft=*/true)) {
+    return ThrowCloneOutOfMemory(env, try_catch);
+  }
   auto* payload = new (std::nothrow) SerializedClonePayload();
   if (payload == nullptr) return napi_generic_failure;
   payload->charge = std::move(charge);
   payload->data = std::move(data);
   payload->size = released.second;
-  payload->shared_array_buffers = std::move(shared_array_buffers);
-  payload->wasm_modules = std::move(wasm_modules);
+  payload->shared_array_buffers = serializer_delegate.TakeSharedArrayBuffers();
+  payload->wasm_modules = serializer_delegate.TakeWasmModules();
   payload->sender_allows_webassembly = EnvAllowsWebAssembly(env);
   payload->sender_lane = EnvLaneId(env);
   *message_out = reinterpret_cast<unofficial_napi_message>(payload);
