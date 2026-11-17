@@ -1647,7 +1647,16 @@ struct SerializedClonePayload {
   std::vector<std::shared_ptr<v8::BackingStore>> array_buffers;
   std::vector<std::shared_ptr<v8::BackingStore>> shared_array_buffers;
   std::vector<v8::CompiledWasmModule> wasm_modules;
+  // Whether the env that made the message could hold WebAssembly objects.
+  bool sender_allows_webassembly = true;
 };
+
+// Whether `env` can hold WebAssembly objects: false under
+// NapiWebAssemblyPolicy::kRestricted.
+bool EnvAllowsWebAssembly(napi_env env) {
+  return env == nullptr || env->agent == nullptr ||
+         !env->agent->webassembly_restricted;
+}
 
 void ThrowCloneTransferError(v8::Isolate* isolate, const char* message) {
   v8::Local<v8::String> text =
@@ -1718,6 +1727,7 @@ napi_status DeserializeTransferredClone(
     const std::vector<std::shared_ptr<v8::BackingStore>>& array_buffers,
     const std::vector<std::shared_ptr<v8::BackingStore>>& shared_array_buffers,
     const std::vector<v8::CompiledWasmModule>& wasm_modules,
+    bool sender_allows_webassembly,
     v8::Local<v8::Value>* result_out) {
   if (env == nullptr || env->isolate == nullptr || result_out == nullptr) {
     return napi_invalid_arg;
@@ -1725,6 +1735,24 @@ napi_status DeserializeTransferredClone(
 
   v8::Isolate* isolate = env->isolate;
   v8::Local<v8::Context> context = env->context();
+  // V8 restores a compiled WebAssembly.Module, and a shared WebAssembly.Memory
+  // over a shared buffer, without asking the code-generation callback, and no
+  // V8 API tells which shared buffer backs a memory. A restricted env refuses
+  // every module, and the shared memory of a sender that allows WebAssembly.
+  // Envs of one context share their policy, so this never refuses a message
+  // between them.
+  if (!EnvAllowsWebAssembly(env) &&
+      (!wasm_modules.empty() ||
+       (sender_allows_webassembly && !shared_array_buffers.empty()))) {
+    // Recorded as N-API's pending exception, without entering JS.
+    napi_v8_set_last_exception(
+        env,
+        v8::Exception::Error(v8::String::NewFromUtf8Literal(
+            isolate,
+            "This environment cannot receive WebAssembly modules or the shared "
+            "memory of an environment that has WebAssembly")));
+    return napi_pending_exception;
+  }
   StructuredCloneDeserializerDelegate deserializer_delegate(
       isolate, shared_array_buffers, wasm_modules);
   v8::ValueDeserializer deserializer(
@@ -1802,6 +1830,7 @@ napi_status StructuredCloneImpl(
       transferred_array_buffers,
       serializer_delegate.shared_array_buffers(),
       serializer_delegate.wasm_modules(),
+      EnvAllowsWebAssembly(env),
       &output);
   if (deserialize_status != napi_ok) return deserialize_status;
 
@@ -2512,6 +2541,7 @@ napi_status NAPI_CDECL unofficial_napi_message_create(
   std::free(released.first);
   payload->shared_array_buffers = serializer_delegate.shared_array_buffers();
   payload->wasm_modules = serializer_delegate.TakeWasmModules();
+  payload->sender_allows_webassembly = EnvAllowsWebAssembly(env);
   *message_out = reinterpret_cast<unofficial_napi_message>(payload);
   return napi_ok;
 }
@@ -2540,6 +2570,7 @@ napi_status NAPI_CDECL unofficial_napi_message_take(
       payload->array_buffers,
       payload->shared_array_buffers,
       payload->wasm_modules,
+      payload->sender_allows_webassembly,
       &output);
   if (deserialize_status != napi_ok) return deserialize_status;
 

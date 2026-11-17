@@ -289,6 +289,96 @@ TEST_F(Test21General, WebAssemblyPolicyDecidesWebAssemblyInTheEnv) {
     ASSERT_EQ(unofficial_napi_release_env(owner, nullptr), napi_ok);
   }
 }
+
+namespace {
+
+// Makes a message of `script`'s value in a fresh env with `policy`, then
+// releases that env: the message outlives its sender, as one a worker posts.
+unofficial_napi_message MessageFrom(uint32_t policy, const char* script) {
+  napi_env env = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
+  unofficial_napi_env_create_options options{};
+  InitializeTestEnvCreateOptions(&options);
+  EXPECT_EQ(snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options, policy, &env,
+                                     &owner),
+            napi_ok);
+  if (env == nullptr) return nullptr;
+  napi_value source = nullptr;
+  napi_value value = nullptr;
+  unofficial_napi_message message = nullptr;
+  EXPECT_EQ(napi_create_string_utf8(env, script, NAPI_AUTO_LENGTH, &source), napi_ok);
+  EXPECT_EQ(napi_run_script(env, source, &value), napi_ok);
+  EXPECT_EQ(unofficial_napi_message_create(env, value, &message), napi_ok);
+  EXPECT_EQ(unofficial_napi_release_env(owner, nullptr), napi_ok);
+  return message;
+}
+
+// Takes `message` in a fresh env with `policy`: "refused" when the take
+// throws, else each received property's [[Class]].
+std::string TakeIn(uint32_t policy, unofficial_napi_message message) {
+  if (message == nullptr) return "<no message>";
+  napi_env env = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
+  unofficial_napi_env_create_options options{};
+  InitializeTestEnvCreateOptions(&options);
+  EXPECT_EQ(snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options, policy, &env,
+                                     &owner),
+            napi_ok);
+  if (env == nullptr) return "<no env>";
+  std::string described;
+  napi_value value = nullptr;
+  const napi_status status = unofficial_napi_message_take(env, message, &value);
+  if (status == napi_pending_exception) {
+    napi_value exception = nullptr;
+    EXPECT_EQ(napi_get_and_clear_last_exception(env, &exception), napi_ok);
+    described = "refused";
+  } else if (status != napi_ok) {
+    described = "status " + std::to_string(status);
+  } else {
+    napi_value global = nullptr;
+    EXPECT_EQ(napi_get_global(env, &global), napi_ok);
+    EXPECT_EQ(napi_set_named_property(env, global, "__received", value), napi_ok);
+    described = RunToString(
+        env,
+        "Object.keys(__received).map(function (key) { return key + ':' + "
+        "Object.prototype.toString.call(__received[key]); }).join()");
+  }
+  EXPECT_EQ(unofficial_napi_release_env(owner, nullptr), napi_ok);
+  return described;
+}
+
+constexpr char kModuleMessage[] =
+    "({ module: new WebAssembly.Module(new Uint8Array([0x00, 0x61, 0x73, "
+    "0x6d, 0x01, 0x00, 0x00, 0x00])) })";
+constexpr char kSharedMemoryMessage[] =
+    "({ memory: new WebAssembly.Memory({ initial: 1, maximum: 2, shared: true }) })";
+constexpr char kSharedBufferMessage[] = "({ buffer: new SharedArrayBuffer(8) })";
+
+}  // namespace
+
+// V8 restores modules and shared memories without asking the code-generation
+// callback, so a restricted env checks a message before it is read.
+TEST_F(Test21General, RestrictedEnvironmentsRefuseWebAssemblyMessages) {
+  const uint32_t restricted = kWebAssemblyRestricted;
+  const uint32_t unmetered = kWebAssemblyAllowUnmetered;
+
+  EXPECT_EQ(TakeIn(restricted, MessageFrom(unmetered, kModuleMessage)), "refused");
+  EXPECT_EQ(TakeIn(unmetered, MessageFrom(unmetered, kModuleMessage)),
+            "module:[object WebAssembly.Module]");
+
+  EXPECT_EQ(TakeIn(restricted, MessageFrom(unmetered, kSharedMemoryMessage)), "refused");
+  EXPECT_EQ(TakeIn(unmetered, MessageFrom(unmetered, kSharedMemoryMessage)),
+            "memory:[object WebAssembly.Memory]");
+
+  // A shared buffer from an env with WebAssembly may back a memory.
+  EXPECT_EQ(TakeIn(restricted, MessageFrom(unmetered, kSharedBufferMessage)), "refused");
+  EXPECT_EQ(TakeIn(unmetered, MessageFrom(unmetered, kSharedBufferMessage)),
+            "buffer:[object SharedArrayBuffer]");
+  // Between restricted envs, as between all envs of one context, shared
+  // memory still crosses.
+  EXPECT_EQ(TakeIn(restricted, MessageFrom(restricted, kSharedBufferMessage)),
+            "buffer:[object SharedArrayBuffer]");
+}
 #endif
 
 TEST_F(Test21General, EnvironmentHooksAttachAtomicallyOnce) {

@@ -42,8 +42,8 @@ Guest JavaScript has V8's `WebAssembly` by default (`WasmPolicy::EnabledUnmetere
 wasm memories and compiled code are not charged to any N-API limit. Pass
 `--restricted-webassembly` to take it away (`WasmPolicy::Restricted`). The
 `WebAssembly` global is then absent from the guest's realms, and V8 refuses to
-compile wasm in all of them:
+compile wasm in all of them. Options follow the module path:
 
 ```sh
-./target/release/napi_wasmer --restricted-webassembly guest.wasm
+./target/release/napi_wasmer guest.wasm --restricted-webassembly
 ```

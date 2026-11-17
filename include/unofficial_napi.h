@@ -822,7 +822,11 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_structured_clone(
 
 // Opaque provider-owned message which may cross N-API environments. A message
 // is consumed by message_take on both success and failure, or explicitly
-// destroyed with message_drop while it is still queued.
+// destroyed with message_drop while it is still queued. On V8, an env whose
+// embedder restricted WebAssembly refuses a message that carries a
+// WebAssembly.Module, or that carries shared memory and comes from an env with
+// WebAssembly (it may hold a WebAssembly.Memory); message_take then returns
+// napi_pending_exception.
 typedef struct unofficial_napi_message__* unofficial_napi_message;
 
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_message_create(
