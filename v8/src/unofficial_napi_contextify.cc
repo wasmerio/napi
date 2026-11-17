@@ -1551,6 +1551,9 @@ v8::MaybeLocal<v8::Function> CompileCjsFunction(v8::Local<v8::Context> context,
 // ---- bytecode handles (unofficial_napi_js_source) ----
 
 struct BytecodeRecord {
+  // The native copies below, charged to the isolate's host memory (if any)
+  // for the record's life. Declared first, so it is returned last.
+  NapiHostCharge charge;
   std::vector<uint8_t> bytes;
   std::string source_utf8;
   std::string filename_utf8;
@@ -1579,20 +1582,88 @@ BytecodeRecord* BytecodeRecordFromSource(const unofficial_napi_js_source* source
   return reinterpret_cast<BytecodeRecord*>(source->bytecode);
 }
 
-bool ReadParamsArray(napi_env env, napi_value params_or_undefined, std::vector<std::string>* out) {
-  out->clear();
-  if (IsNullish(env, params_or_undefined)) return true;
-  v8::Local<v8::Value> value = napi_v8_unwrap_value(params_or_undefined);
-  if (value.IsEmpty() || !value->IsArray()) return false;
-  v8::Local<v8::Context> context = env->context();
-  v8::Local<v8::Array> array = value.As<v8::Array>();
-  out->reserve(array->Length());
-  for (uint32_t i = 0; i < array->Length(); ++i) {
-    v8::Local<v8::Value> item;
-    if (!array->Get(context, i).ToLocal(&item) || !item->IsString()) return false;
-    out->push_back(V8ValueToUtf8(env->isolate, item));
+// The UTF-8 of `value`, charged to `charge` (if any) before it is copied out
+// of the V8 heap, the way Utf8Value would convert it. False, copying nothing,
+// if the budget refused it.
+bool ChargedUtf8(v8::Isolate* isolate,
+                 v8::Local<v8::String> value,
+                 NapiHostCharge* charge,
+                 std::string* out) {
+  const size_t length = value->Utf8Length(isolate);
+  if (charge != nullptr && !charge->Grow(length + sizeof(std::string), /*soft=*/true)) {
+    return false;
+  }
+  out->resize(length);
+  if (length != 0) {
+    const size_t written = value->WriteUtf8(isolate, out->data(), length,
+                                            v8::String::WriteFlags::kReplaceInvalidUtf8);
+    out->resize(written);
   }
   return true;
+}
+
+// As ToUtf8String (coercing a non-string), charged like ChargedUtf8.
+bool ChargedToUtf8String(napi_env env,
+                         napi_value value,
+                         const char* fallback,
+                         NapiHostCharge* charge,
+                         std::string* out) {
+  napi_value str = nullptr;
+  v8::Local<v8::Value> raw;
+  if (CoerceToStringValue(env, value, &str)) raw = napi_v8_unwrap_value(str);
+  if (raw.IsEmpty() || !raw->IsString()) {
+    *out = fallback == nullptr ? "" : fallback;
+    return charge == nullptr || charge->Grow(out->size() + sizeof(std::string), true);
+  }
+  return ChargedUtf8(env->isolate, raw.As<v8::String>(), charge, out);
+}
+
+// The most formal parameters V8 compiles: Code::kMaxArguments ((1 << 16) -
+// 10, src/objects/code.h) less the receiver slot. Above it the parser hits a
+// hard check (Parser::PrepareWrappedArguments), so the list is refused first.
+constexpr uint32_t kMaxParams = 65525;
+
+// Copies a parameter list into `out`, charging each name to `charge` as it is
+// read (napi_generic_failure if the budget refuses one). napi_invalid_arg for
+// anything but an array of at most kMaxParams strings. The length is read
+// once: a getter that grows the array cannot extend the loop.
+napi_status ReadParamsArray(napi_env env,
+                            napi_value params_or_undefined,
+                            std::vector<std::string>* out,
+                            NapiHostCharge* charge) {
+  out->clear();
+  if (IsNullish(env, params_or_undefined)) return napi_ok;
+  v8::Local<v8::Value> value = napi_v8_unwrap_value(params_or_undefined);
+  if (value.IsEmpty() || !value->IsArray()) return napi_invalid_arg;
+  v8::Local<v8::Context> context = env->context();
+  v8::Local<v8::Array> array = value.As<v8::Array>();
+  const uint32_t length = array->Length();
+  if (length > kMaxParams) return napi_invalid_arg;
+  out->reserve(std::min<uint32_t>(length, 64));
+  for (uint32_t i = 0; i < length; ++i) {
+    v8::Local<v8::Value> item;
+    if (!array->Get(context, i).ToLocal(&item) || !item->IsString()) return napi_invalid_arg;
+    std::string name;
+    if (!ChargedUtf8(env->isolate, item.As<v8::String>(), charge, &name)) {
+      return napi_generic_failure;
+    }
+    out->push_back(std::move(name));
+  }
+  return napi_ok;
+}
+
+// A charge to the isolate's host memory (none without it).
+NapiHostCharge HostCharge(napi_env env, NapiHostMemory::Pool pool) {
+  return NapiHostCharge(
+      env != nullptr && env->agent != nullptr ? env->agent->host_memory : nullptr, pool);
+}
+
+// Copies a record's source and filename, charged before each is copied;
+// false if the budget refused one.
+bool CopyRecordText(napi_env env, napi_value source_text, napi_value filename,
+                    BytecodeRecord* record) {
+  return ChargedToUtf8String(env, source_text, "", &record->charge, &record->source_utf8) &&
+         ChargedToUtf8String(env, filename, "[eval]", &record->charge, &record->filename_utf8);
 }
 
 std::vector<v8::Local<v8::String>> ToV8Params(v8::Isolate* isolate,
@@ -1657,6 +1728,10 @@ bool CompileBytecodeRecord(napi_env env,
   v8::ScriptCompiler::Source source_obj(code_str, origin, cached_data);
   const v8::ScriptCompiler::CompileOptions options =
       consume ? v8::ScriptCompiler::kConsumeCodeCache : v8::ScriptCompiler::kEagerCompile;
+  // Under resource limits a cache only feeds this isolate (a guest's is
+  // never consumed), and the artifact already serves it: produce none.
+  const bool produce =
+      !consume && (env->agent == nullptr || !env->agent->resource_limits);
 
   std::unique_ptr<v8::ScriptCompiler::CachedData> produced;
   switch (record->shape) {
@@ -1667,7 +1742,7 @@ bool CompileBytecodeRecord(napi_env env,
                .ToLocal(&unbound)) {
         return false;
       }
-      if (!consume) produced.reset(v8::ScriptCompiler::CreateCodeCache(unbound));
+      if (produce) produced.reset(v8::ScriptCompiler::CreateCodeCache(unbound));
       break;
     }
     case unofficial_napi_bytecode_shape_cjs_function: {
@@ -1684,7 +1759,7 @@ bool CompileBytecodeRecord(napi_env env,
                .ToLocal(&fn)) {
         return false;
       }
-      if (!consume) produced.reset(v8::ScriptCompiler::CreateCodeCacheForFunction(fn));
+      if (produce) produced.reset(v8::ScriptCompiler::CreateCodeCacheForFunction(fn));
       record->function.Reset(isolate, fn);
       record->function_context.Reset(isolate, context);
       break;
@@ -1696,7 +1771,7 @@ bool CompileBytecodeRecord(napi_env env,
                .ToLocal(&module)) {
         return false;
       }
-      if (!consume && module->IsSourceTextModule()) {
+      if (produce && module->IsSourceTextModule()) {
         produced.reset(v8::ScriptCompiler::CreateCodeCache(module->GetUnboundModuleScript()));
       }
       record->module.Reset(isolate, module);
@@ -1715,8 +1790,12 @@ bool CompileBytecodeRecord(napi_env env,
       *rejected_out = source_obj.GetCachedData()->rejected;
     }
   } else {
+    record->charge.Shrink(record->bytes.size());
     record->bytes.clear();
-    if (produced != nullptr && produced->data != nullptr && produced->length > 0) {
+    // The cache is optional (consumers compile from source without it): one
+    // the budget refuses is dropped.
+    if (produced != nullptr && produced->data != nullptr && produced->length > 0 &&
+        record->charge.Grow(static_cast<uint64_t>(produced->length), /*soft=*/true)) {
       record->bytes.assign(produced->data, produced->data + produced->length);
     }
   }
@@ -1994,12 +2073,14 @@ static napi_status BytecodeCompile(
   v8::Context::Scope context_scope(context);
 
   auto record = std::make_unique<BytecodeRecord>();
-  record->source_utf8 = ToUtf8String(env, source_text, "");
-  record->filename_utf8 = ToUtf8String(env, filename, "[eval]");
+  record->charge = HostCharge(env, NapiHostMemory::kBookkeeping);
+  if (!CopyRecordText(env, source_text, filename, record.get())) return napi_generic_failure;
   record->shape = shape;
   record->line_offset = line_offset;
   record->column_offset = column_offset;
-  if (!ReadParamsArray(env, params_or_undefined, &record->params)) return napi_invalid_arg;
+  const napi_status params_status =
+      ReadParamsArray(env, params_or_undefined, &record->params, &record->charge);
+  if (params_status != napi_ok) return params_status;
 
   v8::Local<v8::Symbol> host_id_symbol;
   if (!IsNullish(env, host_defined_option_id)) {
@@ -2061,11 +2142,14 @@ static napi_status BytecodeDeserialize(
   v8::Context::Scope context_scope(context);
 
   auto record = std::make_unique<BytecodeRecord>();
+  record->charge = HostCharge(env, NapiHostMemory::kBookkeeping);
+  if (!record->charge.Grow(byte_length, /*soft=*/true)) return napi_generic_failure;
   record->bytes.assign(bytes, bytes + byte_length);
-  record->source_utf8 = ToUtf8String(env, source_text, "");
-  record->filename_utf8 = ToUtf8String(env, filename, "[eval]");
+  if (!CopyRecordText(env, source_text, filename, record.get())) return napi_generic_failure;
   record->shape = shape;
-  if (!ReadParamsArray(env, params_or_undefined, &record->params)) return napi_invalid_arg;
+  const napi_status params_status =
+      ReadParamsArray(env, params_or_undefined, &record->params, &record->charge);
+  if (params_status != napi_ok) return params_status;
 
   v8::Local<v8::Symbol> host_id_symbol;
   if (!IsNullish(env, host_defined_option_id)) {
@@ -2109,8 +2193,15 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_open(
   v8::Local<v8::Context> context = RealmContext(env, realm);
   if (context.IsEmpty()) return napi_invalid_arg;
 
-  if (options->has_cache != 0 && options->cache_bytes != nullptr &&
-      options->cache_byte_length != 0) {
+  // V8 does not validate a code cache as untrusted input: a crafted one can
+  // corrupt the heap, and this V8 has no sandbox around it. An isolate under
+  // resource limits shares the process with other tenants, so it compiles
+  // from source and reports the guest's cache as rejected (as V8 does for a
+  // stale one). Caches V8 produced in this isolate are still consumed.
+  const bool trust_guest_cache =
+      env->agent == nullptr || !env->agent->resource_limits;
+  if (trust_guest_cache && options->has_cache != 0 &&
+      options->cache_bytes != nullptr && options->cache_byte_length != 0) {
     bool rejected = false;
     const napi_status status = BytecodeDeserialize(env,
                                                    context,
@@ -2402,16 +2493,24 @@ napi_status NAPI_CDECL unofficial_napi_compile_function(
     v8::Local<v8::Value> value = napi_v8_unwrap_value(context_extensions_or_undefined);
     if (value.IsEmpty() || !value->IsArray()) return napi_invalid_arg;
     v8::Local<v8::Array> array = value.As<v8::Array>();
-    context_extensions.reserve(array->Length());
-    for (uint32_t i = 0; i < array->Length(); ++i) {
+    // As for parameters: the guest's length, read once, capped, and never
+    // reserved whole.
+    const uint32_t length = array->Length();
+    if (length > kMaxParams) return napi_invalid_arg;
+    context_extensions.reserve(std::min<uint32_t>(length, 64));
+    for (uint32_t i = 0; i < length; ++i) {
       v8::Local<v8::Value> item;
       if (!array->Get(current, i).ToLocal(&item) || !item->IsObject()) return napi_invalid_arg;
       context_extensions.push_back(item.As<v8::Object>());
     }
   }
 
+  // The names live only for this compile: charged as transient memory.
+  NapiHostCharge params_charge = HostCharge(env, NapiHostMemory::kTransient);
   std::vector<std::string> param_strings;
-  if (!ReadParamsArray(env, params_or_undefined, &param_strings)) return napi_invalid_arg;
+  const napi_status params_status =
+      ReadParamsArray(env, params_or_undefined, &param_strings, &params_charge);
+  if (params_status != napi_ok) return params_status;
 
   // Artifact fast path: bytecode_compile/deserialize already built this exact
   // function (same context, offsets, params, filename, host symbol) — reuse
@@ -3309,6 +3408,9 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_cached_data(
     napi_value* result_out) {
   if (env == nullptr || module_handle == nullptr || result_out == nullptr) return napi_invalid_arg;
   NAPI_V8_RETURN_IF_TERMINATING(env);
+  // Under resource limits a guest cache is never consumed (bytecode_open),
+  // so producing one only costs unaccounted memory.
+  if (env->agent != nullptr && env->agent->resource_limits) return napi_generic_failure;
   ModuleWrapRecord* record = ModuleRecord(module_handle);
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);

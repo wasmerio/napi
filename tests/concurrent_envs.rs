@@ -372,11 +372,13 @@ fn a_message_has_exactly_one_consumer() {
 
 unsafe extern "C" {
     fn snapi_bridge_unofficial_configure_runtime(flags: *const c_char, length: u32) -> i32;
-    /// `webassembly_policy` 1 is `WasmPolicy::EnabledUnmetered`.
+    /// `webassembly_policy` 1 is `WasmPolicy::EnabledUnmetered`;
+    /// `resource_limits` 0 is a standalone application.
     fn snapi_bridge_unofficial_create_env(
         module_api_version: i32,
         guest_heap_ctx: *const c_void,
         webassembly_policy: u32,
+        resource_limits: u32,
         env_out: *mut *mut c_void,
     ) -> i32;
     fn snapi_bridge_unofficial_release_env(env: *mut c_void) -> i32;
@@ -411,7 +413,7 @@ fn bridge_call_throughput() {
                 thread::spawn(move || unsafe {
                     let mut env: *mut c_void = std::ptr::null_mut();
                     assert_eq!(
-                        snapi_bridge_unofficial_create_env(8, std::ptr::null(), 1, &mut env),
+                        snapi_bridge_unofficial_create_env(8, std::ptr::null(), 1, 0, &mut env),
                         0
                     );
                     let mut id = 0u32;
@@ -498,7 +500,7 @@ fn foreign_threads_may_only_terminate_an_env() {
         );
         let mut env: *mut c_void = std::ptr::null_mut();
         assert_eq!(
-            snapi_bridge_unofficial_create_env(8, std::ptr::null(), 1, &mut env),
+            snapi_bridge_unofficial_create_env(8, std::ptr::null(), 1, 0, &mut env),
             0
         );
         let mut global = 0u32;

@@ -33,10 +33,13 @@
 
 // Provider-private (v8/src/unofficial_napi.cc): unofficial_napi_create_env
 // with the embedder's WebAssembly policy. Never imported by guests.
+// `resource_limits` nonzero: the isolate is created under resource limits
+// (napi_agent__::resource_limits), before anything runs in it.
 extern "C" napi_status NAPI_CDECL snapi_private_create_env(
     int32_t module_api_version,
     const unofficial_napi_env_create_options* options,
     uint32_t webassembly_policy,
+    uint32_t resource_limits,
     napi_env* env_out,
     unofficial_napi_env_owner* owner_out);
 
@@ -142,15 +145,18 @@ struct BookkeepingAccount {
     return true;
   }
 
-  // Returns everything granted and the budget reference. The agent's tables
-  // are gone.
-  void Close() {
-    live = 0;
+  // Returns everything granted and the budget reference.
+  void Detach() {
     if (budget == nullptr) return;
     if (granted != 0) napi_host_bookkeeping_uncharge(budget, granted);
     granted = 0;
     napi_host_budget_release(budget);
     budget = nullptr;
+  }
+
+  void Close() {
+    live = 0;
+    Detach();
   }
 };
 
@@ -3651,6 +3657,7 @@ extern "C" int snapi_bridge_create_function(SnapiEnvState* env_state, const char
 extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
                                                   const void* guest_heap_ctx,
                                                   uint32_t webassembly_policy,
+                                                  uint32_t resource_limits,
                                                   SnapiEnvState** env_out) {
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;
@@ -3662,10 +3669,10 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
     options.guest_heap = reinterpret_cast<unofficial_napi_guest_heap>(
         const_cast<void*>(guest_heap_ctx));
     s = snapi_private_create_env(module_api_version, &options,
-                                 webassembly_policy, &env, &owner);
+                                 webassembly_policy, resource_limits, &env, &owner);
   } else {
     s = snapi_private_create_env(module_api_version, nullptr,
-                                 webassembly_policy, &env, &owner);
+                                 webassembly_policy, resource_limits, &env, &owner);
   }
   if (s != napi_ok) return s;
 
@@ -3694,6 +3701,7 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
     uint32_t /*stack_limit*/,
     const void* guest_heap_ctx,
     uint32_t webassembly_policy,
+    uint32_t resource_limits,
     SnapiEnvState** env_out) {
   unofficial_napi_env_create_options options{};
   const bool has_options =
@@ -3720,7 +3728,7 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;
   napi_status s = snapi_private_create_env(
-      module_api_version, has_options ? &options : nullptr, webassembly_policy,
+      module_api_version, has_options ? &options : nullptr, webassembly_policy, resource_limits,
       &env, &owner);
   if (s != napi_ok) return s;
 
@@ -3867,17 +3875,19 @@ extern "C" int snapi_bridge_value_id_alive(SnapiEnvState* env_state, uint32_t id
 extern "C" int snapi_bridge_unofficial_set_host_budget(SnapiEnvState* env_state,
                                                        const void* budget) {
   auto* state = LookupEnvState(env_state);
-  if (state == nullptr) return napi_invalid_arg;
-  if (!state->agent->bookkeeping.Attach(budget)) return napi_generic_failure;
-  // The provider's host memory (messages) holds a reference of its own: its
-  // charges can outlive the agent.
+  if (state == nullptr || budget == nullptr) return napi_invalid_arg;
+  // Bookkeeping takes a separate reference. The provider takes the caller's
+  // reference on success because its charges can outlive the agent.
   napi_host_budget_retain(budget);
-  if (snapi_private_set_host_memory(state->env, const_cast<void*>(budget),
-                                    napi_host_memory_charge, napi_host_memory_uncharge,
-                                    HostBudgetRelease) != napi_ok) {
+  if (!state->agent->bookkeeping.Attach(budget)) {
     napi_host_budget_release(budget);
+    return napi_generic_failure;
   }
-  return napi_ok;
+  const napi_status status = snapi_private_set_host_memory(
+      state->env, const_cast<void*>(budget), napi_host_memory_charge,
+      napi_host_memory_uncharge, HostBudgetRelease);
+  if (status != napi_ok) state->agent->bookkeeping.Detach();
+  return status;
 }
 
 extern "C" int snapi_bridge_unofficial_release_env(SnapiEnvState* env_state) {

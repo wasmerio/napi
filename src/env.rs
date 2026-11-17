@@ -18,8 +18,10 @@ use crate::budget::{
     EnvHeapCharge, EnvRejected, HeapReservation, Pool, RequestedHeap, ResourceBudget,
 };
 use crate::id_hash::IdHashMap;
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+use crate::snapi::snapi_bridge_unofficial_set_host_budget;
 use crate::snapi::{
-    SnapiEnv, snapi_bridge_unofficial_release_env, snapi_bridge_unofficial_set_host_budget,
+    SnapiEnv, snapi_bridge_unofficial_release_env,
     snapi_bridge_unofficial_set_host_near_heap_limit_callback,
 };
 
@@ -307,6 +309,29 @@ impl NapiEnv {
         self.managed_lane_activator.is_some()
     }
 
+    /// Whether this store's application shares the process under an
+    /// embedder's limits: an embedder budgets it ([`ResourceBudget::is_budgeted`],
+    /// the same test the WebAssembly default uses), or its context is
+    /// managed. Its isolates are then created under resource limits; a
+    /// standalone, unbudgeted application is not restricted.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn enforces_resource_limits(&self) -> bool {
+        self.budget.is_budgeted() || self.is_managed()
+    }
+
+    /// The flag `snapi_bridge_unofficial_create_env*` takes: nonzero to
+    /// create the isolate under resource limits.
+    pub(crate) fn resource_limits_flag(&self) -> u32 {
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        {
+            u32::from(self.enforces_resource_limits())
+        }
+        #[cfg(all(target_arch = "wasm32", feature = "js"))]
+        {
+            0
+        }
+    }
+
     /// Binds the instance's V8 lane to this thread for an env creation, so
     /// the isolate's V8 work goes to it. A managed context gets the lane from
     /// its embedder the first time. A standalone context has none, and binds
@@ -353,15 +378,30 @@ impl NapiEnv {
         self.budget.try_reserve_env(requested, self.max_envs)
     }
 
-    /// Register a successfully-created env, attach its heap charge, and — under
-    /// a limited budget — install the host-owned near-heap-limit callback so V8
-    /// heap growth for this isolate is charged against the budget. Teardown
-    /// releases both the initial ceiling and any granted growth.
+    /// Attach host accounting and register the env. If accounting fails,
+    /// release the new env and its reservation without publishing the env.
+    /// A clamped heap also gets a near-heap-limit callback that charges growth.
     pub(crate) fn commit_isolate(
         &mut self,
         env: SnapiEnv,
         reservation: &HeapReservation,
-    ) -> (u32, u32) {
+    ) -> Result<(u32, u32), i32> {
+        // An accountant can begin with an unlimited heap reservation and
+        // reduce its limit later. Install host accounting for its full lifetime.
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        if self.budget.is_budgeted() {
+            let reference = ResourceBudget::bridge_reference(&self.budget);
+            // SAFETY: This thread just created the env and owns it. The
+            // bridge takes the budget reference on success.
+            let status = unsafe { snapi_bridge_unofficial_set_host_budget(env, reference) };
+            if status != 0 {
+                ResourceBudget::drop_bridge_reference(reference);
+                unsafe { snapi_bridge_unofficial_release_env(env) };
+                self.abort_isolate(reservation);
+                return Err(status);
+            }
+        }
+
         let (env_id, scope_id) = self.register_napi_env(env);
         {
             // If the host already stopped this app's JS, an isolate created
@@ -399,15 +439,6 @@ impl NapiEnv {
                 );
             }
 
-            // Charge the bridge's handle tables for this isolate to the
-            // budget, so its host bookkeeping cannot grow host RSS past it.
-            let reference = ResourceBudget::bridge_reference(&self.budget);
-            // SAFETY: `env` is the isolate just created; on success the
-            // bridge owns `reference` until it releases the isolate.
-            if unsafe { snapi_bridge_unofficial_set_host_budget(env, reference) } != 0 {
-                ResourceBudget::drop_bridge_reference(reference);
-            }
-
             boxed as usize
         } else {
             0
@@ -420,7 +451,7 @@ impl NapiEnv {
                 tracker,
             },
         );
-        (env_id, scope_id)
+        Ok((env_id, scope_id))
     }
 
     /// The heap tracker of a live budgeted env, or `None` for an env under

@@ -51,6 +51,7 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
             8,
             std::ptr::null(),
             webassembly_policy,
+            env.data().resource_limits_flag(),
             &mut snapi_env_state,
         )
     };
@@ -542,6 +543,7 @@ fn guest_unofficial_napi_create_env(
             stack_limit,
             std::ptr::null(),
             webassembly_policy,
+            env.data().resource_limits_flag(),
             &mut snapi_env_state,
         )
     };
