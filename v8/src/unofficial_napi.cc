@@ -513,6 +513,10 @@ bool IsEnvThreadEntered(napi_env env) {
 // nothing is returned, as when the variable is unset or empty.
 std::unique_ptr<v8impl::detail::env_cpu_profile::State> StartEnvCPUProfile(napi_env env) {
   using namespace v8impl::detail::env_cpu_profile;
+  // A managed process runs applications of many tenants: an operator's
+  // variable must not profile whichever env comes first, write its function
+  // names and URLs to a shared directory, or start a sampling thread.
+  if (g_managed_runtime_requested.load(std::memory_order_acquire)) return nullptr;
   const char* directory = std::getenv(kDirectoryVariable);
   if (directory == nullptr || directory[0] == '\0') return nullptr;
   static std::atomic<uint64_t> attempted{0};
@@ -1029,7 +1033,10 @@ void PromiseRejectCallback(v8::PromiseRejectMessage message) {
       return;
   }
 
+  // Not in a managed process: tenants' rejection values would reach the
+  // shared host stderr.
   const bool debug_promise_reject =
+      !g_managed_runtime_requested.load(std::memory_order_acquire) &&
       std::getenv("EDGE_DEBUG_EXCEPTIONS") != nullptr &&
       std::getenv("EDGE_DEBUG_EXCEPTIONS")[0] != '\0' &&
       std::getenv("EDGE_DEBUG_EXCEPTIONS")[0] != '0';
@@ -2413,6 +2420,15 @@ extern "C" napi_status NAPI_CDECL snapi_private_set_host_memory(
   memory->uncharge = uncharge;
   memory->release = release;
   env->agent->host_memory = std::move(memory);
+  return napi_ok;
+}
+
+// Puts the isolate of a freshly created env under resource limits
+// (napi_agent__::resource_limits). Called by the bridge before the guest runs
+// anything in it; there is no way back.
+extern "C" napi_status NAPI_CDECL snapi_private_enable_resource_limits(napi_env env) {
+  if (env == nullptr || env->agent == nullptr) return napi_invalid_arg;
+  env->agent->resource_limits = true;
   return napi_ok;
 }
 
@@ -3845,6 +3861,9 @@ napi_status NAPI_CDECL unofficial_napi_profile_start(
   if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
   napi_agent__* agent = env->agent;
   if (agent == nullptr) return napi_invalid_arg;
+  // A profiler runs a sampling thread outside the instance's lane and keeps
+  // unaccounted samples.
+  if (agent->resource_limits) return napi_generic_failure;
 
   if (kind == unofficial_napi_profile_heap) {
     if (std::any_of(agent->active_profiles.begin(),
@@ -3954,6 +3973,8 @@ napi_status NAPI_CDECL unofficial_napi_take_heap_snapshot(
   }
   *json_out = nullptr;
   if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
+  // A snapshot builds a native copy of the whole heap, outside the budget.
+  if (env->agent != nullptr && env->agent->resource_limits) return napi_generic_failure;
 
   v8::HeapProfiler::HeapSnapshotOptions snapshot_options;
   snapshot_options.snapshot_mode =
@@ -4011,6 +4032,9 @@ napi_status NAPI_CDECL unofficial_napi_notify_datetime_configuration_change(napi
 napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
                                                              napi_value* result_out) {
   if (env == nullptr || env->isolate == nullptr || result_out == nullptr) return napi_invalid_arg;
+  // node:v8's Serializer/Deserializer keep their buffers in host memory the
+  // budget does not see (messages go through message_create_bounded).
+  if (env->agent != nullptr && env->agent->resource_limits) return napi_generic_failure;
 
   v8::Isolate* isolate = env->isolate;
   // The binding is returned past this scope: escaped, it lives in the

@@ -142,6 +142,13 @@ struct napi_agent__ {
   // The embedder's budget for host memory the provider allocates for this
   // isolate (NapiHostMemory), or null when nothing is charged.
   std::shared_ptr<NapiHostMemory> host_memory;
+
+  // The embedder budgets or manages the isolate's application, which shares
+  // the process with others: tools that make the host write files, start
+  // threads or hold unaccounted memory are refused, and the engine does not
+  // consume code caches the guest supplies. Set once, right after the env is
+  // created (snapi_private_enable_resource_limits).
+  bool resource_limits = false;
   // The instance lane bound when the isolate was created
   // (snapi_v8_lane_current_id), or 0 for a standalone isolate. Fixed once the
   // agent is set up.

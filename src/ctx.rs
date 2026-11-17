@@ -58,7 +58,8 @@ pub enum WasmPolicy {
     /// there under this policy.
     Restricted,
     /// V8's `WebAssembly` as the engine ships it, **without resource
-    /// accounting** (the default).
+    /// accounting**: the default of a standalone context (see
+    /// [`NapiCtxBuilder::webassembly`]), and `WasmPolicy::default()`.
     ///
     /// Guest JavaScript can make V8 reserve address space for wasm memories
     /// (by default 4 GiB for each 32-bit memory without a declared maximum)
@@ -90,7 +91,9 @@ impl WasmPolicy {
 pub struct NapiCtxBuilder {
     limits: NapiLimits,
     accountant: Option<Arc<dyn NapiMemoryAccountant>>,
-    webassembly: WasmPolicy,
+    /// `None`: [`WasmPolicy::Restricted`] for a budgeted or managed context,
+    /// [`WasmPolicy::EnabledUnmetered`] otherwise.
+    webassembly: Option<WasmPolicy>,
 }
 
 #[derive(Clone, Debug)]
@@ -269,12 +272,19 @@ impl NapiCtxBuilder {
         self
     }
 
-    /// Whether guest JavaScript can use V8's `WebAssembly` (default:
-    /// [`WasmPolicy::EnabledUnmetered`], which no limit of this context
-    /// covers). Applies to every environment a guest creates through this
-    /// context, including those of its WASIX worker threads.
+    /// Whether guest JavaScript can use V8's `WebAssembly`. Applies to every
+    /// environment a guest creates through this context, including those of
+    /// its WASIX worker threads.
+    ///
+    /// The default depends on the context. A standalone context (no memory
+    /// limit, no accountant, not managed) gets
+    /// [`WasmPolicy::EnabledUnmetered`]. A budgeted or managed context gets
+    /// [`WasmPolicy::Restricted`], because no limit of the context covers
+    /// unmetered WebAssembly; such an embedder enables it explicitly. (The
+    /// host-JavaScript backend cannot restrict it and always defaults to
+    /// [`WasmPolicy::EnabledUnmetered`].)
     pub fn webassembly(mut self, policy: WasmPolicy) -> Self {
-        self.webassembly = policy;
+        self.webassembly = Some(policy);
         self
     }
 
@@ -333,10 +343,24 @@ impl NapiCtxBuilder {
         if let Some(bytes) = self.limits.heap_emergency_headroom_bytes {
             budget.set_heap_emergency_headroom(bytes);
         }
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        let managed = managed_lane_activator.is_some();
+        // The host-JavaScript backend cannot restrict WebAssembly (env
+        // creation would fail), so its contexts keep the engine's default.
+        #[cfg(all(target_arch = "wasm32", feature = "js"))]
+        let managed = false;
+        let restrictable = cfg!(not(all(target_arch = "wasm32", feature = "js")));
+        let webassembly = self.webassembly.unwrap_or_else(|| {
+            if !restrictable || (budget.is_unlimited() && !managed) {
+                WasmPolicy::EnabledUnmetered
+            } else {
+                WasmPolicy::Restricted
+            }
+        });
         NapiCtx {
             inner: Arc::new(NapiCtxInner {
                 limits: self.limits,
-                webassembly: self.webassembly,
+                webassembly,
                 active_sessions: AtomicUsize::new(0),
                 budget,
                 envs: Arc::new(Mutex::new(crate::env::EnvRegistry::default())),

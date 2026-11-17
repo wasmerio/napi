@@ -3818,6 +3818,16 @@ extern "C" int snapi_bridge_value_id_alive(SnapiEnvState* env_state, uint32_t id
   return LoadValue(*bridge_state, id) != nullptr ? 1 : 0;
 }
 
+extern "C" napi_status NAPI_CDECL snapi_private_enable_resource_limits(napi_env env);
+
+// Host-only: puts the env's isolate under resource limits, for an embedder
+// that budgets or manages the application (NapiEnv::enforces_resource_limits).
+extern "C" int snapi_bridge_unofficial_enable_resource_limits(SnapiEnvState* env_state) {
+  auto* state = LookupEnvState(env_state);
+  if (state == nullptr) return napi_invalid_arg;
+  return snapi_private_enable_resource_limits(state->env);
+}
+
 // Host-only: charges the env's agent's handle tables to `budget`, a reference
 // to the context's ResourceBudget that the agent owns on success (returned at
 // release). Fails, leaving the reference with the caller, if the agent already

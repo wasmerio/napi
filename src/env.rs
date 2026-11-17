@@ -307,6 +307,16 @@ impl NapiEnv {
         self.managed_lane_activator.is_some()
     }
 
+    /// Whether this store's application shares the process under an
+    /// embedder's limits: it has a memory budget, or its context is managed.
+    /// Its isolates are then put under resource limits (see
+    /// `snapi_bridge_unofficial_enable_resource_limits`); a standalone,
+    /// unbudgeted application is not restricted.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn enforces_resource_limits(&self) -> bool {
+        !self.budget.is_unlimited() || self.is_managed()
+    }
+
     /// Binds the instance's V8 lane to this thread for an env creation, so
     /// the isolate's V8 work goes to it. A managed context gets the lane from
     /// its embedder the first time. A standalone context has none, and binds
@@ -381,6 +391,15 @@ impl NapiEnv {
                     crate::snapi::snapi_bridge_unofficial_stop_execution(env);
                 }
             }
+        }
+
+        // Before the guest can run anything in the isolate.
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        if self.enforces_resource_limits() {
+            // SAFETY: `env` is the isolate just created and is still live.
+            let status =
+                unsafe { crate::snapi::snapi_bridge_unofficial_enable_resource_limits(env) };
+            debug_assert_eq!(status, 0, "a new env refused resource limits");
         }
 
         let tracker = if reservation.clamped {

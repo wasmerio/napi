@@ -147,6 +147,10 @@ unsafe extern "C" {
     /// Charge the host bookkeeping of this env's handle tables to `budget`, a
     /// reference from `ResourceBudget::bridge_reference` that the bridge owns
     /// on success. Nonzero (the caller keeps the reference) on failure.
+    /// Puts the env's isolate under resource limits (profilers, heap
+    /// snapshots, serdes and guest code caches are refused). Nonzero on
+    /// failure.
+    pub fn snapi_bridge_unofficial_enable_resource_limits(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_set_host_budget(
         env: SnapiEnv,
         budget: *const std::ffi::c_void,

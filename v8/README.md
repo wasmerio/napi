@@ -49,6 +49,12 @@ CPU profile, from the end of that call to the start of
 guest import or script. Unset or empty, it does nothing. It is read each time
 an env is created.
 
+A managed process (one whose embedder built managed imports, such as Wasmer
+Edge) ignores it: its envs belong to many tenants, whose function names and
+URLs would land in one shared directory. It ignores `EDGE_DEBUG_EXCEPTIONS`
+for the same reason, since that prints rejected promise values to the shared
+stderr.
+
 Each session writes two files, `<name>.cpuprofile` and
 `<name>.metadata.json`. `<name>` is `env-<pid>-<token>-<n>`, where `<token>`
 is 16 hex digits drawn once per process and `<n>` numbers the process's

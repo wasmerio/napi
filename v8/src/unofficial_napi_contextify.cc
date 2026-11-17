@@ -1586,7 +1586,10 @@ bool ReadParamsArray(napi_env env, napi_value params_or_undefined, std::vector<s
   if (value.IsEmpty() || !value->IsArray()) return false;
   v8::Local<v8::Context> context = env->context();
   v8::Local<v8::Array> array = value.As<v8::Array>();
-  out->reserve(array->Length());
+  // The length is the guest's (up to 2^32 - 1, holes included): reserve no
+  // more than a few, so a sparse array fails on its first hole instead of
+  // making the host reserve gigabytes up front.
+  out->reserve(std::min<uint32_t>(array->Length(), 64));
   for (uint32_t i = 0; i < array->Length(); ++i) {
     v8::Local<v8::Value> item;
     if (!array->Get(context, i).ToLocal(&item) || !item->IsString()) return false;
@@ -2109,8 +2112,15 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_open(
   v8::Local<v8::Context> context = RealmContext(env, realm);
   if (context.IsEmpty()) return napi_invalid_arg;
 
-  if (options->has_cache != 0 && options->cache_bytes != nullptr &&
-      options->cache_byte_length != 0) {
+  // V8 does not validate a code cache as untrusted input: a crafted one can
+  // corrupt the heap, and this V8 has no sandbox around it. An isolate under
+  // resource limits shares the process with other tenants, so it compiles
+  // from source and reports the guest's cache as rejected (as V8 does for a
+  // stale one). Caches V8 produced in this isolate are still consumed.
+  const bool trust_guest_cache =
+      env->agent == nullptr || !env->agent->resource_limits;
+  if (trust_guest_cache && options->has_cache != 0 &&
+      options->cache_bytes != nullptr && options->cache_byte_length != 0) {
     bool rejected = false;
     const napi_status status = BytecodeDeserialize(env,
                                                    context,
@@ -3309,6 +3319,9 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_cached_data(
     napi_value* result_out) {
   if (env == nullptr || module_handle == nullptr || result_out == nullptr) return napi_invalid_arg;
   NAPI_V8_RETURN_IF_TERMINATING(env);
+  // Under resource limits a guest cache is never consumed (bytecode_open),
+  // so producing one only costs unaccounted memory.
+  if (env->agent != nullptr && env->agent->resource_limits) return napi_generic_failure;
   ModuleWrapRecord* record = ModuleRecord(module_handle);
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);
