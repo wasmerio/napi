@@ -144,6 +144,7 @@ struct NativeRetiredProvider {
 pub(crate) struct NativeRetirement {
     providers: Vec<NativeRetiredProvider>,
     _lane: Option<Arc<ManagedV8Lane>>,
+    _session_lease: Option<Arc<crate::ctx::SessionLease>>,
     registry: Arc<std::sync::Mutex<HashSet<usize>>>,
     budget: Arc<ResourceBudget>,
     leases: Vec<NativeBufferLease>,
@@ -307,6 +308,7 @@ impl Drop for NativeRetirement {
             // Move only owned resources; the empty shell cannot run a callback.
             let plan = Self {
                 _lane: self._lane.take(),
+                _session_lease: self._session_lease.take(),
                 providers: std::mem::take(&mut self.providers),
                 registry: self.registry.clone(),
                 budget: self.budget.clone(),
@@ -348,12 +350,12 @@ pub(crate) struct NativeCreationRequest {
     policy: crate::WasmPolicy,
     activator: Option<ManagedV8LaneActivator>,
     messages: Arc<PendingMessages>,
-    lane: Option<Arc<ManagedV8Lane>>,
+    pub(crate) lane: Option<Arc<ManagedV8Lane>>,
     budget: Arc<ResourceBudget>,
     max_envs: Option<usize>,
     registry: Arc<std::sync::Mutex<HashSet<usize>>>,
     stopped: Arc<AtomicBool>,
-    heap: Option<Arc<crate::guest_heap::GuestHeap>>,
+    pub(crate) heap: Option<Arc<crate::guest_heap::GuestHeap>>,
     refill: Option<Arc<dyn crate::NativeGuestRefill>>,
 }
 
@@ -366,10 +368,10 @@ impl NativeCreationRequest {
             && !self.stopped.load(Ordering::Acquire)
     }
 
-    pub(crate) fn reserve(
-        mut self,
-        requested: RequestedHeap,
-    ) -> Result<NativeCreation, EnvRejected> {
+    pub(crate) fn admit_lane(&mut self) -> Result<(), EnvRejected> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(EnvRejected::HeapDoesNotFit);
+        }
         if self.lane.is_none() {
             if let Some(activate) = &self.activator {
                 let lane = activate().map_err(|_| EnvRejected::HeapDoesNotFit)?;
@@ -391,9 +393,14 @@ impl NativeCreationRequest {
                 self.lane = Some(lane);
             }
         }
+        Ok(())
+    }
+
+    pub(crate) fn reserve(self, requested: RequestedHeap) -> Result<NativeCreation, EnvRejected> {
         let reservation = self.budget.try_reserve_env(requested, self.max_envs)?;
         let retirement = NativeRetirement {
             _lane: self.lane.clone(),
+            _session_lease: None,
             providers: vec![NativeRetiredProvider {
                 state: None,
                 retired_state: None,
@@ -416,12 +423,10 @@ impl NativeCreationRequest {
             request: self,
             reservation,
             retirement,
-            value_limit: None,
         };
         // The reservation already has an owned Drop path before this custom
         // accountant query. No NapiEnv/Store reference is exposed to the callback.
         if creation.reservation.clamped {
-            creation.value_limit = None;
             creation.retirement.providers[0]
                 .charge
                 .as_mut()
@@ -444,11 +449,15 @@ pub(crate) struct NativeCreation {
     pub(crate) request: NativeCreationRequest,
     reservation: HeapReservation,
     retirement: NativeRetirement,
-    value_limit: Option<u64>,
 }
 
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 impl NativeCreation {
+    pub(crate) fn install_heap(&mut self, heap: Arc<crate::guest_heap::GuestHeap>) {
+        self.retirement.heap = Some(heap.clone());
+        self.request.heap = Some(heap);
+    }
+
     pub(crate) fn ids(&self) -> NativeEnvIds {
         self.request.ids
     }
@@ -460,6 +469,12 @@ impl NativeCreation {
     /// provider entry cannot observe it before callback-free publication.
     pub(crate) fn create(&mut self, version: i32, total: u64, constrained: u64, stack: u32) -> i32 {
         let _lane = self.request.lane.as_ref().map(ManagedV8Lane::enter);
+        unsafe {
+            crate::snapi::snapi_bridge_init();
+            // Empty defaults initialize a fresh runtime, while a runtime
+            // configured explicitly by the embedder keeps its existing flags.
+            let _ = crate::snapi::snapi_bridge_unofficial_configure_runtime(std::ptr::null(), 0);
+        }
         let allocator = self.request.heap.as_ref().map_or(std::ptr::null(), |heap| {
             heap.make_alloc_ctx(self.request.refill.as_ref().map(Arc::downgrade))
                 .cast_const()
@@ -495,13 +510,7 @@ impl NativeCreation {
                 tracker.env = state as usize;
                 (&**tracker as *const EnvHeapCharge).cast::<c_void>()
             });
-        unsafe {
-            crate::snapi::snapi_bridge_prepare_created_env(
-                state,
-                tracker,
-                self.value_limit.unwrap_or(0),
-            )
-        }
+        unsafe { crate::snapi::snapi_bridge_prepare_created_env(state, tracker) }
     }
 
     /// Called only after all fallible work, guest output writes and map moves
@@ -533,7 +542,7 @@ pub(crate) struct NapiEnv {
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) managed_lane_activator: Option<ManagedV8LaneActivator>,
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    managed_lane: Option<Arc<ManagedV8Lane>>,
+    pub(crate) managed_lane: Option<Arc<ManagedV8Lane>>,
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) next_native_env_id: Arc<AtomicU32>,
     /// Per-app cap on live V8 isolates (`None` = unlimited).
@@ -837,12 +846,29 @@ impl NapiEnv {
     }
 
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn runtime_control(&self) -> crate::NapiRuntimeControl {
+        crate::NapiRuntimeControl::new(
+            self.env_registry.clone(),
+            self.host_stopped.clone(),
+            self.pending_messages.clone(),
+        )
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) fn cancel_guest_termination(&self, env: SnapiEnv) -> i32 {
         let _registry = self
             .env_registry
             .lock()
             .expect("poisoned N-API env registry");
-        if self.host_stopped() || env.is_null() {
+        if self.host_stopped() {
+            if !env.is_null() {
+                unsafe {
+                    crate::snapi::snapi_bridge_unofficial_terminate_execution(env);
+                }
+            }
+            return 1;
+        }
+        if env.is_null() {
             return 1;
         }
         unsafe { crate::snapi::snapi_bridge_unofficial_cancel_terminate_execution(env) }
@@ -856,6 +882,10 @@ impl NapiEnv {
             .tracker
             .as_ref()?
             .take_settle_turn()
+    }
+
+    pub(crate) fn is_deactivated(&self) -> bool {
+        self.deactivated
     }
 
     pub(crate) fn creation_enabled(&self) -> bool {
@@ -1007,6 +1037,7 @@ impl NapiEnv {
             .collect();
         let mut retirement = NativeRetirement {
             _lane: self.managed_lane.clone(),
+            _session_lease: None,
             providers: ids
                 .iter()
                 .map(|_| NativeRetiredProvider {
@@ -1053,6 +1084,7 @@ impl NapiEnv {
         } else {
             self.configured = false;
             self.deactivated = true;
+            retirement._session_lease = self.session_lease.take();
             self.default_napi_env_id = None;
             self.napi_scopes.clear();
             self.napi_envs.clear();

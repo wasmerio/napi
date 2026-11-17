@@ -86,7 +86,11 @@ pub(super) fn register(store: &mut impl AsStoreMut, fe: &FunctionEnv<NapiEnv>, i
     }
 }
 
-fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<i32, RuntimeError> {
+fn dispatch(
+    name: &str,
+    mut env: FunctionEnvMut<NapiEnv>,
+    args: &[Value],
+) -> Result<i32, RuntimeError> {
     // Control shutdown is sticky across cloned WASIX worker import sets.
     // Release is still available so an instance can tear down admitted envs.
     if env.data().stopped_for_guest()
@@ -122,7 +126,12 @@ fn dispatch(name: &str, env: FunctionEnvMut<NapiEnv>, args: &[Value]) -> Result<
             let Some(_charge) = env.data().pending_messages.take_legacy(id as u32) else {
                 return Err(RuntimeError::new("invalid legacy serialized payload"));
             };
-            unsafe { crate::snapi::snapi_bridge_unofficial_message_drop(id as u32) };
+            unsafe {
+                {
+                    use crate::snapi::snapi_bridge_unofficial_message_drop;
+                    parked_bridge!(env, snapi_bridge_unofficial_message_drop(id as u32))
+                }
+            };
             Ok(0)
         }
         "unofficial_napi_create_env" => Ok(super::guest_unofficial_napi_create_env(
@@ -660,14 +669,28 @@ fn legacy_module_create(
         Err(error) => {
             if handle != 0 {
                 unsafe {
-                    crate::snapi::snapi_bridge_unofficial_module_wrap_destroy(snapi_env, handle)
+                    {
+                        use crate::snapi::snapi_bridge_unofficial_module_wrap_destroy;
+                        parked_bridge!(
+                            env,
+                            snapi_bridge_unofficial_module_wrap_destroy(snapi_env, handle)
+                        )
+                    }
                 };
             }
             return Err(RuntimeError::user(Box::new(error)));
         }
     };
     if status == 0 && !super::write_guest_u32(&mut env, result_ptr as u32, handle) {
-        unsafe { crate::snapi::snapi_bridge_unofficial_module_wrap_destroy(snapi_env, handle) };
+        unsafe {
+            {
+                use crate::snapi::snapi_bridge_unofficial_module_wrap_destroy;
+                parked_bridge!(
+                    env,
+                    snapi_bridge_unofficial_module_wrap_destroy(snapi_env, handle)
+                )
+            }
+        };
         return Ok(1);
     }
     Ok(status)
@@ -691,20 +714,26 @@ fn legacy_module_metadata(mut env: FunctionEnvMut<NapiEnv>, args: &[Value], requ
     let mut result_id = 0u32;
     let mut has_tla = 0i32;
     let status = unsafe {
-        crate::snapi::snapi_bridge_unofficial_module_wrap_get_legacy_metadata(
-            snapi_env,
-            handle as u32,
-            if requests {
-                &mut result_id
-            } else {
-                std::ptr::null_mut()
-            },
-            if requests {
-                std::ptr::null_mut()
-            } else {
-                &mut has_tla
-            },
-        )
+        {
+            use crate::snapi::snapi_bridge_unofficial_module_wrap_get_legacy_metadata;
+            parked_bridge!(
+                env,
+                snapi_bridge_unofficial_module_wrap_get_legacy_metadata(
+                    snapi_env,
+                    handle as u32,
+                    if requests {
+                        &mut result_id
+                    } else {
+                        std::ptr::null_mut()
+                    },
+                    if requests {
+                        std::ptr::null_mut()
+                    } else {
+                        &mut has_tla
+                    },
+                )
+            )
+        }
     };
     if status != 0 {
         return status;
@@ -782,8 +811,15 @@ fn legacy_heap_statistics(
         version: 1,
         ..Default::default()
     };
-    let status =
-        unsafe { crate::snapi::snapi_bridge_unofficial_get_heap_statistics(snapi_env, &mut stats) };
+    let status = unsafe {
+        {
+            use crate::snapi::snapi_bridge_unofficial_get_heap_statistics;
+            parked_bridge!(
+                env,
+                snapi_bridge_unofficial_get_heap_statistics(snapi_env, &mut stats)
+            )
+        }
+    };
     if status != 0 {
         return status;
     }
@@ -829,12 +865,18 @@ fn legacy_heap_space_count(
     }
     let mut count = 0u32;
     let status = unsafe {
-        crate::snapi::snapi_bridge_unofficial_get_heap_space_statistics(
-            snapi_env,
-            std::ptr::null_mut(),
-            0,
-            &mut count,
-        )
+        {
+            use crate::snapi::snapi_bridge_unofficial_get_heap_space_statistics;
+            parked_bridge!(
+                env,
+                snapi_bridge_unofficial_get_heap_space_statistics(
+                    snapi_env,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut count,
+                )
+            )
+        }
     };
     if status == 0 && !super::write_guest_u32(&mut env, result_ptr as u32, count) {
         return 1;
@@ -870,12 +912,18 @@ fn legacy_heap_space_statistics(
         (0..capacity).map(|_| Default::default()).collect();
     let mut count = 0u32;
     let status = unsafe {
-        crate::snapi::snapi_bridge_unofficial_get_heap_space_statistics(
-            snapi_env,
-            stats.as_mut_ptr(),
-            capacity as u32,
-            &mut count,
-        )
+        {
+            use crate::snapi::snapi_bridge_unofficial_get_heap_space_statistics;
+            parked_bridge!(
+                env,
+                snapi_bridge_unofficial_get_heap_space_statistics(
+                    snapi_env,
+                    stats.as_mut_ptr(),
+                    capacity as u32,
+                    &mut count,
+                )
+            )
+        }
     };
     if status != 0 {
         return status;
@@ -910,8 +958,15 @@ fn legacy_process_memory_info(mut env: FunctionEnvMut<NapiEnv>, args: &[Value]) 
         version: 1,
         ..Default::default()
     };
-    let status =
-        unsafe { crate::snapi::snapi_bridge_unofficial_get_heap_statistics(snapi_env, &mut stats) };
+    let status = unsafe {
+        {
+            use crate::snapi::snapi_bridge_unofficial_get_heap_statistics;
+            parked_bridge!(
+                env,
+                snapi_bridge_unofficial_get_heap_statistics(snapi_env, &mut stats)
+            )
+        }
+    };
     if status != 0 {
         return status;
     }
@@ -964,7 +1019,12 @@ fn legacy_set_fatal_error_callbacks(
     // The published guest's callbacks abort the process. A provider hook
     // records a workload-local stop if V8 returns to the import boundary.
     // Native fatal errors can still abort inside V8 before control returns.
-    unsafe { crate::snapi::snapi_bridge_unofficial_attach_legacy_env(snapi_env) }
+    unsafe {
+        {
+            use crate::snapi::snapi_bridge_unofficial_attach_legacy_env;
+            parked_bridge!(env, snapi_bridge_unofficial_attach_legacy_env(snapi_env))
+        }
+    }
 }
 
 fn legacy_compile_function(
@@ -1119,7 +1179,7 @@ fn legacy_create_cached_data(
 }
 
 fn legacy_module_hook(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     guest_env: i32,
     callback: i32,
     kind: i32,
@@ -1128,11 +1188,17 @@ fn legacy_module_hook(
         return 1;
     }
     unsafe {
-        crate::snapi::snapi_bridge_unofficial_module_wrap_set_legacy_hook(
-            super::snapi_env(&env, guest_env),
-            callback as u32,
-            kind,
-        )
+        {
+            use crate::snapi::snapi_bridge_unofficial_module_wrap_set_legacy_hook;
+            parked_bridge!(
+                env,
+                snapi_bridge_unofficial_module_wrap_set_legacy_hook(
+                    super::snapi_env(&env, guest_env),
+                    callback as u32,
+                    kind,
+                )
+            )
+        }
     }
 }
 
@@ -1173,30 +1239,55 @@ fn legacy_serialize_value(
         Ok(status) => status,
         Err(error) => {
             if message != 0 {
-                unsafe { crate::snapi::snapi_bridge_unofficial_message_drop(message) };
+                unsafe {
+                    {
+                        use crate::snapi::snapi_bridge_unofficial_message_drop;
+                        parked_bridge!(env, snapi_bridge_unofficial_message_drop(message))
+                    }
+                };
             }
             return Err(RuntimeError::user(Box::new(error)));
         }
     };
     if status != 0 {
         if message != 0 {
-            unsafe { crate::snapi::snapi_bridge_unofficial_message_drop(message) };
+            unsafe {
+                {
+                    use crate::snapi::snapi_bridge_unofficial_message_drop;
+                    parked_bridge!(env, snapi_bridge_unofficial_message_drop(message))
+                }
+            };
         }
         return Ok(status);
     }
     if !charge.shrink(retained_bytes) {
-        unsafe { crate::snapi::snapi_bridge_unofficial_message_drop(message) };
+        unsafe {
+            {
+                use crate::snapi::snapi_bridge_unofficial_message_drop;
+                parked_bridge!(env, snapi_bridge_unofficial_message_drop(message))
+            }
+        };
         return Ok(1);
     }
     charge.bind_memory(memory, shared_memory);
     if let Err(rejected_charge) = pending.insert_legacy(message, charge) {
-        unsafe { crate::snapi::snapi_bridge_unofficial_message_drop(message) };
+        unsafe {
+            {
+                use crate::snapi::snapi_bridge_unofficial_message_drop;
+                parked_bridge!(env, snapi_bridge_unofficial_message_drop(message))
+            }
+        };
         drop(rejected_charge);
         return Ok(1);
     }
     if !super::write_guest_u32(&mut env, result_ptr as u32, message) {
         let charge = pending.take_legacy(message);
-        unsafe { crate::snapi::snapi_bridge_unofficial_message_drop(message) };
+        unsafe {
+            {
+                use crate::snapi::snapi_bridge_unofficial_message_drop;
+                parked_bridge!(env, snapi_bridge_unofficial_message_drop(message))
+            }
+        };
         drop(charge);
         return Ok(1);
     }

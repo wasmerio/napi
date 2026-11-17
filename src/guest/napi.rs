@@ -152,13 +152,13 @@ macro_rules! reserve_property_array {
 
 native_import! {
 fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> Result<i32, RuntimeError> {
+    if env.data().is_deactivated() {
+        return Ok(0);
+    }
     if !env.data().creation_enabled() {
         // Direct instantiation must configure the attachment before calling N-API.
         return Err(RuntimeError::new("N-API activation before instance configuration is unsupported"));
     }
-    let _ = unsafe { parked_bridge!(env, snapi_bridge_init()) };
-    // Preserve an embedder's prior explicit runtime configuration.
-    let _ = unsafe { parked_bridge!(env, snapi_bridge_unofficial_configure_runtime(std::ptr::null(), 0)) };
     if let Some(id) = env.data().default_napi_env_id {
         return Ok(id as i32);
     }
@@ -182,10 +182,36 @@ fn with_cb_context<R: Copy>(
     f: impl FnOnce() -> R,
 ) -> Result<R, RuntimeError> {
     let native = env.data().resolve_napi_env(guest_env);
-    let result = with_callback_state(env, native, f)?;
     let budget = env.data().budget.clone();
-    env.as_store_mut()
-        .parked(|| budget.deliver_limits_exceeded());
+    let control = env.data().runtime_control();
+    let mut fatal = false;
+    let result = with_callback_state(env, native, || {
+        use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+        let outcome = catch_unwind(AssertUnwindSafe(f));
+        let reports = catch_unwind(AssertUnwindSafe(|| {
+            if !native.is_null()
+                && unsafe { snapi_bridge_unofficial_take_fatal_requested(native) } != 0
+            {
+                control.terminate_all();
+                fatal = true;
+            }
+            budget.deliver_limits_exceeded();
+        }));
+        match outcome {
+            Err(first) => {
+                if let Err(second) = reports {
+                    let _ = catch_unwind(AssertUnwindSafe(|| drop(second)));
+                }
+                resume_unwind(first)
+            }
+            Ok(value) => {
+                if let Err(panic) = reports {
+                    resume_unwind(panic);
+                }
+                value
+            }
+        }
+    })?;
     if let Some(limit) = env.data().heap_settle_due(native) {
         unsafe {
             parked_bridge!(
@@ -194,11 +220,7 @@ fn with_cb_context<R: Copy>(
             );
         }
     }
-    if !native.is_null()
-        && unsafe { parked_bridge!(env, snapi_bridge_unofficial_take_fatal_requested(native)) } != 0
-    {
-        let stopped = env.data().host_stop_flag();
-        stopped.store(true, std::sync::atomic::Ordering::Release);
+    if fatal {
         return Err(RuntimeError::new("N-API provider requested termination"));
     }
     Ok(result)
@@ -307,6 +329,16 @@ fn guest_unofficial_napi_configure_runtime(
     mut env: FunctionEnvMut<NapiEnv>,
     options_ptr: i32,
 ) -> i32 {
+    if env.data().managed_lane_activator.is_none() {
+        let Some(flags) = abi::read_runtime_options(&mut env, options_ptr) else {
+            return 1;
+        };
+        if flags.contains(&0) { return 1; }
+        return unsafe {
+            parked_bridge!(env, snapi_bridge_unofficial_configure_runtime(
+                flags.as_ptr().cast(), flags.len() as u32))
+        };
+    }
     // V8 flags are process-wide. A guest must not change flags for other
     // tenants or make the first caller decide the host's security policy.
     let Some(true) = abi::runtime_options_are_inert(&mut env, options_ptr) else {
@@ -330,6 +362,9 @@ fn guest_unofficial_napi_create_env(
     env_out_ptr: i32,
     scope_out_ptr: i32,
 ) -> Result<i32, RuntimeError> {
+    if options_ptr < 0 || env_out_ptr <= 0 || scope_out_ptr <= 0
+        || !guest_range_is_valid(&mut env, env_out_ptr, 4)
+        || !guest_range_is_valid(&mut env, scope_out_ptr, 4) { return Ok(1); }
     let mut options = NativeCreateOptions {
         version: module_api_version,
         total: 0,
@@ -363,6 +398,13 @@ fn create_env_with_options(
     env_out: i32,
     scope_out: i32,
 ) -> i32 {
+    if env_out <= 0
+        || scope_out <= 0
+        || !guest_range_is_valid(&mut env, env_out, 4)
+        || !guest_range_is_valid(&mut env, scope_out, 4)
+    {
+        return 1;
+    }
     let options = NativeCreateOptions {
         version,
         total: input.total_memory,
@@ -6085,22 +6127,35 @@ fn create_native_provider(
     env: &mut FunctionEnvMut<NapiEnv>,
     options: NativeCreateOptions,
 ) -> Result<crate::env::NativeEnvIds, i32> {
+    if env.data().memory.is_none() {
+        return Err(1);
+    }
     if unsafe { snapi_v8_allocator_active() } != 0 {
         return Err(1);
     }
-    let refill = env.data().native_guest_refill.clone();
-    if let (Some(heap), Some(refill)) = (env.data().guest_heap.clone(), refill) {
-        // Prefunding is advisory: creating an isolate does not require a
-        // guest-visible backing buffer. Preserve the original failure if the
-        // refiller raised one rather than merely refusing this allocation.
-        let _ = heap.refill_leased(&mut env.as_store_mut(), &*refill, 0, true);
-        if crate::native_frame::current_failed() {
-            return Err(1);
-        }
+    if env.data().host_stopped() {
+        let budget = env.data().budget.clone();
+        env.as_store_mut()
+            .parked(|| budget.deliver_limits_exceeded());
+        return Err(1);
     }
     let frame = env.pin_frame().ok_or(1)?;
-    let request = env.data_mut().prepare_native_creation().ok_or(1)?;
+    let mut request = env.data_mut().prepare_native_creation().ok_or(1)?;
     env.as_store_mut().parked(|| {
+        request.admit_lane().map_err(|_| 1)?;
+        let (memory, budget, refill) = with_creation_env(&frame, |current| {
+            if !request.matches(current.data()) {
+                return None;
+            }
+            current.data_mut().managed_lane = request.lane.clone();
+            Some((
+                current.data().memory.clone(),
+                current.data().budget.clone(),
+                current.data().native_guest_refill.clone(),
+            ))
+        })
+        .flatten()
+        .ok_or(1)?;
         let mut creation = request.reserve(options.requested).map_err(|_| 1)?;
         // A reservation accountant may detach this cell, stop the session or
         // reenter default initialization. Recheck before provider creation.
@@ -6117,6 +6172,26 @@ fn create_native_provider(
         .ok_or(1)??;
         if let Some(env) = existing {
             return Ok(crate::env::NativeEnvIds { env, scope: 0 });
+        }
+        if creation.request.heap.is_none() {
+            let memory = memory.ok_or(1)?;
+            let heap = wasmer::Store::with_current(|store| {
+                crate::guest_heap::GuestHeap::get_or_create(store, &memory, budget)
+            })
+            .flatten()
+            .ok_or(1)?;
+            with_creation_env(&frame, |current| {
+                current.data_mut().guest_heap = Some(heap.clone())
+            })
+            .ok_or(1)?;
+            creation.install_heap(heap);
+        }
+        if let (Some(heap), Some(refill)) = (&creation.request.heap, refill) {
+            let _ =
+                wasmer::Store::with_current(|store| heap.refill_leased(store, &*refill, 0, true));
+            if crate::native_frame::current_failed() {
+                return Err(1);
+            }
         }
         let status = creation.create(
             options.version,

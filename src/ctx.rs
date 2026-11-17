@@ -53,21 +53,21 @@ impl NapiLimits {
 /// Guest environments allocate V8 array buffers in the guest's linear memory,
 /// where they count against the context's memory budget. V8 does not allocate
 /// WebAssembly memories and compiled wasm code that way: they come from V8's
-/// page allocator, outside the guest heap. The default therefore removes
-/// `WebAssembly` from guest environments; [`WasmPolicy::EnabledMetered`]
+/// page allocator, outside the guest heap. The default preserves the SDK
+/// WebAssembly behavior; untrusted embedders must explicitly select a policy.
+/// [`WasmPolicy::EnabledMetered`]
 /// exposes it with those allocations bounded and charged.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum WasmPolicy {
     /// `WebAssembly` is absent from the root context and from every `vm`
     /// context of a guest environment, and V8 refuses wasm code generation in
-    /// them. This is the default.
+    /// them. Select this explicitly for untrusted workloads.
     ///
     /// The restriction applies to environments backed by a guest heap, which
     /// is every environment a guest creates through this crate. (The
     /// provider's native C API leaves environments without a guest heap
     /// unrestricted, since their array buffers are not budgeted either.)
-    #[default]
     Restricted,
     /// Expose V8's `WebAssembly` in guest environments **without wasm
     /// limits**. Unsupported for untrusted code.
@@ -93,6 +93,7 @@ pub enum WasmPolicy {
     /// realms) still refuse wasm code generation.
     ///
     /// Intended for trusted workloads and for evaluation.
+    #[default]
     EnabledUnmetered,
     /// Expose V8's `WebAssembly` in guest environments with wasm memory and
     /// code bounded and charged to the context's budget.
@@ -1011,48 +1012,27 @@ impl NapiSession {
             bail!("N-API session instance has already been configured");
         }
 
-        if let Some(memory) = imported_memory {
-            func_env.as_mut(&mut *store).memory = Some(memory.clone());
+        if func_env.as_ref(&*store).memory.is_none() {
+            func_env.as_mut(&mut *store).memory = imported_memory
+                .cloned()
+                .or_else(|| instance.exports.get_memory("memory").ok().cloned());
         }
-
         #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-        {
-            // Stand up the host-side guest-memory allocator now that the memory is
-            // final. All bridge allocations of guest memory go through it, AND it
-            // is the only backing store for V8 ArrayBuffers/Buffers/TypedArrays
-            // (see TrackingArrayBufferAllocator in unofficial_napi.cc) — the
-            // guest's own malloc is never called from the host, and host-heap
-            // allocation is never used for guest-visible V8 memory. A module that
-            // requests N-API imports without usable linear memory, or whose
-            // memory can't support a GuestHeap, cannot run under this bridge: we
-            // fail instantiation here rather than let allocation silently fall
-            // back to unbudgeted, non-guest-shared host memory later.
+        if let Some((arena, refill)) = leased {
             let memory = func_env
                 .as_ref(&*store)
                 .memory
                 .clone()
-                .context("N-API imports require the guest to have linear memory")?;
-            let budget = Arc::clone(&func_env.as_ref(&*store).budget);
-            let (heap, refill) = if let Some((arena, refill)) = leased {
-                if !arena.matches(&*store, &memory, &budget) {
-                    bail!("leased N-API arena does not match this memory and context");
-                }
-                (arena.heap, Some(refill))
-            } else {
-                let heap = crate::guest_heap::GuestHeap::get_or_create(
-                    &mut *store,
-                    &memory,
-                    budget,
-                )
-                .context(
-                    "failed to initialize the guest-heap allocator over the guest's linear memory",
-                )?;
-                (heap, None)
-            };
+                .context("leased N-API requires linear memory")?;
+            let budget = func_env.as_ref(&*store).budget.clone();
+            if !arena.matches(&*store, &memory, &budget) {
+                bail!("leased N-API arena does not match this memory and context");
+            }
             let env = func_env.as_mut(&mut *store);
-            env.guest_heap = Some(heap);
-            env.native_guest_refill = refill;
+            env.guest_heap = Some(arena.heap);
+            env.native_guest_refill = Some(refill);
         }
+        // Direct non-leased imports remain inert until first provider creation.
 
         // The browser backend cannot expose a native pointer into Wasmer's JS
         // Memory. Keep its established guest allocator: exported malloc owns
@@ -1213,11 +1193,11 @@ mod tests {
     }
 
     #[test]
-    fn webassembly_policy_defaults_to_restricted_and_reaches_store_envs() {
-        assert_eq!(WasmPolicy::default(), WasmPolicy::Restricted);
+    fn webassembly_policy_preserves_sdk_default_and_reaches_store_envs() {
+        assert_eq!(WasmPolicy::default(), WasmPolicy::EnabledUnmetered);
         assert_eq!(
             NapiCtx::default().webassembly_policy(),
-            WasmPolicy::Restricted
+            WasmPolicy::EnabledUnmetered
         );
         // Mirrors NapiWebAssemblyPolicy in restricted_context.h.
         assert_eq!(WasmPolicy::Restricted.bridge_code(), 0);

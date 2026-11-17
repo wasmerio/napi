@@ -536,7 +536,7 @@ public:
     unofficial_napi_guest_heap guest_heap =
         guest_heap_.load(std::memory_order_acquire);
     if (guest_heap != nullptr) {
-      napi_host_guest_heap_release(guest_heap);
+      ReleaseGuestHeapContext(guest_heap);
     }
     delete backing_;
   }
@@ -2322,7 +2322,7 @@ snapi_private_create_env(int32_t module_api_version,
   if (policy == NapiWebAssemblyPolicy::kAllowMetered &&
       !EdgeV8WasmMeteringReady()) {
     if (guest_heap != nullptr)
-      napi_host_guest_heap_release(guest_heap);
+      ReleaseGuestHeapContext(guest_heap);
     return napi_generic_failure;
   }
   EdgeV8Platform *platform = nullptr;

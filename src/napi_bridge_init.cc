@@ -1270,7 +1270,6 @@ struct SnapiEnvState {
   std::vector<ValueSlot> value_slots;
   std::vector<uint32_t> value_free_slots;
   size_t live_value_count = 0;
-  size_t value_limit = 0;
 
   // Open scope frames, innermost last. Initialized lazily with the root frame
   // on first use; new values are minted into the innermost frame.
@@ -1832,6 +1831,15 @@ void BeforeBridgeEnvDestroy(void *raw) noexcept {
   // foreign termination uses the Rust registry -> g_mu lock order.
   if (notification->before_destroy != nullptr) {
     notification->before_destroy(notification->data);
+  }
+  auto *state = notification->state;
+  {
+    std::lock_guard<std::recursive_mutex> lock(state->mutex);
+    for (auto *record : state->guest_finalizer_records) {
+      UnchargeBookkeeping(*state, kFinalizerRecordBytes, true);
+      delete static_cast<GuestFinalizerRecord *>(record);
+    }
+    state->guest_finalizer_records.clear();
   }
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   g_envs.erase(notification->state);
@@ -3303,6 +3311,9 @@ extern "C" int snapi_bridge_create_promise(SnapiEnvState *env_state,
   BridgeOperationScope isolate_scope(bridge_state);
   if (!isolate_scope)
     return napi_invalid_arg;
+  if (bridge_state->next_deferred_id == 0 ||
+      !ChargeBookkeeping(*bridge_state, kDeferredBytes, false))
+    return napi_generic_failure;
   napi_deferred deferred;
   napi_value promise;
   napi_status s = napi_create_promise(env, &deferred, &promise);
@@ -3416,6 +3427,8 @@ namespace {
 // backing-store deleter for the guest finalizer — those run synchronously in
 // GC, with no way back into the guest — they attach via napi_add_finalizer
 // instead.) Allocated on registration, freed exactly once when it fires.
+void DropGuestFinalizerRecord(GuestFinalizerRecord *record);
+
 void GuestFinalizerTrampoline(node_api_basic_env /*env*/, void * /*data*/,
                               void *hint) {
   auto *record = static_cast<GuestFinalizerRecord *>(hint);
@@ -3461,7 +3474,7 @@ void GuestFinalizerTrampoline(node_api_basic_env /*env*/, void * /*data*/,
       }
     }
   }
-  delete record;
+  DropGuestFinalizerRecord(record);
 }
 
 void DropGuestFinalizerRecord(GuestFinalizerRecord *record) {
@@ -5516,8 +5529,10 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
   state->background_lane = snapi_v8_lane_current();
   state->native_env_identity = env;
   state->stack_policy = entry.stack_policy();
-  state->retiring = true;
-  state->pending_publish = true;
+  // The legacy direct constructor returns a usable provider immediately.
+  // Rust creation uses the options constructor's closed publication protocol.
+  state->retiring = false;
+  state->pending_publish = false;
   {
     // Provider creation may allocate through a guest arena. Publish only after
     // it completes; no process-global bridge lock may span that refill.
@@ -5544,7 +5559,7 @@ snapi_bridge_unofficial_configure_runtime(const char *engine_flags,
   return unofficial_napi_configure_runtime(&options);
 }
 
-extern "C" int snapi_bridge_unofficial_create_env_with_options(
+extern "C" int snapi_bridge_create_pending_env_with_options(
     int32_t module_api_version, uint64_t total_memory,
     uint64_t constrained_memory, uint32_t max_young_generation_size_in_bytes,
     uint32_t max_old_generation_size_in_bytes,
@@ -5652,15 +5667,13 @@ extern "C" int snapi_bridge_unofficial_set_host_near_heap_limit_callback(
 // Only the private pending owner may configure this closed provider. These
 // primitives do not invoke Rust/JS; the callback box remains owned by Rust.
 extern "C" int snapi_bridge_prepare_created_env(SnapiEnvState *state,
-                                                const void *tracker,
-                                                uint64_t value_limit) {
+                                                const void *tracker) {
   {
     std::lock_guard<std::recursive_mutex> lock(g_mu);
     if (g_envs.find(state) == g_envs.end() || !state->pending_publish ||
         !state->retiring || state->env == nullptr || state->owner == nullptr ||
         state->foreground_depth != 0)
       return napi_invalid_arg;
-    state->value_limit = static_cast<size_t>(value_limit);
   }
   PhysicalBridgeScope entry(state->env->isolate, &state->foreground_depth, 0,
                             true, state->stack_policy);
@@ -5685,6 +5698,29 @@ extern "C" void snapi_bridge_publish_created_env(SnapiEnvState *state) {
   state->retiring = false;
 }
 
+// Preserve the legacy direct C++ constructor contract. Native Rust keeps the
+// closed token until all callback-free map/output publication has succeeded.
+extern "C" int snapi_bridge_unofficial_create_env_with_options(
+    int32_t version, uint64_t total, uint64_t constrained, uint32_t young,
+    uint32_t old, uint32_t code, uint32_t stack, const void *heap,
+    uint32_t policy, SnapiEnvState **out) {
+  SnapiEnvState *state = nullptr;
+  int status = snapi_bridge_create_pending_env_with_options(
+      version, total, constrained, young, old, code, stack, heap, policy, &state);
+  if (status != napi_ok)
+    return status;
+  status = out == nullptr ? napi_invalid_arg
+                          : snapi_bridge_prepare_created_env(state, nullptr);
+  if (status != napi_ok) {
+    (void)FinishBridgeRetirement(state, 1, nullptr, nullptr);
+    DestroyRetiredState(state);
+    return status;
+  }
+  snapi_bridge_publish_created_env(state);
+  *out = state;
+  return napi_ok;
+}
+
 // Debug/diagnostics: live count of slot-table entries (leak assertions).
 extern "C" uint64_t
 snapi_bridge_unofficial_get_live_value_count(SnapiEnvState *env_state) {
@@ -5704,17 +5740,6 @@ extern "C" int snapi_bridge_value_id_alive(SnapiEnvState *env_state,
   if (bridge_state == nullptr)
     return 0;
   return LoadValue(*bridge_state, id) != nullptr ? 1 : 0;
-}
-
-extern "C" int snapi_bridge_unofficial_set_value_limit(SnapiEnvState *env_state,
-                                                       uint64_t limit) {
-  std::lock_guard<std::recursive_mutex> lock(g_mu);
-  env_state = LookupEnvState(env_state);
-  if (env_state == nullptr) {
-    return napi_invalid_arg;
-  }
-  env_state->value_limit = static_cast<size_t>(limit);
-  return napi_ok;
 }
 
 // Private host protocol: preallocate the caller's token slots, then validate
@@ -6610,7 +6635,7 @@ extern "C" int snapi_bridge_unofficial_message_create_metered(
   }
   *message_out = message_id;
   if (retained_bytes_out != nullptr)
-    *retained_bytes_out = unofficial_napi_message_retained_bytes(message);
+    *retained_bytes_out = unofficial_napi_message_retained_bytes(message) + 4096;
   return napi_ok;
 }
 
@@ -6697,6 +6722,8 @@ extern "C" int snapi_bridge_unofficial_message_take(SnapiEnvState *env_state,
   unofficial_napi_message message;
   {
     std::lock_guard<std::recursive_mutex> lock(g_mu);
+    if (g_legacy_message_holders.count(message_id) != 0)
+      return napi_invalid_arg;
     message = reinterpret_cast<unofficial_napi_message>(
         g_message_handles.Take(message_id));
   }
@@ -6732,12 +6759,18 @@ extern "C" void snapi_bridge_unofficial_message_drop(uint32_t message_id) {
     return;
   }
   unofficial_napi_message message;
+  std::shared_ptr<LegacyMessageHolder> holder;
   {
     std::lock_guard<std::recursive_mutex> lock(g_mu);
+    auto found = g_legacy_message_holders.find(message_id);
+    if (found != g_legacy_message_holders.end()) {
+      holder = std::move(found->second);
+      g_legacy_message_holders.erase(found);
+    }
     message = reinterpret_cast<unofficial_napi_message>(
         g_message_handles.Take(message_id));
   }
-  if (message != nullptr)
+  if (message != nullptr && !holder)
     unofficial_napi_message_drop(message);
 }
 
@@ -7802,11 +7835,15 @@ extern "C" void snapi_bridge_dispose() {
   }
   std::vector<SnapiEnvState *> env_states;
   std::vector<void *> messages;
+  std::unordered_map<uint32_t, std::shared_ptr<LegacyMessageHolder>> holders;
   {
     std::lock_guard<std::recursive_mutex> lock(g_mu);
     env_states.reserve(g_envs.size());
     for (auto *state : g_envs)
       env_states.push_back(state);
+    for (const auto &entry : g_legacy_message_holders)
+      (void)g_message_handles.Take(entry.first);
+    holders.swap(g_legacy_message_holders);
     messages = g_message_handles.TakeAll();
   }
   for (auto *state : env_states)

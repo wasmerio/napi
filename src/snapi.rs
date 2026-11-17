@@ -2,7 +2,7 @@
 // C++ bridge FFI declarations (from napi_bridge_init.cc)
 // ============================================================
 
-use core::ffi::c_void;
+use core::ffi::{c_char, c_void};
 
 #[repr(C)]
 pub struct SnapiEnvState {
@@ -101,7 +101,7 @@ unsafe extern "C" {
     pub fn snapi_bridge_init() -> i32;
     pub fn snapi_bridge_set_v8_worker_thread_count(count: u32) -> i32;
     pub fn snapi_bridge_unofficial_configure_runtime(
-        engine_flags: *const i8,
+        engine_flags: *const c_char,
         engine_flags_length: u32,
     ) -> i32;
     /// `webassembly_policy` is [`crate::WasmPolicy::bridge_code`].
@@ -113,6 +113,10 @@ unsafe extern "C" {
         env_out: *mut SnapiEnv,
     ) -> i32;
     /// `webassembly_policy` is [`crate::WasmPolicy::bridge_code`].
+    #[cfg_attr(
+        not(all(target_arch = "wasm32", feature = "js")),
+        link_name = "snapi_bridge_create_pending_env_with_options"
+    )]
     pub fn snapi_bridge_unofficial_create_env_with_options(
         module_api_version: i32,
         total_memory: u64,
@@ -129,7 +133,6 @@ unsafe extern "C" {
     pub fn snapi_bridge_prepare_created_env(
         state: SnapiEnv,
         tracker: *const core::ffi::c_void,
-        value_limit: u64,
     ) -> i32;
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_publish_created_env(state: SnapiEnv);
@@ -236,7 +239,7 @@ unsafe extern "C" {
     ) -> i32;
     pub fn snapi_bridge_unofficial_create_private_symbol(
         env: SnapiEnv,
-        str_ptr: *const i8,
+        str_ptr: *const c_char,
         wasm_length: u32,
         out_id: *mut u32,
     ) -> i32;
@@ -594,13 +597,13 @@ unsafe extern "C" {
     pub fn snapi_bridge_get_global(env: SnapiEnv, out_id: *mut u32) -> i32;
     pub fn snapi_bridge_create_string_utf8(
         env: SnapiEnv,
-        str_ptr: *const i8,
+        str_ptr: *const c_char,
         wasm_length: u32,
         out_id: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_create_string_latin1(
         env: SnapiEnv,
-        str_ptr: *const i8,
+        str_ptr: *const c_char,
         wasm_length: u32,
         out_id: *mut u32,
     ) -> i32;
@@ -619,14 +622,14 @@ unsafe extern "C" {
     pub fn snapi_bridge_get_value_string_utf8(
         env: SnapiEnv,
         id: u32,
-        buf: *mut i8,
+        buf: *mut c_char,
         bufsize: usize,
         result: *mut usize,
     ) -> i32;
     pub fn snapi_bridge_get_value_string_latin1(
         env: SnapiEnv,
         id: u32,
-        buf: *mut i8,
+        buf: *mut c_char,
         bufsize: usize,
         result: *mut usize,
     ) -> i32;
@@ -684,19 +687,19 @@ unsafe extern "C" {
     pub fn snapi_bridge_set_named_property(
         env: SnapiEnv,
         obj_id: u32,
-        name: *const i8,
+        name: *const c_char,
         val_id: u32,
     ) -> i32;
     pub fn snapi_bridge_get_named_property(
         env: SnapiEnv,
         obj_id: u32,
-        name: *const i8,
+        name: *const c_char,
         out_id: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_has_named_property(
         env: SnapiEnv,
         obj_id: u32,
-        name: *const i8,
+        name: *const c_char,
         result: *mut i32,
     ) -> i32;
     pub fn snapi_bridge_set_element(env: SnapiEnv, obj_id: u32, index: u32, val_id: u32) -> i32;
@@ -754,9 +757,17 @@ unsafe extern "C" {
         out_id: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_throw(env: SnapiEnv, error_id: u32) -> i32;
-    pub fn snapi_bridge_throw_error(env: SnapiEnv, code: *const i8, msg: *const i8) -> i32;
-    pub fn snapi_bridge_throw_type_error(env: SnapiEnv, code: *const i8, msg: *const i8) -> i32;
-    pub fn snapi_bridge_throw_range_error(env: SnapiEnv, code: *const i8, msg: *const i8) -> i32;
+    pub fn snapi_bridge_throw_error(env: SnapiEnv, code: *const c_char, msg: *const c_char) -> i32;
+    pub fn snapi_bridge_throw_type_error(
+        env: SnapiEnv,
+        code: *const c_char,
+        msg: *const c_char,
+    ) -> i32;
+    pub fn snapi_bridge_throw_range_error(
+        env: SnapiEnv,
+        code: *const c_char,
+        msg: *const c_char,
+    ) -> i32;
     pub fn snapi_bridge_is_exception_pending(env: SnapiEnv, result: *mut i32) -> i32;
     pub fn snapi_bridge_get_and_clear_last_exception(env: SnapiEnv, out_id: *mut u32) -> i32;
     // Symbol
@@ -1114,7 +1125,7 @@ unsafe extern "C" {
     // Callback system
     pub fn snapi_bridge_create_function(
         env: SnapiEnv,
-        utf8name: *const i8,
+        utf8name: *const c_char,
         name_len: u32,
         reg_id: u32,
         out_id: *mut u32,
@@ -1153,11 +1164,11 @@ unsafe extern "C" {
     // napi_define_class
     pub fn snapi_bridge_define_class(
         env: SnapiEnv,
-        utf8name: *const i8,
+        utf8name: *const c_char,
         name_len: u32,
         ctor_reg_id: u32,
         prop_count: u32,
-        prop_names: *const *const i8,
+        prop_names: *const *const c_char,
         prop_name_ids: *const u32,
         prop_types: *const u32,
         prop_value_ids: *const u32,
@@ -1171,7 +1182,7 @@ unsafe extern "C" {
         env: SnapiEnv,
         obj_id: u32,
         prop_count: u32,
-        prop_names: *const *const i8,
+        prop_names: *const *const c_char,
         prop_name_ids: *const u32,
         prop_types: *const u32,
         prop_value_ids: *const u32,

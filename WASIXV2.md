@@ -103,3 +103,45 @@ coroutine provider. Do not substitute an unverified 11.9.9 archive.
 Actual native CTest runs: V8 **113 passed, 0 failed**, QuickJS **102 passed,
 0 failed**. These use Make's existing deep-freeze test exclusion. V8's invalid
 policy test now uses 3: policy 2 is the valid Edge metered policy.
+
+## Independent review repairs: ownership and lifecycle
+
+- C1/C2/H2/L1: holder-aware message drop/take/dispose; 64-byte deferred charges;
+  finalizer record erase/uncharge and the cancelled-record teardown sweep;
+  serialized-message native overhead restored.
+- H1: forward shared-memory detachment, keep the charge with the retained owner,
+  and delete the obsolete legacy-wait cfg. The ownership regression now checks
+  last-owner release. Defined-memory tests use the production wrapper once.
+- H3/M4: provider fatal/OOM termination walks all sibling isolates and clears
+  pending messages while parked. Limit notifications drain even on callback
+  failure/panic, preserving the original failure and avoiding later Env access.
+  Provider fatal errors remain terminal v2 RuntimeErrors, rather than fabricating
+  a v1 WasiError::Exit(1).
+- H5/M2/L2–L5: direct configuration binds exported/imported memory without a
+  prefund, accepts memoryless inert modules, and creates the heap only on use.
+  Missing memory, stop and lane admission precede funding. Accepted lanes survive
+  later creation failures. Runtime initialization occurs in that lane; unmanaged
+  consumers retain next's explicit runtime flags. Output validation allocates
+  nothing. Cancellation after host stop re-terminates defensively.
+- M1: the default policy preserves SDK WebAssembly availability. Edge selects
+  Restricted or EnabledMetered explicitly. Tests for restriction configure it
+  explicitly; the three H5 Edge tests retain their assertions.
+- L6/L7/L8/L10: release rejected allocator contexts in the allocator scope, park
+  legacy bridge calls, retain positive configure-before-start coverage, and remove
+  dead value-limit plumbing. Raw direct C++ constructors retain their published
+  provider contract; Rust uses a separate private pending constructor and next's
+  prepare/publish retirement protocol.
+- M3: clone/thread detachment no longer takes the failing mutation token, with a
+  concurrent grow/clone regression. Copy still needs a serialized high-water
+  snapshot; a TODO records the callback-safe read-guard work. It can reject a
+  concurrent mutation, rather than risk copying uncharged retained backing.
+- L9: restored unknown-policy allocator ownership coverage against NativeGuestArena.
+  A TODO records stale nonshared direct-memory registrations retained by messages;
+  protected leased arenas retain and authenticate their physical allocation.
+
+Some retained next tests assumed uncharged host copies, eager direct prefunds,
+process-wide message ids across unrelated apps, or an unused value-limit query.
+Their harnesses now exercise the same intended lifecycle cases under Edge's
+accounting and context ownership. The bounded facade denial fixture leaves room
+for the restored V8 heap/slack and bookkeeping charges before denying a 32 MiB
+buffer. Explicit-release finalizers were verified through the SDK.

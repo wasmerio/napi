@@ -1424,7 +1424,6 @@ impl LinearMemory for BudgetedMemory {
         // the last handle drops.
         // `VMMemory::try_clone` (inherent) already yields a `VMMemory`.
         wasmer::sys::vm::on_host_stack(|| {
-            let _operation = self.charge.begin_mutation()?;
             let inner = self.inner.try_clone()?;
             Ok(Box::new(BudgetedMemory {
                 inner,
@@ -1435,8 +1434,12 @@ impl LinearMemory for BudgetedMemory {
     }
 
     fn copy(&self) -> Result<Box<dyn LinearMemory + Send + Sync + 'static>, MemoryError> {
+        let charge = Arc::clone(&self.charge);
         wasmer::sys::vm::on_host_stack(|| {
-            let _operation = self.charge.begin_mutation()?;
+            // TODO(wasixv2): a callback-safe read guard would let copy wait for
+            // concurrent growth. Keep the high-water snapshot serialized until
+            // then; try_clone and thread spawning need no mutation guard.
+            let _operation = charge.begin_mutation()?;
             // Copy retains the source mapping's accessible backing even after
             // reset has lowered its logical size. Reserve that high-water
             // allocation before the backend allocates the copy.
@@ -1458,20 +1461,8 @@ impl LinearMemory for BudgetedMemory {
     }
 
     fn as_shared(&self) -> Result<VMSharedMemory, MemoryError> {
-        // The pinned public Wasmer used by the standalone CLI still detaches
-        // shared memories through this raw VMSharedMemory API. Its WASIX
-        // pthreads need that detach path for libuv's async workers. A raw
-        // handle drops our charge wrapper, so only permit it when accounting
-        // is explicitly unlimited. Managed Edge uses a newer Wasmer API that
-        // preserves the wrapper and never takes this compatibility path.
-        #[cfg(napi_standalone_legacy_wait)]
-        if self.charge.budget.accountant.is_none() && self.charge.budget.mem_total == UNLIMITED {
-            return self.inner.as_shared();
-        }
-
-        Err(MemoryError::UnsupportedOperation {
-            message: "budgeted memory requires wrapper-preserving shared detachment".into(),
-        })
+        // SharedMemory retains the wrapped owner, including its charge.
+        self.inner.as_shared()
     }
 
     unsafe fn do_wait(
@@ -1623,21 +1614,17 @@ pub fn budgeted_tunables(budget: Arc<ResourceBudget>) -> BudgetedTunables<BaseTu
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    #[cfg(napi_standalone_legacy_wait)]
-    use wasmer::MemoryLocation;
     use wasmer::sys::{Cranelift, EngineBuilder};
     use wasmer::{Imports, Instance, Memory, MemoryType, Module, Pages, Store, WASM_PAGE_SIZE};
 
     const PAGE: u64 = WASM_PAGE_SIZE as u64;
 
-    #[cfg(not(napi_standalone_legacy_wait))]
     #[derive(Debug)]
     struct WaitProbe {
         inner: VMMemory,
         seen: Arc<AtomicBool>,
     }
 
-    #[cfg(not(napi_standalone_legacy_wait))]
     impl LinearMemory for WaitProbe {
         fn ty(&self) -> MemoryType {
             self.inner.ty()
@@ -1842,8 +1829,9 @@ mod tests {
             assert_eq!(budget.memory_charged(), 5 * PAGE);
             drop(access);
             memory.reset().unwrap();
-            assert_eq!(budget.memory_charged(), 3 * PAGE);
+            assert_eq!(budget.memory_charged(), 5 * PAGE);
             drop(memory);
+            assert_eq!(budget.memory_charged(), 3 * PAGE);
             drop(copy);
             assert_eq!(budget.memory_charged(), 3 * PAGE);
             drop(copied);
@@ -2041,7 +2029,6 @@ mod tests {
     // Public standalone Wasmer detaches copies through a raw shared-memory
     // handle. Finite-budget copies fail closed there; this quota-preserving
     // copy test applies to the newer wrapper-preserving managed Wasmer API.
-    #[cfg(not(napi_standalone_legacy_wait))]
     #[test]
     fn reset_keeps_backing_charged_and_copy_reserves_it() {
         let budget = ResourceBudget::with_memory_limit(2 * PAGE);
@@ -2067,50 +2054,20 @@ mod tests {
     }
 
     #[test]
-    fn direct_raw_shared_detachment_is_rejected() {
+    fn shared_detachment_keeps_charge_until_last_owner() {
         let budget = ResourceBudget::with_memory_limit(PAGE);
-        let ty = MemoryType::new(1, Some(1), true);
-        let base = BaseTunables::new();
-        let style = base.memory_style(&ty);
-        let inner = base.create_host_memory(&ty, &style).unwrap();
-        let wrapped = BudgetedMemory::new(inner, Arc::clone(&budget)).unwrap();
-        assert!(LinearMemory::as_shared(&wrapped).is_err());
-        assert_eq!(budget.snapshot().wasm_linear, PAGE);
-        drop(wrapped);
-        assert_eq!(budget.snapshot().wasm_linear, 0);
-
-        #[cfg(napi_standalone_legacy_wait)]
-        {
-            let mut store = budgeted_store(Arc::clone(&budget));
-            let memory = Memory::new(&mut store, ty).unwrap();
-            assert!(
-                memory.as_shared(&store).is_none(),
-                "legacy Wasmer must reject raw detachment under a finite quota"
-            );
-        }
-    }
-
-    #[cfg(napi_standalone_legacy_wait)]
-    #[test]
-    fn standalone_unlimited_budget_keeps_wasix_shared_memory_detachable() {
-        let budget = ResourceBudget::unlimited();
-        let mut store = budgeted_store(Arc::clone(&budget));
-        let memory = Memory::new(&mut store, MemoryType::new(1, Some(2), true)).unwrap();
-        let shared = memory
-            .as_shared(&store)
-            .expect("legacy Wasmer must be able to detach WASIX pthread memory");
-        assert_eq!(
+        let shared = {
+            let mut store = budgeted_store(budget.clone());
+            let memory = Memory::new(&mut store, MemoryType::new(1, Some(1), true)).unwrap();
+            let shared = memory.as_shared(&store).unwrap();
+            assert_eq!(budget.snapshot().wasm_linear, PAGE);
             shared
-                .wait(MemoryLocation::new_32(0), Some(Duration::ZERO))
-                .unwrap(),
-            2,
-        );
-        let mut worker_store = Store::new(store.engine().clone());
-        let attached = shared.attach(&mut worker_store);
-        assert_eq!(attached.size(&worker_store), Pages(1));
+        };
+        assert_eq!(budget.snapshot().wasm_linear, PAGE);
+        drop(shared);
+        assert_eq!(budget.snapshot().wasm_linear, 0);
     }
 
-    #[cfg(not(napi_standalone_legacy_wait))]
     #[test]
     fn budgeted_memory_forwards_atomic_wait() {
         let budget = ResourceBudget::with_memory_limit(PAGE);
@@ -2722,24 +2679,6 @@ mod external_accountant_tests {
         assert_eq!(budget.limit_reports.undelivered.load(Ordering::Acquire), 0);
     }
 
-    #[cfg(all(napi_standalone_legacy_wait, not(target_arch = "wasm32")))]
-    #[test]
-    fn external_accountant_cannot_use_legacy_raw_detachment() {
-        let accountant = TestAccountant::new(UNLIMITED);
-        let external: Arc<dyn NapiMemoryAccountant> = accountant.clone();
-        let budget = ResourceBudget::with_accountant(external);
-        let ty = MemoryType::new(1, Some(1), true);
-        let base = BaseTunables::new();
-        let inner = base
-            .create_host_memory(&ty, &base.memory_style(&ty))
-            .unwrap();
-        let wrapped = BudgetedMemory::new(inner, budget).unwrap();
-
-        assert!(LinearMemory::as_shared(&wrapped).is_err());
-        drop(wrapped);
-        assert_eq!(accountant.memory_charged(), 0);
-    }
-
     #[test]
     fn grant_covers_an_old_generation_already_over_the_limit() {
         // V8 admits the first large young object regardless of the limit and
@@ -2976,6 +2915,36 @@ mod shared_memory_mutation_tests {
     }
 
     #[test]
+    fn shared_clone_succeeds_while_another_thread_is_growing() {
+        let page = WASM_PAGE_SIZE as u64;
+        let accountant = Arc::new(Accountant(AtomicU64::new(0)));
+        let budget = ResourceBudget::with_accountant(accountant.clone());
+        let mut memory = shared_memory(budget.clone());
+        let sibling = memory.try_clone().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let grower = std::thread::spawn(move || {
+            ON_CHARGE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    entered_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                }));
+            });
+            memory.grow(Pages(1)).unwrap();
+            memory
+        });
+        entered_rx.recv().unwrap();
+        let cloned = sibling.try_clone();
+        resume_tx.send(()).unwrap();
+        let memory = grower.join().unwrap();
+        let cloned = cloned.expect("clone must not reject a concurrent mutation");
+        assert_eq!(cloned.size(), Pages(2));
+        assert_eq!(budget.snapshot().wasm_linear, 2 * page);
+        drop((cloned, sibling, memory));
+        assert_eq!(accountant.memory_charged(), 0);
+    }
+
+    #[test]
     fn shared_mutation_token_is_released_after_accountant_panic() {
         let page = WASM_PAGE_SIZE as u64;
         let accountant = Arc::new(Accountant(AtomicU64::new(0)));
@@ -3077,62 +3046,12 @@ mod memory_grow_callback_tests {
         }
     }
 
-    // Production Phase1 wraps imported/host-created memory only. This sibling
-    // also wraps a defined memory to exercise the other VM libcall with the
-    // actual BudgetedMemory consumer, without changing production policy.
-    struct DefinedTunables {
-        host: BudgetedTunables<BaseTunables>,
-        budget: Arc<ResourceBudget>,
-    }
-    impl Tunables for DefinedTunables {
-        fn memory_style(&self, ty: &MemoryType) -> MemoryStyle {
-            self.host.memory_style(ty)
-        }
-        fn table_style(&self, ty: &TableType) -> TableStyle {
-            self.host.table_style(ty)
-        }
-        fn create_host_memory(
-            &self,
-            ty: &MemoryType,
-            style: &MemoryStyle,
-        ) -> Result<VMMemory, MemoryError> {
-            self.host.create_host_memory(ty, style)
-        }
-        unsafe fn create_vm_memory(
-            &self,
-            ty: &MemoryType,
-            style: &MemoryStyle,
-            location: wasmer::sys::vm::VMDefinitionLocation<VMMemoryDefinition>,
-        ) -> Result<VMMemory, MemoryError> {
-            // SAFETY: forward the exact initialization location and its owner.
-            let inner = unsafe { self.host.create_vm_memory(ty, style, location) }?;
-            Ok(VMMemory::from(
-                Box::new(BudgetedMemory::new(inner, self.budget.clone())?)
-                    as Box<dyn LinearMemory + Send + Sync>,
-            ))
-        }
-        fn create_host_table(&self, ty: &TableType, style: &TableStyle) -> Result<VMTable, String> {
-            self.host.create_host_table(ty, style)
-        }
-        unsafe fn create_vm_table(
-            &self,
-            ty: &TableType,
-            style: &TableStyle,
-            location: wasmer::sys::vm::VMDefinitionLocation<VMTableDefinition>,
-        ) -> Result<VMTable, String> {
-            // SAFETY: the caller's initialization contract is forwarded intact.
-            unsafe { self.host.create_vm_table(ty, style, location) }
-        }
-    }
-
+    // Both host-created and defined memories use the production wrapper.
     fn setup(imported: bool) -> (Store, Instance, Arc<ResourceBudget>, Arc<Accountant>) {
         let accountant = Arc::new(Accountant(AtomicU64::new(0)));
         let budget = ResourceBudget::with_accountant(accountant.clone());
         let mut engine = EngineBuilder::new(Cranelift::default()).engine();
-        engine.set_tunables(DefinedTunables {
-            host: budgeted_tunables(budget.clone()),
-            budget: budget.clone(),
-        });
+        engine.set_tunables(budgeted_tunables(budget.clone()));
         let mut store = Store::new(engine);
         let declaration = if imported {
             "(import \"env\" \"memory\" (memory 1 3))"

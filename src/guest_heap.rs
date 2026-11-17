@@ -132,6 +132,9 @@ struct HeapInner {
     refilling: bool,
 }
 
+// TODO(wasixv2): retire nonshared direct-memory registrations on detach.
+// Leased arenas pin their allocation; legacy message-retained heaps still
+// retain Store handles after their last direct environment retires.
 pub(crate) struct GuestHeap {
     /// Cached host address of guest offset 0. Stable for the life of the
     /// memory (verified after every grow).
@@ -1872,6 +1875,35 @@ mod tests {
     }
 
     #[test]
+    fn unknown_webassembly_policy_is_rejected_and_releases_the_heap_ctx() {
+        let ctx = crate::NapiCtx::default();
+        let mut store = leased_arena_store(&ctx);
+        let memory = Memory::new(&mut store, MemoryType::new(1, Some(2048), true)).unwrap();
+        let arena = ctx.native_guest_arena(&store, &memory).unwrap();
+        let before = Arc::strong_count(&arena.heap);
+        let allocator = arena.heap.make_alloc_ctx(None);
+        assert_eq!(Arc::strong_count(&arena.heap), before + 1);
+        let mut env = std::ptr::null_mut();
+        let status = unsafe {
+            crate::snapi::snapi_bridge_unofficial_create_env_with_options(
+                8,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                allocator.cast_const(),
+                crate::WasmPolicy::EnabledMetered(crate::WasmLimits::default()).bridge_code() + 1,
+                &mut env,
+            )
+        };
+        assert_eq!(status, 1);
+        assert!(env.is_null());
+        assert_eq!(Arc::strong_count(&arena.heap), before);
+    }
+
+    #[test]
     fn leased_arenas_start_empty_and_return_rejected_owners_without_growing() {
         use std::sync::atomic::AtomicUsize;
         let ctx = crate::NapiCtx::default();
@@ -2133,9 +2165,12 @@ mod tests {
         assert!(heap.upgrade().is_some());
         // The payload owns V8's real shared BackingStore/allocator, rather than
         // a copied byte vector or a modeled pin. A new provider reads it.
+        // Message ids belong to one app/context, even when its worker Store
+        // and provider have retired. A different app must not consume this id.
+        let shared_context = source_ctx.clone();
         let (value, target_usage) = std::thread::spawn(move || {
             let (mut target, target_ctx, target_instance, target_memory, target_session) =
-                message_instance();
+                message_instance_configured(shared_context, false, true);
             target_instance
                 .exports
                 .get_typed_function::<i32, ()>(&target, "take")
@@ -2338,18 +2373,14 @@ mod tests {
             .build();
         let (mut store, ctx, instance, _memory, session) =
             message_instance_configured(ctx, true, false);
-        let unfunded = VMFunctionEnvironment::list(store.objects_mut().as_sys_mut())
+        let heap_is_lazy = VMFunctionEnvironment::list(store.objects_mut().as_sys_mut())
             .iter()
             .find_map(|owner| {
                 let env = owner.as_ref().downcast_ref::<crate::NapiEnv>()?;
-                let heap = env.guest_heap.as_ref()?;
-                Some(heap.inner.lock().unwrap().chunks.is_empty())
+                Some(env.guest_heap.is_none())
             })
             .unwrap();
-        assert!(
-            unfunded,
-            "the actual advisory prefund must have been denied"
-        );
+        assert!(heap_is_lazy, "direct configuration must not prefund a heap");
         accountant.armed.store(true, Ordering::SeqCst);
         instance
             .exports

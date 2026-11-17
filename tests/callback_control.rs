@@ -478,40 +478,11 @@ fn wasm_start_cannot_create_a_provider_before_configuration() {
         .additional_imports(&module, &mut store.as_store_mut())
         .unwrap();
     let session = state.session().unwrap().clone();
-    let instance = Instance::new(&mut store, &module, &imports).unwrap();
+    let error = Instance::new(&mut store, &module, &imports).unwrap_err();
+    assert!(error.to_string().contains("before instance configuration"));
     assert_eq!(ctx.budget().snapshot().live_isolates, 0);
     assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
-    assert_eq!(ctx.budget().snapshot().v8_external, 0);
-    let Some(Extern::Memory(memory)) = imports.get_export("env", "memory") else {
-        panic!("missing guest memory");
-    };
-    hooks
-        .configure_instance(
-            &module,
-            &mut store.as_store_mut(),
-            &instance,
-            Some(&memory),
-            state,
-        )
-        .unwrap();
-    assert!(
-        session
-            .configure_instance(&mut store.as_store_mut(), &instance, Some(&memory))
-            .is_err()
-    );
-    let init = instance
-        .exports
-        .get_typed_function::<(), i32>(&store, "init")
-        .unwrap();
-    assert_ne!(init.call(&mut store).unwrap(), 0);
-    assert_eq!(ctx.budget().snapshot().live_isolates, 1);
-    // All guest calls returned; the provider has no callback or pending job.
-    unsafe {
-        session.deactivate(&mut store.as_store_mut());
-    }
-    assert_eq!(init.call(&mut store).unwrap(), 0);
-    assert_eq!(ctx.budget().snapshot().live_isolates, 0);
-    assert_eq!(ctx.budget().snapshot().wasm_linear, 0);
+    unsafe { session.deactivate(&mut store.as_store_mut()) };
 }
 
 #[test]
@@ -737,12 +708,18 @@ fn callback_cleanup_uses_its_pinned_environment_after_slot_replacement() {
 // Match budget::external_accountant_tests; only the owning thread's armed hook
 // may reenter the real Store, and taking it ends the TLS borrow before callout.
 thread_local! {
+    static ALLOCATOR_CHARGES_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static EXTERNAL_ACCOUNTANT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 struct ReentrantAccountant(std::sync::atomic::AtomicU64);
 impl ReentrantAccountant {
     fn call_hook() {
+        if ALLOCATOR_CHARGES_ONLY.with(|flag| flag.get())
+            && unsafe { snapi_v8_allocator_active() } == 0
+        {
+            return;
+        }
         let hook = EXTERNAL_ACCOUNTANT_HOOK.with(|slot| slot.borrow_mut().take());
         if let Some(hook) = hook {
             hook();
@@ -975,6 +952,7 @@ impl wasmer_napi::NapiMemoryAccountant for RetirementAccountant {
 }
 
 unsafe extern "C" {
+    fn snapi_v8_allocator_active() -> i32;
     fn snapi_bridge_unofficial_get_live_env_count() -> u64;
     fn snapi_bridge_unofficial_get_live_buffer_lease_count() -> u64;
 }
@@ -1364,9 +1342,9 @@ impl wasmer_napi::NapiMemoryAccountant for CreationAccountant {
 }
 
 #[test]
-fn native_creation_owns_reservation_before_the_value_limit_query() {
+fn native_creation_rolls_back_when_limit_planning_panics() {
     if !run_in_subprocess(
-        "native_creation_owns_reservation_before_the_value_limit_query",
+        "native_creation_rolls_back_when_limit_planning_panics",
         Duration::from_secs(20),
     ) {
         return;
@@ -1382,7 +1360,7 @@ fn native_creation_owns_reservation_before_the_value_limit_query() {
         configured_instance_with_context(&mut store, ctx, |store, _| {
             Function::new_typed(store, |_: i32| {})
         });
-    accountant.panic_after_charge.store(true, Ordering::SeqCst);
+    accountant.pending_query.store(true, Ordering::SeqCst);
     let init = instance
         .exports
         .get_typed_function::<(), i32>(&store, "init_id")
@@ -1579,13 +1557,13 @@ fn native_creation_rolls_back_provider_when_guest_output_is_invalid() {
         .exports
         .get_typed_function::<(i32, i32), i32>(&store, "create_status")
         .unwrap();
-    // The env id write succeeds, the scope write does not. Neither id may
-    // become a logical owner, and the already-created provider must be retired.
+    // Both outputs are validated before creating a provider. A bad scope
+    // pointer must leave the valid env output untouched.
     assert_eq!(create.call(&mut store, 32, i32::MAX).unwrap(), 1);
     let mut bytes = [0; 4];
     memory.view(&store).read(32, &mut bytes).unwrap();
     let rejected_id = u32::from_le_bytes(bytes);
-    assert!(rejected_id > 0);
+    assert_eq!(rejected_id, 0);
     assert_eq!(unsafe { snapi_bridge_unofficial_get_live_env_count() }, 0);
     assert_eq!(ctx.budget().snapshot().live_isolates, 0);
     assert_eq!(ctx.budget().snapshot().v8_heap_reserved, 0);
@@ -3278,6 +3256,9 @@ fn native_allocator_defers_independent_store_retirement_until_cpp_exit() {
             );
         }));
     });
+    // Edge also charges the host copy of the script before entering V8.
+    // Arm this scenario for the allocator callout it is intended to exercise.
+    ALLOCATOR_CHARGES_ONLY.with(|flag| flag.set(true));
     let value = eval(
         &mut store,
         &instance,

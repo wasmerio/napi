@@ -32,7 +32,7 @@ extern "C" void napi_host_guest_heap_release(void* ctx) {
 extern "C" size_t unofficial_napi_message_retained_bytes(
     unofficial_napi_message message);
 // Provider-private env creation with an embedder WebAssembly policy
-// (NapiWebAssemblyPolicy: 0 = restrict guest-heap envs, 1 = allow unmetered).
+// (0 = restrict, 1 = allow unmetered, 2 = allow metered).
 extern "C" napi_status snapi_private_create_env(
     int32_t module_api_version,
     const unofficial_napi_env_create_options* options,
@@ -216,7 +216,7 @@ TEST_F(Test21General, UnknownWebAssemblyPolicyIsRejectedAfterTakingGuestHeap) {
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;
   EXPECT_EQ(snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options,
-                                     kWebAssemblyAllowUnmetered + 1, &env,
+                                     kWebAssemblyAllowUnmetered + 2, &env,
                                      &owner),
             napi_invalid_arg);
   EXPECT_EQ(env, nullptr);

@@ -1,5 +1,5 @@
 use std::{
-    env, fs,
+    env,
     io::Read,
     path::{Path, PathBuf},
 };
@@ -37,12 +37,6 @@ enum ExtraLink {
 }
 
 fn main() {
-    println!("cargo:rustc-check-cfg=cfg(napi_standalone_legacy_wait)");
-    println!("cargo:rerun-if-changed=Cargo.toml");
-    if standalone_legacy_wait() {
-        println!("cargo:rustc-cfg=napi_standalone_legacy_wait");
-    }
-
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     if target_arch == "wasm32" {
         if env::var_os("CARGO_FEATURE_JS").is_none() {
@@ -277,6 +271,11 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=m");
         println!("cargo:rustc-link-lib=dylib=pthread");
         println!("cargo:rustc-link-lib=dylib=rt");
+        // Linux arm64 local-provider builds retain upstream's atomic runtime.
+        // Product CI disables NAPI V8 there; 11.9.7 has no certified arm64 archive.
+        if target_os == "linux" && env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
+            println!("cargo:rustc-link-lib=dylib=atomic");
+        }
     }
 }
 
@@ -933,28 +932,6 @@ fn adapt_pinned_darwin_v8_archive(
         return Err("source Darwin V8 archive changed during adaptation".into());
     }
     Ok(destination)
-}
-
-fn standalone_legacy_wait() -> bool {
-    let manifest_dir =
-        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"));
-    let manifest = fs::read_to_string(manifest_dir.join("Cargo.toml"))
-        .expect("failed to read N-API Cargo.toml");
-    let mut in_napi_metadata = false;
-    for line in manifest.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_napi_metadata = line == "[package.metadata.napi]";
-        } else if in_napi_metadata {
-            let declaration = line.split('#').next().unwrap_or("").trim();
-            if let Some((key, value)) = declaration.split_once('=')
-                && key.trim() == "standalone_legacy_wait"
-            {
-                return value.trim() == "true";
-            }
-        }
-    }
-    false
 }
 
 fn read_sandbox_build_flag(library_path: &Path) -> Option<bool> {

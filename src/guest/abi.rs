@@ -195,6 +195,32 @@ pub(crate) fn read_legacy_env_create(
 /// default is shorter, so longer strings are rejected without a host copy.
 const MAX_ENGINE_FLAGS_LENGTH: u32 = 64;
 
+/// Decode next-compatible runtime flags for unmanaged native consumers.
+pub(crate) fn read_runtime_options(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    guest_ptr: i32,
+) -> Option<HostCopy<u8>> {
+    if guest_ptr == 0 {
+        return Some(HostCopy::empty());
+    }
+    let bytes = read_versioned(env, guest_ptr, RUNTIME_OPTIONS_SIZE, 1)?;
+    let flags_ptr = u32_at(
+        &bytes,
+        std::mem::offset_of!(Wasm32RuntimeOptionsV1, engine_flags),
+    )? as i32;
+    let flags_length = u32_at(
+        &bytes,
+        std::mem::offset_of!(Wasm32RuntimeOptionsV1, engine_flags_length),
+    )? as usize;
+    if flags_length == 0 {
+        return Some(HostCopy::empty());
+    }
+    if flags_ptr <= 0 {
+        return None;
+    }
+    read_guest_bytes(env, flags_ptr, flags_length)
+}
+
 /// Whether guest runtime options only request inert engine flags. Guests are
 /// never permitted to set process-wide V8 flags, but EdgeJS unconditionally
 /// passes its fixed defaults before it creates an env; those are accepted

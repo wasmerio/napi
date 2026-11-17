@@ -181,8 +181,13 @@ fn explicit_length_names_preserve_embedded_nul_without_native_overread() {
 #[test]
 fn guest_cannot_allocate_unmetered_v8_webassembly_memory() {
     let wasm = build_wasix_test("test_js_wasm_disabled");
-    let (exit_code, stdout, stderr) =
-        run_guest(&NapiCtx::default(), &wasm).expect("guest run failed");
+    let (exit_code, stdout, stderr) = run_guest(
+        &NapiCtx::builder()
+            .webassembly(WasmPolicy::Restricted)
+            .build(),
+        &wasm,
+    )
+    .expect("guest run failed");
     assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
     assert!(stdout.contains("JS_WASM_DISABLED_OK"), "{stdout}\n{stderr}");
 }
@@ -230,11 +235,16 @@ fn unmetered_webassembly_policy_exposes_webassembly() {
         "{stdout}\n{stderr}"
     );
 
-    // The policy belongs to one context: the next default context is
-    // restricted again in the same process.
+    // The policy belongs to one context: a separately restricted context
+    // still rejects WebAssembly in the same process.
     let wasm = build_wasix_test("test_js_wasm_disabled");
-    let (exit_code, stdout, stderr) =
-        run_guest(&NapiCtx::default(), &wasm).expect("guest run failed");
+    let (exit_code, stdout, stderr) = run_guest(
+        &NapiCtx::builder()
+            .webassembly(WasmPolicy::Restricted)
+            .build(),
+        &wasm,
+    )
+    .expect("guest run failed");
     assert_eq!(exit_code, 0, "{stdout}\n{stderr}");
     assert!(stdout.contains("JS_WASM_DISABLED_OK"), "{stdout}\n{stderr}");
 }

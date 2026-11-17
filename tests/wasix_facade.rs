@@ -131,6 +131,8 @@ async fn facade_native_default_machine_denies_unaccounted_refill_and_accountant_
         }
     }
 
+    // Edge reserves V8 heap/slack and charges bridge bookkeeping in addition
+    // to leases. Leave room for startup while denying the 32 MiB buffer refill.
     const MIB: u64 = 1024 * 1024;
     let source = GUEST
         .replace(
@@ -150,7 +152,7 @@ async fn facade_native_default_machine_denies_unaccounted_refill_and_accountant_
             let context = NapiCtx::builder()
                 .max_sessions(1)
                 .max_envs(1)
-                .total_memory_bytes(64 * MIB)
+                .total_memory_bytes(128 * MIB)
                 .build();
             let machine = Machine::builder()
                 .instantiation_hook(Arc::new(NapiHook::new(context.clone())))
@@ -213,7 +215,7 @@ async fn facade_native_default_machine_denies_unaccounted_refill_and_accountant_
             }
 
             let accountant = Arc::new(Accountant {
-                limit: 64 * MIB,
+                limit: 128 * MIB,
                 charged: std::sync::atomic::AtomicU64::new(0),
                 denied: std::sync::atomic::AtomicUsize::new(0),
             });
