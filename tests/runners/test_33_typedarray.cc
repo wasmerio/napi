@@ -844,8 +844,7 @@ TEST_F(Test33TypedArray, CreateUint8ArrayIsZeroedAndTakesItsPrototype) {
 
   // A length past what the engine can make fails, with no abort, and the env
   // stays usable. (An allocator that declines is covered on WASIX, where the
-  // guest heap's allocator returns null: tests/guest_create_uint8array.rs.
-  // V8's default allocator aborts on its own.)
+  // guest heap's allocator returns null: tests/guest_create_uint8array.rs.)
   {
     napi_value refused = nullptr;
     data = nullptr;
@@ -1062,6 +1061,29 @@ TEST_F(Test33TypedArray, InfoCallsKeepThePendingExceptionWhenErrorFormattingCall
   // V8 makes no error to read a buffer or a view, so only QuickJS gets here.
   EXPECT_GT(native_calls, 0) << "the getter never ran: nothing was tested";
 #endif
+}
+
+// Past 2 GiB the prebuilt V8's process-wide malloc (PartitionAlloc) aborts
+// instead of failing. An ArrayBuffer that large is backed or is a
+// RangeError, as in Node (test-buffer-creation-regression), never an abort.
+TEST_F(Test33TypedArray, MultiGigabyteArrayBufferIsBackedOrARangeError) {
+  EnvScope s(runtime_.get());
+  RunBufferScript(s.env,
+                  "globalThis.huge = (() => {"
+                  "  try {"
+                  "    const bytes = new Uint8Array(new ArrayBuffer(2 ** 32 + 1000));"
+                  "    bytes[bytes.length - 1] = 7;"
+                  "    return bytes[0] === 0 && bytes[bytes.length - 1] === 7 ? 1 : 'bad';"
+                  "  } catch (e) { return e instanceof RangeError ? 1 : 'other'; }"
+                  "})();"
+                  "globalThis.large = (() => {"
+                  "  const bytes = new Uint8Array(new ArrayBuffer(64 * 1024 * 1024));"
+                  "  bytes[bytes.length - 1] = 7;"
+                  "  return bytes[0] === 0 && bytes[bytes.length - 1] === 7 ? 1 : 0;"
+                  "})();"
+                  "0");
+  EXPECT_EQ(GlobalInt(s.env, "huge"), 1);
+  EXPECT_EQ(GlobalInt(s.env, "large"), 1);
 }
 
 #if defined(NAPI_TEST_ENGINE_QUICKJS)

@@ -20,6 +20,12 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
+
 #include <libplatform/libplatform.h>
 #include <v8.h>
 #include <v8-profiler.h>
@@ -647,6 +653,10 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
     if (data != nullptr) {
       total_mem_usage_.fetch_sub(length, std::memory_order_relaxed);
     }
+    if (data != nullptr && IsLargeBackingStore(length)) {
+      FreeLargeBackingStore(data, length);
+      return;
+    }
     if (backing_ != nullptr) {
       backing_->Free(data, length);
     }
@@ -698,7 +708,9 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
     // No guest-heap context: this is the native (non-guest) embedder, which
     // has no budget concept for this allocator. Plain host allocation.
     void* data = nullptr;
-    if (backing_ != nullptr) {
+    if (IsLargeBackingStore(length)) {
+      data = AllocateLargeBackingStore(length);
+    } else if (backing_ != nullptr) {
       data = zeroed ? backing_->Allocate(length)
                     : backing_->AllocateUninitialized(length);
     }
@@ -706,6 +718,34 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
       total_mem_usage_.fetch_add(length, std::memory_order_relaxed);
     }
     return data;
+  }
+
+  // Large backing stores come straight from the OS, zeroed, and fail with
+  // null: V8 then throws a RangeError. The prebuilt V8 replaces the process's
+  // malloc with PartitionAlloc, whose calloc (behind the default allocator)
+  // aborts the process on a request it cannot serve instead of returning
+  // null, so new ArrayBuffer(2 ** 32) would crash. Free gets the length the
+  // store was allocated with, which picks the same path.
+  static constexpr size_t kLargeBackingStore = size_t{1} << 20;
+
+  static bool IsLargeBackingStore(size_t length) { return length >= kLargeBackingStore; }
+
+  static void* AllocateLargeBackingStore(size_t length) {
+#if defined(_WIN32)
+    return VirtualAlloc(nullptr, length, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* data = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return data == MAP_FAILED ? nullptr : data;
+#endif
+  }
+
+  static void FreeLargeBackingStore(void* data, size_t length) {
+#if defined(_WIN32)
+    (void)length;
+    VirtualFree(data, 0, MEM_RELEASE);
+#else
+    munmap(data, length);
+#endif
   }
 
   v8::ArrayBuffer::Allocator* backing_ = nullptr;
