@@ -591,6 +591,7 @@ napi_env__::~napi_env__() {
     instance_data_finalize_cb(this, instance_data, instance_data_finalize_hint);
   }
   NAPI_V8_LIFETIME_DUMP(this, "napi_env__ teardown end");
+  if (before_destroy != nullptr) before_destroy(before_destroy_data);
 }
 
 v8::Local<v8::Context> napi_env__::context() const {

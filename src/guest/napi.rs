@@ -6,95 +6,201 @@
 
 use std::ffi::CString;
 
-use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports, namespace};
-use wasmer_wasix::WasiError;
+use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports, RuntimeError, namespace};
 
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv, RequestedHeap,
     guest::{
         MAX_GUEST_CSTRING_SCAN, MAX_NAPI_BIGINT_WORDS, MAX_NAPI_CALLBACK_ARGS,
-        callback::{take_pending_guest_exit, with_callback_state},
+        callback::with_callback_state,
     },
     snapi::*,
 };
 
 use super::{abi, util::*};
 
-fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
-    let _ = unsafe { snapi_bridge_init() };
-    // Legacy N-API modules without an embedder-owned runtime configuration use
-    // the provider default. If Edge configured flags first, this conflicting
-    // empty request is rejected without changing the existing runtime.
-    let _ = unsafe { snapi_bridge_unofficial_configure_runtime(std::ptr::null(), 0) };
-
-    if let Some(env_id) = env.data().default_napi_env_id {
-        return env_id as i32;
-    }
-
-    let Ok(reservation) = env.data().reserve_isolate(RequestedHeap::default()) else {
-        return 0;
+// The shape matches the existing guest_is_check/guest_coerce item macros.
+// Preserve each typed Wasm signature while adding one Rust import failure scope.
+macro_rules! native_import {
+    ($(#[$attribute:meta])* fn $name:ident(mut $env:ident: FunctionEnvMut<NapiEnv> $(, $arg:ident: $ty:ty)* $(,)?) -> $result:ty $body:block) => {
+        native_import!(@item [mut] $(#[$attribute])* fn $name($env $(, $arg: $ty)*) -> $result $body);
     };
-
-    let guest_heap_ctx = guest_heap_alloc_ctx(&env);
-    let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
-    let status = if reservation.clamped {
-        unsafe {
-            snapi_bridge_unofficial_create_env_with_options(
-                8,
-                0,
-                0,
-                reservation.max_young,
-                reservation.max_old,
-                reservation.code_range,
-                0,
-                guest_heap_ctx,
-                &mut snapi_env_state,
-            )
+    ($(#[$attribute:meta])* fn $name:ident($env:ident: FunctionEnvMut<NapiEnv> $(, $arg:ident: $ty:ty)* $(,)?) -> $result:ty $body:block) => {
+        native_import!(@item [] $(#[$attribute])* fn $name($env $(, $arg: $ty)*) -> $result $body);
+    };
+    ($(#[$attribute:meta])* fn $name:ident($env:ident: FunctionEnvMut<NapiEnv> $(, $arg:ident: $ty:ty)* $(,)?) $body:block) => {
+        native_import!(@item [] $(#[$attribute])* fn $name($env $(, $arg: $ty)*) -> () $body);
+    };
+    (@item [$($mutable:tt)?] $(#[$attribute:meta])* fn $name:ident($env:ident $(, $arg:ident: $ty:ty)*) -> $result:ty $body:block) => {
+        $(#[$attribute])*
+        fn $name($env: FunctionEnvMut<NapiEnv> $(, $arg: $ty)*) -> Result<
+            <$result as super::callback::NativeImportOutput>::Value,
+            RuntimeError,
+        > {
+            super::callback::with_native_import($env, move |$($mutable)? $env| -> $result { $body })
         }
-    } else {
-        unsafe { snapi_bridge_unofficial_create_env(8, guest_heap_ctx, &mut snapi_env_state) }
     };
-    if status != 0 || snapi_env_state.is_null() {
-        env.data().abort_isolate(&reservation);
-        return 0;
+}
+// Match the existing item macros: snapshot every FFI argument before lending
+// the original Store. Borrowed Env data must be copied into owned snapshots.
+macro_rules! parked_bridge {
+    ($env:ident, $call:ident($($argument:expr),* $(,)?)) => {
+        parked_bridge!(@bind $env, $call, [], [$($argument),*],
+            [a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+             a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28,a29,a30,a31])
+    };
+    (@bind $env:ident, $call:ident, [$($bound:ident),*], [], [$($left:ident),*]) => {
+        $env.as_store_mut().parked(|| $call($($bound),*))
+    };
+    (@bind $env:ident, $call:ident, [$($bound:ident),*],
+        [$argument:expr $(, $rest:expr)*], [$next:ident $(, $left:ident)*]) => {{
+        let $next = $argument;
+        parked_bridge!(@bind $env, $call, [$($bound,)* $next], [$($rest),*], [$($left),*])
+    }};
+}
+
+native_import! {
+fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> Result<i32, RuntimeError> {
+    if !env.data().creation_enabled() {
+        return Ok(0);
     }
-
-    let (env_id, _scope_id) = env.data_mut().commit_isolate(snapi_env_state, &reservation);
-    env.data_mut().default_napi_env_id = Some(env_id);
-    env_id as i32
+    let _ = unsafe { parked_bridge!(env, snapi_bridge_init()) };
+    // Preserve an embedder's prior explicit runtime configuration.
+    let _ = unsafe { parked_bridge!(env, snapi_bridge_unofficial_configure_runtime(std::ptr::null(), 0)) };
+    if let Some(id) = env.data().default_napi_env_id {
+        return Ok(id as i32);
+    }
+    let options = NativeCreateOptions {
+        version: 8,
+        total: 0,
+        constrained: 0,
+        stack: 0,
+        requested: RequestedHeap::default(),
+        make_default: true,
+        outputs: None,
+    };
+    Ok(create_native_provider(&mut env, options).map_or(0, |ids| ids.env as i32))
+}
 }
 
-/// Boxed guest-heap context for env creation, or null when no heap exists.
-/// The bridge takes ownership in all cases (success or failure).
-fn guest_heap_alloc_ctx(env: &FunctionEnvMut<NapiEnv>) -> *const std::ffi::c_void {
-    env.data()
-        .guest_heap
-        .as_ref()
-        .map(|heap| heap.make_alloc_ctx() as *const std::ffi::c_void)
-        .unwrap_or(std::ptr::null())
+struct NativeCreateOptions {
+    version: i32,
+    total: u64,
+    constrained: u64,
+    stack: u32,
+    requested: RequestedHeap,
+    make_default: bool,
+    outputs: Option<(i32, i32)>,
 }
 
-/// Run a bridge call that may re-enter the guest via host V8 callbacks, then
-/// re-raise any guest instance exit that trapped out of one of those callbacks.
-///
-/// A guest `_exit`/`proc_exit` during a nested callback cannot unwind through the
-/// intervening host V8 (C++) frames, so the callback trampoline stashes it (see
-/// [`take_pending_guest_exit`]). This boundary — the enclosing N-API import — is
-/// the first Rust frame that can carry a trap, so it returns the exit as
-/// `Err(WasiError::Exit)`. wasmer re-raises it, and the same happens at each
-/// outer import layer until the runner handles it, terminating just this guest
-/// instance. Callers propagate with `?`.
-fn with_cb_context<R>(
+// Return only owned results, restoring the counted wrapper before replaying a
+// panic. No original FunctionEnvMut is reconstructed from a stored pointer.
+fn with_creation_env<R>(
+    frame: &wasmer::sys::FunctionEnvFramePin<NapiEnv>,
+    f: impl FnOnce(&mut FunctionEnvMut<NapiEnv>) -> R,
+) -> Option<R> {
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+    let result = wasmer::Store::with_current(|store| {
+        catch_unwind(AssertUnwindSafe(|| {
+            let mut current = frame.try_as_env_mut(store)?;
+            Some(f(&mut current))
+        }))
+    })?;
+    match result {
+        Ok(result) => result,
+        Err(panic) => resume_unwind(panic),
+    }
+}
+
+fn create_native_provider(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    options: NativeCreateOptions,
+) -> Result<crate::env::NativeEnvIds, i32> {
+    if unsafe { snapi_v8_allocator_active() } != 0 {
+        return Err(1);
+    }
+    let refill = env.data().native_guest_refill.clone();
+    if let (Some(heap), Some(refill)) = (env.data().guest_heap.clone(), refill) {
+        // Prefunding is advisory: creating an isolate does not require a
+        // guest-visible backing buffer. Preserve the original failure if the
+        // refiller raised one rather than merely refusing this allocation.
+        let _ = heap.refill_leased(&mut env.as_store_mut(), &*refill, 0, true);
+        if crate::native_frame::current_failed() {
+            return Err(1);
+        }
+    }
+    let frame = env.pin_frame().ok_or(1)?;
+    let request = env.data_mut().prepare_native_creation().ok_or(1)?;
+    env.as_store_mut().parked(|| {
+        let mut creation = request.reserve(options.requested).map_err(|_| 1)?;
+        // A reservation accountant may detach this cell, stop the session or
+        // reenter default initialization. Recheck before provider creation.
+        let existing = with_creation_env(&frame, |current| {
+            if !creation.request.matches(current.data()) {
+                return Err(1);
+            }
+            Ok(if options.make_default {
+                current.data().default_napi_env_id
+            } else {
+                None
+            })
+        })
+        .ok_or(1)??;
+        if let Some(env) = existing {
+            return Ok(crate::env::NativeEnvIds { env, scope: 0 });
+        }
+        let status = creation.create(
+            options.version,
+            options.total,
+            options.constrained,
+            options.stack,
+        );
+        if status != 0 || crate::native_frame::current_failed() {
+            return Err(if status == 0 { 1 } else { status });
+        }
+        let ids = with_creation_env(&frame, |current| {
+            if !creation.request.matches(current.data()) {
+                return Err(1);
+            }
+            if options.make_default
+                && let Some(env) = current.data().default_napi_env_id
+            {
+                return Ok(crate::env::NativeEnvIds { env, scope: 0 });
+            }
+            let ids = creation.ids();
+            if let Some((env_out, scope_out)) = options.outputs
+                && ((env_out > 0 && !write_guest_u32(current, env_out as u32, ids.env))
+                    || (scope_out > 0 && !write_guest_u32(current, scope_out as u32, ids.scope)))
+            {
+                return Err(1);
+            }
+            if current
+                .data_mut()
+                .commit_isolate(&mut creation, options.make_default)
+            {
+                Ok(ids)
+            } else {
+                Err(1)
+            }
+        })
+        .ok_or(1)??;
+        if ids.env == creation.ids().env {
+            // Every user callout and output write ended before this private,
+            // callback-free transition. Drop still owns every failure path.
+            creation.publish();
+        }
+        Ok(ids)
+    })
+}
+
+/// Run a bridge call and return the original error of any guest callback.
+fn with_cb_context<R: Copy>(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_env: i32,
     f: impl FnOnce() -> R,
-) -> Result<R, WasiError> {
+) -> Result<R, RuntimeError> {
     let snapi_env = env.data().resolve_napi_env(guest_env);
-    let r = with_callback_state(env, snapi_env, f);
-    if let Some(code) = take_pending_guest_exit() {
-        return Err(WasiError::Exit(code));
-    }
-    Ok(r)
+    with_callback_state(env, snapi_env, f)
 }
 
 fn snapi_env(env: &FunctionEnvMut<NapiEnv>, guest_env: i32) -> SnapiEnv {
@@ -168,7 +274,10 @@ fn resolve_host_data_to_guest(
     // unbounded.
     let hint = heap.make_finalize_ctx(guest_ptr);
     let status = unsafe {
-        snapi_bridge_attach_guest_heap_finalizer(snapi_env(env, guest_env), handle_id, hint)
+        parked_bridge!(
+            env,
+            snapi_bridge_attach_guest_heap_finalizer(snapi_env(env, guest_env), handle_id, hint)
+        )
     };
     if status != 0 {
         crate::guest_heap::GuestHeap::reclaim_finalize_ctx(hint);
@@ -192,6 +301,7 @@ fn foreign_store_warn() {
     }
 }
 
+native_import! {
 fn guest_unofficial_napi_configure_runtime(
     mut env: FunctionEnvMut<NapiEnv>,
     options_ptr: i32,
@@ -203,98 +313,90 @@ fn guest_unofficial_napi_configure_runtime(
         return 1;
     };
     unsafe {
-        snapi_bridge_unofficial_configure_runtime(flags.as_ptr(), flags.as_bytes().len() as u32)
+        parked_bridge!(env, snapi_bridge_unofficial_configure_runtime(flags.as_ptr(), flags.as_bytes().len() as u32))
     }
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_create_env(
     mut env: FunctionEnvMut<NapiEnv>,
     module_api_version: i32,
     options_ptr: i32,
     env_out_ptr: i32,
     scope_out_ptr: i32,
-) -> i32 {
-    let (
-        total_memory,
-        constrained_memory,
-        max_young_generation_size_in_bytes,
-        max_old_generation_size_in_bytes,
-        code_range_size_in_bytes,
-        stack_limit,
-    ) = if options_ptr > 0 {
-        let Some(options) = abi::read_env_create(&mut env, options_ptr) else {
-            return 1;
+) -> Result<i32, RuntimeError> {
+    let mut options = NativeCreateOptions {
+        version: module_api_version,
+        total: 0,
+        constrained: 0,
+        stack: 0,
+        requested: RequestedHeap::default(),
+        make_default: false,
+        outputs: Some((env_out_ptr, scope_out_ptr)),
+    };
+    if options_ptr > 0 {
+        let Some(input) = abi::read_env_create(&mut env, options_ptr) else {
+            return Ok(1);
         };
-        (
-            options.total_memory,
-            options.constrained_memory,
-            options.max_young_generation_size_in_bytes,
-            options.max_old_generation_size_in_bytes,
-            options.code_range_size_in_bytes,
-            options.stack_limit,
-        )
-    } else {
-        (0, 0, 0, 0, 0, 0)
-    };
-
-    let requested = RequestedHeap {
-        max_young: max_young_generation_size_in_bytes,
-        max_old: max_old_generation_size_in_bytes,
-        code_range: code_range_size_in_bytes,
-    };
-    let reservation = match env.data().reserve_isolate(requested) {
-        Ok(reservation) => reservation,
-        Err(_) => return 1,
-    };
-
-    let guest_heap_ctx = guest_heap_alloc_ctx(&env);
-    let mut snapi_env_state: SnapiEnv = std::ptr::null_mut();
-    let status = unsafe {
-        snapi_bridge_unofficial_create_env_with_options(
-            module_api_version,
-            total_memory,
-            constrained_memory,
-            reservation.max_young,
-            reservation.max_old,
-            reservation.code_range,
-            stack_limit,
-            guest_heap_ctx,
-            &mut snapi_env_state,
-        )
-    };
-    if status != 0 {
-        env.data().abort_isolate(&reservation);
-        return status;
+        options.total = input.total_memory;
+        options.constrained = input.constrained_memory;
+        options.stack = input.stack_limit;
+        options.requested = RequestedHeap {
+            max_young: input.max_young_generation_size_in_bytes,
+            max_old: input.max_old_generation_size_in_bytes,
+            code_range: input.code_range_size_in_bytes,
+        };
     }
-    let (env_id, scope_id) = env.data_mut().commit_isolate(snapi_env_state, &reservation);
-    if env_out_ptr > 0 {
-        write_guest_u32(&mut env, env_out_ptr as u32, env_id);
-    }
-    if scope_out_ptr > 0 {
-        write_guest_u32(&mut env, scope_out_ptr as u32, scope_id);
-    }
-    0
+    Ok(create_native_provider(&mut env, options).map_or_else(|status| status, |_| 0))
+}
 }
 
+native_import! {
 fn guest_unofficial_napi_release_env(
     mut env: FunctionEnvMut<NapiEnv>,
     scope_ptr: i32,
     loop_ptr: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
+    if unsafe { snapi_v8_allocator_active() } != 0 {
+        return Ok(1);
+    }
     let scope_id = if scope_ptr > 0 { scope_ptr as u32 } else { 0 };
-    let Some((guest_env, snapi_env_state)) = env.data_mut().begin_unregister_napi_scope(scope_id)
-    else {
+    let Some(guest_env) = env.data().napi_scopes.get(&scope_id).copied() else {
         return Ok(1);
     };
-    let loop_id = if loop_ptr > 0 { loop_ptr as u32 } else { 0 };
-    let status = with_cb_context(&mut env, guest_env as i32, || unsafe {
-        snapi_bridge_unofficial_release_env_with_loop(snapi_env_state, loop_id)
-    });
+    let target = env.data().resolve_napi_env(guest_env as i32);
+    let Some(mut retirement) = env.data_mut().take_native_scope(scope_id) else {
+        return Ok(1);
+    };
+    let _ = loop_ptr; // the native provider currently has no separate loop owner
+    let callback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_cb_context(&mut env, guest_env as i32, || retirement.dispose())
+    }));
+    // Held temporary cleanup targets the original cell even after slot removal.
     env.data_mut()
-        .finish_unregister_napi_env(guest_env, snapi_env_state);
-    status
+        .finish_native_scope(guest_env, target, &mut retirement);
+    let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        env.as_store_mut().parked(|| drop(retirement));
+    }));
+    match (callback, cleanup) {
+        (Ok(result), Ok(())) => result,
+        (Ok(Ok(_)), Err(panic)) => std::panic::resume_unwind(panic),
+        (first, cleanup) => {
+            if let Err(secondary) = cleanup {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(secondary)));
+            }
+            match first {
+                Ok(Err(error)) => Err(error),
+                Err(panic) => std::panic::resume_unwind(panic),
+                Ok(Ok(_)) => unreachable!(),
+            }
+        }
+    }
+}
 }
 
+native_import! {
 fn guest_unofficial_napi_attach_env(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -309,12 +411,12 @@ fn guest_unofficial_napi_attach_env(
     }
     let mut accepted_hooks = 0u64;
     let status = unsafe {
-        snapi_bridge_unofficial_attach_env(
+        parked_bridge!(env, snapi_bridge_unofficial_attach_env(
             snapi_env(&env, napi_env),
             hooks.fatal,
             hooks.oom,
             &mut accepted_hooks,
-        )
+        ))
     };
     if status == 0 {
         write_guest_u64(&mut env, accepted_hooks_ptr as u32, accepted_hooks);
@@ -322,19 +424,23 @@ fn guest_unofficial_napi_attach_env(
     }
     status
 }
-
-fn guest_unofficial_napi_collect_garbage(env: FunctionEnvMut<NapiEnv>, napi_env: i32) -> i32 {
-    let env_handle = snapi_env(&env, napi_env);
-    unsafe { snapi_bridge_unofficial_collect_garbage(env_handle) }
 }
 
+native_import! {
+fn guest_unofficial_napi_collect_garbage(mut env: FunctionEnvMut<NapiEnv>, napi_env: i32) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    unsafe { parked_bridge!(env, snapi_bridge_unofficial_collect_garbage(env_handle)) }
+}
+}
+
+native_import! {
 fn guest_unofficial_napi_event_loop_checkpoint(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     mode: i32,
     has_runnable_work: i32,
     checkpoint_state_ptr: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let env_handle = snapi_env(&env, napi_env);
     let mut checkpoint_state = 0;
     let status = with_cb_context(&mut env, napi_env, || unsafe {
@@ -350,23 +456,27 @@ fn guest_unofficial_napi_event_loop_checkpoint(
     }
     Ok(status)
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_create_uninitialized_arraybuffer(
     env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     length: i32,
     _zero_fill: i32,
     result_ptr: i32,
-) -> i32 {
+) -> Result<i32, RuntimeError> {
     if length < 0 {
-        return 1;
+        return Ok(1);
     }
     // Imported providers cannot adopt a guest allocation as host engine
     // storage. Allocate directly in the provider without requesting a guest
     // pointer; engines which mandate zero initialization may return zeros.
     guest_napi_create_arraybuffer(env, napi_env, length, 0, result_ptr)
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_get_promise_details(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -381,13 +491,13 @@ fn guest_unofficial_napi_get_promise_details(
     let mut result_id = 0u32;
     let mut has_result = 0i32;
     let status = unsafe {
-        snapi_bridge_unofficial_get_promise_details(
+        parked_bridge!(env, snapi_bridge_unofficial_get_promise_details(
             env_handle,
             promise_id,
             &mut state,
             &mut result_id,
             &mut has_result,
-        )
+        ))
     };
     if status != 0 {
         return status;
@@ -403,7 +513,9 @@ fn guest_unofficial_napi_get_promise_details(
     }
     0
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_get_proxy_details(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -416,12 +528,12 @@ fn guest_unofficial_napi_get_proxy_details(
     let mut target_id = 0u32;
     let mut handler_id = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_get_proxy_details(
+        parked_bridge!(env, snapi_bridge_unofficial_get_proxy_details(
             env_handle,
             proxy_id,
             &mut target_id,
             &mut handler_id,
-        )
+        ))
     };
     if status != 0 {
         return status;
@@ -434,7 +546,9 @@ fn guest_unofficial_napi_get_proxy_details(
     }
     0
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_preview_entries(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -447,12 +561,12 @@ fn guest_unofficial_napi_preview_entries(
     let mut entries_id = 0u32;
     let mut is_key_value = 0i32;
     let status = unsafe {
-        snapi_bridge_unofficial_preview_entries(
+        parked_bridge!(env, snapi_bridge_unofficial_preview_entries(
             env_handle,
             value_id,
             &mut entries_id,
             &mut is_key_value,
-        )
+        ))
     };
     if status != 0 {
         return status;
@@ -465,7 +579,9 @@ fn guest_unofficial_napi_preview_entries(
     }
     0
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_get_call_sites(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -475,14 +591,16 @@ fn guest_unofficial_napi_get_call_sites(
     let env_handle = snapi_env(&env, napi_env);
     let mut callsites_id = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_get_call_sites(env_handle, frames as u32, &mut callsites_id)
+        parked_bridge!(env, snapi_bridge_unofficial_get_call_sites(env_handle, frames as u32, &mut callsites_id))
     };
     if status == 0 && callsites_ptr > 0 {
         write_guest_u32(&mut env, callsites_ptr as u32, callsites_id);
     }
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_arraybuffer_view_has_buffer(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -493,14 +611,16 @@ fn guest_unofficial_napi_arraybuffer_view_has_buffer(
     let value_id = if value > 0 { value as u32 } else { 0 };
     let mut result = 0i32;
     let status = unsafe {
-        snapi_bridge_unofficial_arraybuffer_view_has_buffer(env_handle, value_id, &mut result)
+        parked_bridge!(env, snapi_bridge_unofficial_arraybuffer_view_has_buffer(env_handle, value_id, &mut result))
     };
     if status == 0 && result_ptr > 0 {
         write_guest_u8(&mut env, result_ptr as u32, (result != 0) as u8);
     }
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_get_constructor_name(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -511,13 +631,15 @@ fn guest_unofficial_napi_get_constructor_name(
     let value_id = if value > 0 { value as u32 } else { 0 };
     let mut name_id = 0u32;
     let status =
-        unsafe { snapi_bridge_unofficial_get_constructor_name(env_handle, value_id, &mut name_id) };
+        unsafe { parked_bridge!(env, snapi_bridge_unofficial_get_constructor_name(env_handle, value_id, &mut name_id)) };
     if status == 0 && name_ptr > 0 {
         write_guest_u32(&mut env, name_ptr as u32, name_id);
     }
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_create_private_symbol(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -542,14 +664,16 @@ fn guest_unofficial_napi_create_private_symbol(
     let cs = CString::new(desc).unwrap_or_default();
     let mut out = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_create_private_symbol(env_handle, cs.as_ptr(), wl, &mut out)
+        parked_bridge!(env, snapi_bridge_unofficial_create_private_symbol(env_handle, cs.as_ptr(), wl, &mut out))
     };
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, out);
     }
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_get_continuation_preserved_embedder_data(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -558,69 +682,81 @@ fn guest_unofficial_napi_get_continuation_preserved_embedder_data(
     let env_handle = snapi_env(&env, napi_env);
     let mut out = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_get_continuation_preserved_embedder_data(env_handle, &mut out)
+        parked_bridge!(env, snapi_bridge_unofficial_get_continuation_preserved_embedder_data(env_handle, &mut out))
     };
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, out);
     }
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_set_prepare_stack_trace_callback(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     callback: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let callback_id = if callback > 0 { callback as u32 } else { 0 };
-    unsafe { snapi_bridge_unofficial_set_prepare_stack_trace_callback(env_handle, callback_id) }
+    unsafe { parked_bridge!(env, snapi_bridge_unofficial_set_prepare_stack_trace_callback(env_handle, callback_id)) }
+}
 }
 
+native_import! {
 fn guest_unofficial_napi_set_continuation_preserved_embedder_data(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     value: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let value_id = if value > 0 { value as u32 } else { 0 };
     unsafe {
-        snapi_bridge_unofficial_set_continuation_preserved_embedder_data(env_handle, value_id)
+        parked_bridge!(env, snapi_bridge_unofficial_set_continuation_preserved_embedder_data(env_handle, value_id))
     }
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_notify_datetime_configuration_change(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
-    unsafe { snapi_bridge_unofficial_notify_datetime_configuration_change(env_handle) }
+    unsafe { parked_bridge!(env, snapi_bridge_unofficial_notify_datetime_configuration_change(env_handle)) }
+}
 }
 
-fn guest_unofficial_napi_terminate_execution(env: FunctionEnvMut<NapiEnv>, napi_env: i32) -> i32 {
+native_import! {
+fn guest_unofficial_napi_terminate_execution(mut env: FunctionEnvMut<NapiEnv>, napi_env: i32) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
-    unsafe { snapi_bridge_unofficial_terminate_execution(env_handle) }
+    unsafe { parked_bridge!(env, snapi_bridge_unofficial_terminate_execution(env_handle)) }
+}
 }
 
+native_import! {
 fn guest_unofficial_napi_cancel_terminate_execution(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     if env.data().host_stopped() {
         unsafe {
-            snapi_bridge_unofficial_terminate_execution(env_handle);
+            parked_bridge!(env, snapi_bridge_unofficial_terminate_execution(env_handle));
         }
         return 1;
     }
-    unsafe { snapi_bridge_unofficial_cancel_terminate_execution(env_handle) }
+    unsafe { parked_bridge!(env, snapi_bridge_unofficial_cancel_terminate_execution(env_handle)) }
+}
 }
 
+native_import! {
 fn guest_unofficial_napi_request_interrupt(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     callback: i32,
     data: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let env_handle = snapi_env(&env, napi_env);
     let callback_id = if callback > 0 { callback as u32 } else { 0 };
     let data_val = if data > 0 { data as u32 } else { 0 };
@@ -633,7 +769,9 @@ fn guest_unofficial_napi_request_interrupt(
         )
     })
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_structured_clone(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -650,14 +788,16 @@ fn guest_unofficial_napi_structured_clone(
     };
     let mut out = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_structured_clone(env_handle, value_id, transfer_list_id, &mut out)
+        parked_bridge!(env, snapi_bridge_unofficial_structured_clone(env_handle, value_id, transfer_list_id, &mut out))
     };
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, out);
     }
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_message_create(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -670,14 +810,16 @@ fn guest_unofficial_napi_message_create(
     let env_handle = snapi_env(&env, napi_env);
     let mut message = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_message_create(env_handle, value.max(0) as u32, &mut message)
+        parked_bridge!(env, snapi_bridge_unofficial_message_create(env_handle, value.max(0) as u32, &mut message))
     };
     if status == 0 {
         write_guest_u32(&mut env, payload_out_ptr as u32, message);
     }
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_message_take(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -688,43 +830,51 @@ fn guest_unofficial_napi_message_take(
         return 1;
     }
     if result_out_ptr <= 0 {
-        unsafe { snapi_bridge_unofficial_message_drop(payload as u32) };
+        unsafe { parked_bridge!(env, snapi_bridge_unofficial_message_drop(payload as u32)) };
         return 1;
     }
     let env_handle = snapi_env(&env, napi_env);
     let mut value = 0u32;
     let status =
-        unsafe { snapi_bridge_unofficial_message_take(env_handle, payload as u32, &mut value) };
+        unsafe { parked_bridge!(env, snapi_bridge_unofficial_message_take(env_handle, payload as u32, &mut value)) };
     if status == 0 {
         write_guest_u32(&mut env, result_out_ptr as u32, value);
     }
     status
 }
-
-fn guest_unofficial_napi_message_drop(_env: FunctionEnvMut<NapiEnv>, payload: i32) {
-    unsafe { snapi_bridge_unofficial_message_drop(payload.max(0) as u32) };
 }
 
+native_import! {
+fn guest_unofficial_napi_message_drop(mut _env: FunctionEnvMut<NapiEnv>, payload: i32) -> () {
+    unsafe { parked_bridge!(_env, snapi_bridge_unofficial_message_drop(payload.max(0) as u32)) };
+}
+}
+
+native_import! {
 fn guest_unofficial_napi_enqueue_microtask(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     callback: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let callback_id = if callback > 0 { callback as u32 } else { 0 };
-    unsafe { snapi_bridge_unofficial_enqueue_microtask(env_handle, callback_id) }
+    unsafe { parked_bridge!(env, snapi_bridge_unofficial_enqueue_microtask(env_handle, callback_id)) }
+}
 }
 
+native_import! {
 fn guest_unofficial_napi_set_promise_reject_callback(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     callback: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let callback_id = if callback > 0 { callback as u32 } else { 0 };
-    unsafe { snapi_bridge_unofficial_set_promise_reject_callback(env_handle, callback_id) }
+    unsafe { parked_bridge!(env, snapi_bridge_unofficial_set_promise_reject_callback(env_handle, callback_id)) }
+}
 }
 
+native_import! {
 fn guest_unofficial_napi_get_own_non_index_properties(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -738,21 +888,23 @@ fn guest_unofficial_napi_get_own_non_index_properties(
     let env_handle = snapi_env(&env, napi_env);
     let mut out = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_get_own_non_index_properties(
+        parked_bridge!(env, snapi_bridge_unofficial_get_own_non_index_properties(
             env_handle,
             value as u32,
             filter_bits.max(0) as u32,
             &mut out,
-        )
+        ))
     };
     if status == 0 {
         write_guest_u32(&mut env, result_out_ptr as u32, out);
     }
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_set_promise_hooks(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     init_callback: i32,
     before_callback: i32,
@@ -761,7 +913,7 @@ fn guest_unofficial_napi_set_promise_hooks(
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     unsafe {
-        snapi_bridge_unofficial_set_promise_hooks(
+        parked_bridge!(env, snapi_bridge_unofficial_set_promise_hooks(
             env_handle,
             if init_callback > 0 {
                 init_callback as u32
@@ -783,10 +935,12 @@ fn guest_unofficial_napi_set_promise_hooks(
             } else {
                 0
             },
-        )
+        ))
     }
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_get_hash_seed(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -794,13 +948,15 @@ fn guest_unofficial_napi_get_hash_seed(
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let mut hash_seed = 0u64;
-    let status = unsafe { snapi_bridge_unofficial_get_hash_seed(env_handle, &mut hash_seed) };
+    let status = unsafe { parked_bridge!(env, snapi_bridge_unofficial_get_hash_seed(env_handle, &mut hash_seed)) };
     if status == 0 && hash_seed_out > 0 {
         write_guest_u64(&mut env, hash_seed_out as u32, hash_seed);
     }
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_get_error_metadata(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -818,7 +974,7 @@ fn guest_unofficial_napi_get_error_metadata(
     let mut start_column = 0i32;
     let mut end_column = 0i32;
     let status = unsafe {
-        snapi_bridge_unofficial_get_error_metadata(
+        parked_bridge!(env, snapi_bridge_unofficial_get_error_metadata(
             env_handle,
             error_id,
             mode,
@@ -829,7 +985,7 @@ fn guest_unofficial_napi_get_error_metadata(
             &mut line_number,
             &mut start_column,
             &mut end_column,
-        )
+        ))
     };
     if status != 0 {
         return status;
@@ -845,38 +1001,46 @@ fn guest_unofficial_napi_get_error_metadata(
     }
     0
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_configure_source_maps(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     enabled: i32,
     callback: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let callback_id = if callback > 0 { callback as u32 } else { 0 };
-    unsafe { snapi_bridge_unofficial_configure_source_maps(env_handle, enabled, callback_id) }
+    unsafe { parked_bridge!(env, snapi_bridge_unofficial_configure_source_maps(env_handle, enabled, callback_id)) }
+}
 }
 
+native_import! {
 fn guest_unofficial_napi_preserve_error_source_message(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     error: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let error_id = if error > 0 { error as u32 } else { 0 };
-    unsafe { snapi_bridge_unofficial_preserve_error_source_message(env_handle, error_id) }
+    unsafe { parked_bridge!(env, snapi_bridge_unofficial_preserve_error_source_message(env_handle, error_id)) }
+}
 }
 
+native_import! {
 fn guest_unofficial_napi_mark_promise_as_handled(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     promise: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let promise_id = if promise > 0 { promise as u32 } else { 0 };
-    unsafe { snapi_bridge_unofficial_mark_promise_as_handled(env_handle, promise_id) }
+    unsafe { parked_bridge!(env, snapi_bridge_unofficial_mark_promise_as_handled(env_handle, promise_id)) }
+}
 }
 
+native_import! {
 fn guest_unofficial_napi_get_heap_statistics(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -911,13 +1075,15 @@ fn guest_unofficial_napi_get_heap_statistics(
         external_memory: 0,
         array_buffer_memory: 0,
     };
-    let status = unsafe { snapi_bridge_unofficial_get_heap_statistics(env_handle, &mut stats) };
+    let status = unsafe { parked_bridge!(env, snapi_bridge_unofficial_get_heap_statistics(env_handle, &mut stats)) };
     if status == 0 && stats_ptr > 0 && !write_guest_pod(&mut env, stats_ptr, &stats) {
         return 1;
     }
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_get_heap_space_statistics(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -945,7 +1111,7 @@ fn guest_unofficial_napi_get_heap_space_statistics(
         .collect();
     let mut count = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_get_heap_space_statistics(
+        parked_bridge!(env, snapi_bridge_unofficial_get_heap_space_statistics(
             env_handle,
             if stats.is_empty() {
                 std::ptr::null_mut()
@@ -954,7 +1120,7 @@ fn guest_unofficial_napi_get_heap_space_statistics(
             },
             capacity as u32,
             &mut count,
-        )
+        ))
     };
     if status == 0 {
         if !write_guest_u32(&mut env, count_ptr as u32, count) {
@@ -967,7 +1133,9 @@ fn guest_unofficial_napi_get_heap_space_statistics(
     }
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_get_heap_code_statistics(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -981,13 +1149,15 @@ fn guest_unofficial_napi_get_heap_code_statistics(
         cpu_profiler_metadata_size: 0,
     };
     let status =
-        unsafe { snapi_bridge_unofficial_get_heap_code_statistics(env_handle, &mut stats) };
+        unsafe { parked_bridge!(env, snapi_bridge_unofficial_get_heap_code_statistics(env_handle, &mut stats)) };
     if status == 0 && stats_ptr > 0 && !write_guest_pod(&mut env, stats_ptr, &stats) {
         return 1;
     }
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_configure_near_heap_limit_callback(
     _env: FunctionEnvMut<NapiEnv>,
     _napi_env: i32,
@@ -997,7 +1167,9 @@ fn guest_unofficial_napi_configure_near_heap_limit_callback(
 ) -> i32 {
     0
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_profile_start(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1009,7 +1181,7 @@ fn guest_unofficial_napi_profile_start(
     let mut result = 0i32;
     let mut profile = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_profile_start(env_handle, kind, &mut result, &mut profile)
+        parked_bridge!(env, snapi_bridge_unofficial_profile_start(env_handle, kind, &mut result, &mut profile))
     };
     if status != 0 {
         return status;
@@ -1022,7 +1194,9 @@ fn guest_unofficial_napi_profile_start(
     }
     0
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_profile_stop(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1032,7 +1206,7 @@ fn guest_unofficial_napi_profile_stop(
     let env_handle = snapi_env(&env, napi_env);
     let mut json = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_profile_stop(env_handle, profile.max(0) as u32, &mut json)
+        parked_bridge!(env, snapi_bridge_unofficial_profile_stop(env_handle, profile.max(0) as u32, &mut json))
     };
     if status != 0 {
         return status;
@@ -1042,7 +1216,9 @@ fn guest_unofficial_napi_profile_stop(
     }
     0
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_take_heap_snapshot(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1060,12 +1236,12 @@ fn guest_unofficial_napi_take_heap_snapshot(
     };
     let mut json = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_take_heap_snapshot(
+        parked_bridge!(env, snapi_bridge_unofficial_take_heap_snapshot(
             env_handle,
             expose_internals,
             expose_numeric_values,
             &mut json,
-        )
+        ))
     };
     if status != 0 {
         return status;
@@ -1075,7 +1251,9 @@ fn guest_unofficial_napi_take_heap_snapshot(
     }
     0
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_create_serdes_binding(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1083,13 +1261,15 @@ fn guest_unofficial_napi_create_serdes_binding(
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     let mut out = 0u32;
-    let status = unsafe { snapi_bridge_unofficial_create_serdes_binding(env_handle, &mut out) };
+    let status = unsafe { parked_bridge!(env, snapi_bridge_unofficial_create_serdes_binding(env_handle, &mut out)) };
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, out);
     }
     status
 }
+}
 
+native_import! {
 fn guest_napi_add_env_cleanup_hook(
     _env: FunctionEnvMut<NapiEnv>,
     _napi_env: i32,
@@ -1098,7 +1278,9 @@ fn guest_napi_add_env_cleanup_hook(
 ) -> i32 {
     0
 }
+}
 
+native_import! {
 fn guest_napi_remove_env_cleanup_hook(
     _env: FunctionEnvMut<NapiEnv>,
     _napi_env: i32,
@@ -1107,7 +1289,9 @@ fn guest_napi_remove_env_cleanup_hook(
 ) -> i32 {
     0
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_contextify_contains_module_syntax(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1127,21 +1311,23 @@ fn guest_unofficial_napi_contextify_contains_module_syntax(
     };
     let mut result = 0i32;
     let status = unsafe {
-        snapi_bridge_unofficial_contextify_contains_module_syntax(
+        parked_bridge!(env, snapi_bridge_unofficial_contextify_contains_module_syntax(
             env_handle,
             code_id,
             filename_id,
             resource_name_id,
             cjs_var_in_scope,
             &mut result,
-        )
+        ))
     };
     if status == 0 && result_ptr > 0 {
         write_guest_u8(&mut env, result_ptr as u32, (result != 0) as u8);
     }
     status
 }
+}
 
+native_import! {
 #[allow(clippy::too_many_arguments)]
 fn guest_unofficial_napi_contextify_make_context(
     mut env: FunctionEnvMut<NapiEnv>,
@@ -1158,7 +1344,7 @@ fn guest_unofficial_napi_contextify_make_context(
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_contextify_make_context(
+        parked_bridge!(env, snapi_bridge_unofficial_contextify_make_context(
             env_handle,
             sandbox_or_symbol as u32,
             name as u32,
@@ -1176,14 +1362,16 @@ fn guest_unofficial_napi_contextify_make_context(
                 0
             },
             &mut result_id,
-        )
+        ))
     };
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, result_id);
     }
     status
 }
+}
 
+native_import! {
 #[allow(clippy::too_many_arguments)]
 fn guest_unofficial_napi_contextify_run_script(
     mut env: FunctionEnvMut<NapiEnv>,
@@ -1199,7 +1387,7 @@ fn guest_unofficial_napi_contextify_run_script(
     break_on_first_line: i32,
     host_defined_option_id: i32,
     result_ptr: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let Some((source_text, source_bytecode)) = abi::read_js_source(&mut env, source) else {
         return Ok(1);
     };
@@ -1235,7 +1423,9 @@ fn guest_unofficial_napi_contextify_run_script(
     }
     Ok(status)
 }
+}
 
+native_import! {
 #[allow(clippy::too_many_arguments)]
 fn guest_unofficial_napi_contextify_compile_function(
     mut env: FunctionEnvMut<NapiEnv>,
@@ -1256,7 +1446,7 @@ fn guest_unofficial_napi_contextify_compile_function(
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_contextify_compile_function(
+        parked_bridge!(env, snapi_bridge_unofficial_contextify_compile_function(
             env_handle,
             source_text,
             source_bytecode,
@@ -1284,14 +1474,16 @@ fn guest_unofficial_napi_contextify_compile_function(
                 0
             },
             &mut result_id,
-        )
+        ))
     };
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, result_id);
     }
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_bytecode_open(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1309,7 +1501,7 @@ fn guest_unofficial_napi_bytecode_open(
     let mut cache_rejected = 0u8;
     let mut can_parse_as_module = 0u8;
     let status = unsafe {
-        snapi_bridge_unofficial_bytecode_open(
+        parked_bridge!(env, snapi_bridge_unofficial_bytecode_open(
             env_handle,
             options.source_text,
             options.filename,
@@ -1329,14 +1521,16 @@ fn guest_unofficial_napi_bytecode_open(
             &mut bytecode_id,
             &mut cache_rejected,
             &mut can_parse_as_module,
-        )
+        ))
     };
     write_guest_u32(&mut env, result_ptr as u32, bytecode_id);
     write_guest_u8(&mut env, result_ptr as u32 + 4, cache_rejected);
     write_guest_u8(&mut env, result_ptr as u32 + 5, can_parse_as_module);
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_bytecode_serialize(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1346,23 +1540,27 @@ fn guest_unofficial_napi_bytecode_serialize(
     let env_handle = snapi_env(&env, napi_env);
     let mut buffer_id = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_bytecode_serialize(env_handle, bytecode as u32, &mut buffer_id)
+        parked_bridge!(env, snapi_bridge_unofficial_bytecode_serialize(env_handle, bytecode as u32, &mut buffer_id))
     };
     if status == 0 && buffer_ptr > 0 {
         write_guest_u32(&mut env, buffer_ptr as u32, buffer_id);
     }
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_bytecode_release(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     bytecode: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
-    unsafe { snapi_bridge_unofficial_bytecode_release(env_handle, bytecode as u32) }
+    unsafe { parked_bridge!(env, snapi_bridge_unofficial_bytecode_release(env_handle, bytecode as u32)) }
+}
 }
 
+native_import! {
 fn guest_unofficial_napi_module_wrap_create(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1380,7 +1578,7 @@ fn guest_unofficial_napi_module_wrap_create(
     let mut requests_id = 0u32;
     let mut has_top_level_await = 0u8;
     let status = unsafe {
-        snapi_bridge_unofficial_module_wrap_create(
+        parked_bridge!(env, snapi_bridge_unofficial_module_wrap_create(
             env_handle,
             options.kind,
             options.wrapper,
@@ -1396,7 +1594,7 @@ fn guest_unofficial_napi_module_wrap_create(
             &mut handle_id,
             &mut requests_id,
             &mut has_top_level_await,
-        )
+        ))
     };
     if status == 0 {
         write_guest_u32(&mut env, result_ptr as u32, handle_id);
@@ -1405,16 +1603,20 @@ fn guest_unofficial_napi_module_wrap_create(
     }
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_module_wrap_destroy(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     handle: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
-    unsafe { snapi_bridge_unofficial_module_wrap_destroy(env_handle, handle as u32) }
+    unsafe { parked_bridge!(env, snapi_bridge_unofficial_module_wrap_destroy(env_handle, handle as u32)) }
+}
 }
 
+native_import! {
 fn guest_unofficial_napi_module_wrap_link(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1433,24 +1635,28 @@ fn guest_unofficial_napi_module_wrap_link(
         Vec::new()
     };
     unsafe {
-        snapi_bridge_unofficial_module_wrap_link(
+        parked_bridge!(env, snapi_bridge_unofficial_module_wrap_link(
             env_handle,
             handle as u32,
             count_u,
             linked_handles.as_ptr(),
-        )
+        ))
     }
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_module_wrap_instantiate(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     handle: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
-    unsafe { snapi_bridge_unofficial_module_wrap_instantiate(env_handle, handle as u32) }
+    unsafe { parked_bridge!(env, snapi_bridge_unofficial_module_wrap_instantiate(env_handle, handle as u32)) }
+}
 }
 
+native_import! {
 fn guest_unofficial_napi_module_wrap_evaluate(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1458,7 +1664,7 @@ fn guest_unofficial_napi_module_wrap_evaluate(
     timeout: i64,
     break_on_sigint: i32,
     result_ptr: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
     let status = with_cb_context(&mut env, napi_env, || unsafe {
@@ -1475,7 +1681,9 @@ fn guest_unofficial_napi_module_wrap_evaluate(
     }
     Ok(status)
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_module_wrap_evaluate_sync(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1483,7 +1691,7 @@ fn guest_unofficial_napi_module_wrap_evaluate_sync(
     filename: i32,
     parent_filename: i32,
     result_ptr: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
     let status = with_cb_context(&mut env, napi_env, || unsafe {
@@ -1504,7 +1712,9 @@ fn guest_unofficial_napi_module_wrap_evaluate_sync(
     }
     Ok(status)
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_module_wrap_get_namespace(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1514,14 +1724,16 @@ fn guest_unofficial_napi_module_wrap_get_namespace(
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_module_wrap_get_namespace(env_handle, handle as u32, &mut result_id)
+        parked_bridge!(env, snapi_bridge_unofficial_module_wrap_get_namespace(env_handle, handle as u32, &mut result_id))
     };
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, result_id);
     }
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_module_wrap_get_state(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1535,7 +1747,7 @@ fn guest_unofficial_napi_module_wrap_get_state(
     let mut error_id = 0u32;
     let mut has_async_graph = 0i32;
     let status = unsafe {
-        snapi_bridge_unofficial_module_wrap_get_state(
+        parked_bridge!(env, snapi_bridge_unofficial_module_wrap_get_state(
             env_handle,
             handle as u32,
             if status_ptr > 0 {
@@ -1553,7 +1765,7 @@ fn guest_unofficial_napi_module_wrap_get_state(
             } else {
                 std::ptr::null_mut()
             },
-        )
+        ))
     };
     if status == 0 {
         if status_ptr > 0 {
@@ -1572,7 +1784,9 @@ fn guest_unofficial_napi_module_wrap_get_state(
     }
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_module_wrap_check_unsettled_top_level_await(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1584,21 +1798,23 @@ fn guest_unofficial_napi_module_wrap_check_unsettled_top_level_await(
     let handle_id = if handle > 0 { handle as u32 } else { 0 };
     let mut settled = 0i32;
     let status = unsafe {
-        snapi_bridge_unofficial_module_wrap_check_unsettled_top_level_await(
+        parked_bridge!(env, snapi_bridge_unofficial_module_wrap_check_unsettled_top_level_await(
             env_handle,
             handle_id,
             warnings,
             &mut settled,
-        )
+        ))
     };
     if status == 0 && settled_ptr > 0 {
         write_guest_u8(&mut env, settled_ptr as u32, (settled != 0) as u8);
     }
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_module_wrap_set_export(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     handle: i32,
     export_name: i32,
@@ -1606,7 +1822,7 @@ fn guest_unofficial_napi_module_wrap_set_export(
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     unsafe {
-        snapi_bridge_unofficial_module_wrap_set_export(
+        parked_bridge!(env, snapi_bridge_unofficial_module_wrap_set_export(
             env_handle,
             handle as u32,
             export_name as u32,
@@ -1615,19 +1831,21 @@ fn guest_unofficial_napi_module_wrap_set_export(
             } else {
                 0
             },
-        )
+        ))
     }
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_module_wrap_set_module_source_object(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     handle: i32,
     source_object: i32,
 ) -> i32 {
     let env_handle = snapi_env(&env, napi_env);
     unsafe {
-        snapi_bridge_unofficial_module_wrap_set_module_source_object(
+        parked_bridge!(env, snapi_bridge_unofficial_module_wrap_set_module_source_object(
             env_handle,
             handle as u32,
             if source_object > 0 {
@@ -1635,10 +1853,12 @@ fn guest_unofficial_napi_module_wrap_set_module_source_object(
             } else {
                 0
             },
-        )
+        ))
     }
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_module_wrap_get_module_source_object(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1648,18 +1868,20 @@ fn guest_unofficial_napi_module_wrap_get_module_source_object(
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_module_wrap_get_module_source_object(
+        parked_bridge!(env, snapi_bridge_unofficial_module_wrap_get_module_source_object(
             env_handle,
             handle as u32,
             &mut result_id,
-        )
+        ))
     };
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, result_id);
     }
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_module_wrap_create_cached_data(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1669,18 +1891,20 @@ fn guest_unofficial_napi_module_wrap_create_cached_data(
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_module_wrap_create_cached_data(
+        parked_bridge!(env, snapi_bridge_unofficial_module_wrap_create_cached_data(
             env_handle,
             handle as u32,
             &mut result_id,
-        )
+        ))
     };
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, result_id);
     }
     status
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_module_wrap_set_hooks(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
@@ -1693,20 +1917,22 @@ fn guest_unofficial_napi_module_wrap_set_hooks(
     };
     let env_handle = snapi_env(&env, napi_env);
     unsafe {
-        snapi_bridge_unofficial_module_wrap_set_hooks(
+        parked_bridge!(env, snapi_bridge_unofficial_module_wrap_set_hooks(
             env_handle,
             dynamic_import,
             initialize_import_meta,
-        )
+        ))
     }
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_module_wrap_create_required_module_facade(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     handle: i32,
     result_ptr: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
     let status = with_cb_context(&mut env, napi_env, || unsafe {
@@ -1721,47 +1947,57 @@ fn guest_unofficial_napi_module_wrap_create_required_module_facade(
     }
     Ok(status)
 }
+}
 
 // --- Singleton getters ---
 
+native_import! {
 fn guest_napi_get_undefined(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i32) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_get_undefined(snapi_env(&env, e), &mut out) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_get_undefined(snapi_env(&env, e), &mut out)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_get_null(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i32) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_get_null(snapi_env(&env, e), &mut out) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_get_null(snapi_env(&env, e), &mut out)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_get_boolean(mut env: FunctionEnvMut<NapiEnv>, e: i32, value: i32, rp: i32) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_get_boolean(snapi_env(&env, e), value, &mut out) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_get_boolean(snapi_env(&env, e), value, &mut out)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_get_global(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i32) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_get_global(snapi_env(&env, e), &mut out) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_get_global(snapi_env(&env, e), &mut out)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
+}
 }
 
 // --- Value creation ---
 
+native_import! {
 fn guest_napi_create_string_utf8(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -1785,19 +2021,21 @@ fn guest_napi_create_string_utf8(
     // uninitialized memory past an empty buffer.
     let mut out: u32 = 0;
     let s = unsafe {
-        snapi_bridge_create_string_utf8(
+        parked_bridge!(env, snapi_bridge_create_string_utf8(
             snapi_env(&env, e),
             sb.as_ptr() as *const i8,
             sb.len() as u32,
             &mut out,
-        )
+        ))
     };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_create_string_latin1(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -1819,73 +2057,87 @@ fn guest_napi_create_string_latin1(
     // and leave the host reading uninitialized memory (see the utf8 twin above).
     let mut out: u32 = 0;
     let s = unsafe {
-        snapi_bridge_create_string_latin1(
+        parked_bridge!(env, snapi_bridge_create_string_latin1(
             snapi_env(&env, e),
             sb.as_ptr() as *const i8,
             sb.len() as u32,
             &mut out,
-        )
+        ))
     };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_create_int32(mut env: FunctionEnvMut<NapiEnv>, e: i32, value: i32, rp: i32) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_create_int32(snapi_env(&env, e), value, &mut out) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_create_int32(snapi_env(&env, e), value, &mut out)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_create_uint32(mut env: FunctionEnvMut<NapiEnv>, e: i32, value: i32, rp: i32) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_create_uint32(snapi_env(&env, e), value as u32, &mut out) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_create_uint32(snapi_env(&env, e), value as u32, &mut out)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_create_double(mut env: FunctionEnvMut<NapiEnv>, e: i32, value: f64, rp: i32) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_create_double(snapi_env(&env, e), value, &mut out) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_create_double(snapi_env(&env, e), value, &mut out)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_create_int64(mut env: FunctionEnvMut<NapiEnv>, e: i32, value: i64, rp: i32) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_create_int64(snapi_env(&env, e), value, &mut out) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_create_int64(snapi_env(&env, e), value, &mut out)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_create_object(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i32) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_create_object(snapi_env(&env, e), &mut out) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_create_object(snapi_env(&env, e), &mut out)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_create_array(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i32) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_create_array(snapi_env(&env, e), &mut out) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_create_array(snapi_env(&env, e), &mut out)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_create_array_with_length(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -1894,23 +2146,27 @@ fn guest_napi_create_array_with_length(
 ) -> i32 {
     let mut out: u32 = 0;
     let s = unsafe {
-        snapi_bridge_create_array_with_length(snapi_env(&env, e), length as u32, &mut out)
+        parked_bridge!(env, snapi_bridge_create_array_with_length(snapi_env(&env, e), length as u32, &mut out))
     };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_create_symbol(mut env: FunctionEnvMut<NapiEnv>, e: i32, desc: i32, rp: i32) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_create_symbol(snapi_env(&env, e), desc as u32, &mut out) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_create_symbol(snapi_env(&env, e), desc as u32, &mut out)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_create_error(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -1920,13 +2176,15 @@ fn guest_napi_create_error(
 ) -> i32 {
     let mut out: u32 = 0;
     let s =
-        unsafe { snapi_bridge_create_error(snapi_env(&env, e), code as u32, msg as u32, &mut out) };
+        unsafe { parked_bridge!(env, snapi_bridge_create_error(snapi_env(&env, e), code as u32, msg as u32, &mut out)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_create_type_error(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -1936,14 +2194,16 @@ fn guest_napi_create_type_error(
 ) -> i32 {
     let mut out: u32 = 0;
     let s = unsafe {
-        snapi_bridge_create_type_error(snapi_env(&env, e), code as u32, msg as u32, &mut out)
+        parked_bridge!(env, snapi_bridge_create_type_error(snapi_env(&env, e), code as u32, msg as u32, &mut out))
     };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_create_range_error(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -1953,14 +2213,16 @@ fn guest_napi_create_range_error(
 ) -> i32 {
     let mut out: u32 = 0;
     let s = unsafe {
-        snapi_bridge_create_range_error(snapi_env(&env, e), code as u32, msg as u32, &mut out)
+        parked_bridge!(env, snapi_bridge_create_range_error(snapi_env(&env, e), code as u32, msg as u32, &mut out))
     };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_create_bigint_int64(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -1968,13 +2230,15 @@ fn guest_napi_create_bigint_int64(
     rp: i32,
 ) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_create_bigint_int64(snapi_env(&env, e), value, &mut out) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_create_bigint_int64(snapi_env(&env, e), value, &mut out)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_create_bigint_uint64(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -1983,22 +2247,26 @@ fn guest_napi_create_bigint_uint64(
 ) -> i32 {
     let mut out: u32 = 0;
     let s =
-        unsafe { snapi_bridge_create_bigint_uint64(snapi_env(&env, e), value as u64, &mut out) };
+        unsafe { parked_bridge!(env, snapi_bridge_create_bigint_uint64(snapi_env(&env, e), value as u64, &mut out)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_create_date(mut env: FunctionEnvMut<NapiEnv>, e: i32, time: f64, rp: i32) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_create_date(snapi_env(&env, e), time, &mut out) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_create_date(snapi_env(&env, e), time, &mut out)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_create_external(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2008,15 +2276,17 @@ fn guest_napi_create_external(
     rp: i32,
 ) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_create_external(snapi_env(&env, e), data as u64, &mut out) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_create_external(snapi_env(&env, e), data as u64, &mut out)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
 // --- Value reading ---
 
+native_import! {
 fn guest_napi_get_value_string_utf8(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2035,7 +2305,7 @@ fn guest_napi_get_value_string_utf8(
     let mut hb = vec![0i8; hbs];
     let mut rl: usize = 0;
     let s = unsafe {
-        snapi_bridge_get_value_string_utf8(
+        parked_bridge!(env, snapi_bridge_get_value_string_utf8(
             snapi_env(&env, e),
             vh as u32,
             if hbs > 0 {
@@ -2045,7 +2315,7 @@ fn guest_napi_get_value_string_utf8(
             },
             hbs,
             &mut rl,
-        )
+        ))
     };
     if s != 0 {
         return s;
@@ -2060,7 +2330,9 @@ fn guest_napi_get_value_string_utf8(
     }
     0
 }
+}
 
+native_import! {
 fn guest_napi_get_value_string_latin1(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2076,7 +2348,7 @@ fn guest_napi_get_value_string_latin1(
     let mut hb = vec![0i8; hbs];
     let mut rl: usize = 0;
     let s = unsafe {
-        snapi_bridge_get_value_string_latin1(
+        parked_bridge!(env, snapi_bridge_get_value_string_latin1(
             snapi_env(&env, e),
             vh as u32,
             if hbs > 0 {
@@ -2086,7 +2358,7 @@ fn guest_napi_get_value_string_latin1(
             },
             hbs,
             &mut rl,
-        )
+        ))
     };
     if s != 0 {
         return s;
@@ -2101,52 +2373,64 @@ fn guest_napi_get_value_string_latin1(
     }
     0
 }
+}
 
+native_import! {
 fn guest_napi_get_value_int32(mut env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32, rp: i32) -> i32 {
     let mut r: i32 = 0;
-    let s = unsafe { snapi_bridge_get_value_int32(snapi_env(&env, e), vh as u32, &mut r) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_get_value_int32(snapi_env(&env, e), vh as u32, &mut r)) };
     if s == 0 {
         write_guest_i32(&mut env, rp as u32, r);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_get_value_uint32(mut env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32, rp: i32) -> i32 {
     let mut r: u32 = 0;
-    let s = unsafe { snapi_bridge_get_value_uint32(snapi_env(&env, e), vh as u32, &mut r) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_get_value_uint32(snapi_env(&env, e), vh as u32, &mut r)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, r);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_get_value_double(mut env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32, rp: i32) -> i32 {
     let mut r: f64 = 0.0;
-    let s = unsafe { snapi_bridge_get_value_double(snapi_env(&env, e), vh as u32, &mut r) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_get_value_double(snapi_env(&env, e), vh as u32, &mut r)) };
     if s == 0 {
         write_guest_f64(&mut env, rp as u32, r);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_get_value_int64(mut env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32, rp: i32) -> i32 {
     let mut r: i64 = 0;
-    let s = unsafe { snapi_bridge_get_value_int64(snapi_env(&env, e), vh as u32, &mut r) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_get_value_int64(snapi_env(&env, e), vh as u32, &mut r)) };
     if s == 0 {
         write_guest_i64(&mut env, rp as u32, r);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_get_value_bool(mut env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32, rp: i32) -> i32 {
     let mut r: i32 = 0;
-    let s = unsafe { snapi_bridge_get_value_bool(snapi_env(&env, e), vh as u32, &mut r) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_get_value_bool(snapi_env(&env, e), vh as u32, &mut r)) };
     if s == 0 {
         write_guest_u8(&mut env, rp as u32, r as u8);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_get_value_bigint_int64(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2157,7 +2441,7 @@ fn guest_napi_get_value_bigint_int64(
     let mut val: i64 = 0;
     let mut lossless: i32 = 0;
     let s = unsafe {
-        snapi_bridge_get_value_bigint_int64(snapi_env(&env, e), vh as u32, &mut val, &mut lossless)
+        parked_bridge!(env, snapi_bridge_get_value_bigint_int64(snapi_env(&env, e), vh as u32, &mut val, &mut lossless))
     };
     if s == 0 {
         write_guest_i64(&mut env, vp as u32, val);
@@ -2165,7 +2449,9 @@ fn guest_napi_get_value_bigint_int64(
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_get_value_bigint_uint64(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2176,7 +2462,7 @@ fn guest_napi_get_value_bigint_uint64(
     let mut val: u64 = 0;
     let mut lossless: i32 = 0;
     let s = unsafe {
-        snapi_bridge_get_value_bigint_uint64(snapi_env(&env, e), vh as u32, &mut val, &mut lossless)
+        parked_bridge!(env, snapi_bridge_get_value_bigint_uint64(snapi_env(&env, e), vh as u32, &mut val, &mut lossless))
     };
     if s == 0 {
         write_guest_u64(&mut env, vp as u32, val);
@@ -2184,16 +2470,20 @@ fn guest_napi_get_value_bigint_uint64(
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_get_date_value(mut env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32, rp: i32) -> i32 {
     let mut r: f64 = 0.0;
-    let s = unsafe { snapi_bridge_get_date_value(snapi_env(&env, e), vh as u32, &mut r) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_get_date_value(snapi_env(&env, e), vh as u32, &mut r)) };
     if s == 0 {
         write_guest_f64(&mut env, rp as u32, r);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_get_value_external(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2201,33 +2491,38 @@ fn guest_napi_get_value_external(
     rp: i32,
 ) -> i32 {
     let mut data: u64 = 0;
-    let s = unsafe { snapi_bridge_get_value_external(snapi_env(&env, e), vh as u32, &mut data) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_get_value_external(snapi_env(&env, e), vh as u32, &mut data)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, data as u32);
     }
     s
 }
+}
 
 // --- Type checking ---
 
+native_import! {
 fn guest_napi_typeof(mut env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32, rp: i32) -> i32 {
     let mut r: i32 = 0;
-    let s = unsafe { snapi_bridge_typeof(snapi_env(&env, e), vh as u32, &mut r) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_typeof(snapi_env(&env, e), vh as u32, &mut r)) };
     if s == 0 {
         write_guest_i32(&mut env, rp as u32, r);
     }
     s
 }
+}
 
 macro_rules! guest_is_check {
     ($name:ident, $bridge:ident) => {
+        native_import! {
         fn $name(mut env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32, rp: i32) -> i32 {
-            let mut r: i32 = 0;
-            let s = unsafe { $bridge(snapi_env(&env, e), vh as u32, &mut r) };
-            if s == 0 {
-                write_guest_u8(&mut env, rp as u32, r as u8);
-            }
-            s
+                    let mut r: i32 = 0;
+                    let s = unsafe { parked_bridge!(env, $bridge(snapi_env(&env, e), vh as u32, &mut r)) };
+                    if s == 0 {
+                        write_guest_u8(&mut env, rp as u32, r as u8);
+                    }
+                    s
+                }
         }
     };
 }
@@ -2240,6 +2535,7 @@ guest_is_check!(guest_napi_is_dataview, snapi_bridge_is_dataview);
 guest_is_check!(guest_napi_is_date, snapi_bridge_is_date);
 guest_is_check!(guest_napi_is_promise, snapi_bridge_is_promise);
 
+native_import! {
 fn guest_napi_instanceof(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2248,24 +2544,27 @@ fn guest_napi_instanceof(
     rp: i32,
 ) -> i32 {
     let mut r: i32 = 0;
-    let s = unsafe { snapi_bridge_instanceof(snapi_env(&env, e), obj as u32, ctor as u32, &mut r) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_instanceof(snapi_env(&env, e), obj as u32, ctor as u32, &mut r)) };
     if s == 0 {
         write_guest_u8(&mut env, rp as u32, r as u8);
     }
     s
+}
 }
 
 // --- Coercion ---
 
 macro_rules! guest_coerce {
     ($name:ident, $bridge:ident) => {
+        native_import! {
         fn $name(mut env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32, rp: i32) -> i32 {
-            let mut out: u32 = 0;
-            let s = unsafe { $bridge(snapi_env(&env, e), vh as u32, &mut out) };
-            if s == 0 {
-                write_guest_u32(&mut env, rp as u32, out);
-            }
-            s
+                    let mut out: u32 = 0;
+                    let s = unsafe { parked_bridge!(env, $bridge(snapi_env(&env, e), vh as u32, &mut out)) };
+                    if s == 0 {
+                        write_guest_u32(&mut env, rp as u32, out);
+                    }
+                    s
+                }
         }
     };
 }
@@ -2277,26 +2576,29 @@ guest_coerce!(guest_napi_coerce_to_object, snapi_bridge_coerce_to_object);
 
 // --- Object operations ---
 
+native_import! {
 fn guest_napi_set_property(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
     o: i32,
     k: i32,
     v: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let snapi = snapi_env(&env, e);
     with_cb_context(&mut env, e, || unsafe {
         snapi_bridge_set_property(snapi, o as u32, k as u32, v as u32)
     })
 }
+}
 
+native_import! {
 fn guest_napi_get_property(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
     o: i32,
     k: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -2307,14 +2609,16 @@ fn guest_napi_get_property(
     }
     Ok(s)
 }
+}
 
+native_import! {
 fn guest_napi_has_property(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
     o: i32,
     k: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -2325,14 +2629,16 @@ fn guest_napi_has_property(
     }
     Ok(s)
 }
+}
 
+native_import! {
 fn guest_napi_has_own_property(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
     o: i32,
     k: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -2343,14 +2649,16 @@ fn guest_napi_has_own_property(
     }
     Ok(s)
 }
+}
 
+native_import! {
 fn guest_napi_delete_property(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
     o: i32,
     k: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -2361,14 +2669,16 @@ fn guest_napi_delete_property(
     }
     Ok(s)
 }
+}
 
+native_import! {
 fn guest_napi_set_named_property(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
     o: i32,
     np: i32,
     v: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let Some(nb) = read_guest_c_string(&mut env, np) else {
         return Ok(1);
     };
@@ -2378,14 +2688,16 @@ fn guest_napi_set_named_property(
         snapi_bridge_set_named_property(snapi, o as u32, cn.as_ptr(), v as u32)
     })
 }
+}
 
+native_import! {
 fn guest_napi_get_named_property(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
     o: i32,
     np: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let Some(nb) = read_guest_c_string(&mut env, np) else {
         return Ok(1);
     };
@@ -2400,14 +2712,16 @@ fn guest_napi_get_named_property(
     }
     Ok(s)
 }
+}
 
+native_import! {
 fn guest_napi_has_named_property(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
     o: i32,
     np: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let Some(nb) = read_guest_c_string(&mut env, np) else {
         return Ok(1);
     };
@@ -2422,27 +2736,31 @@ fn guest_napi_has_named_property(
     }
     Ok(s)
 }
+}
 
+native_import! {
 fn guest_napi_set_element(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
     o: i32,
     idx: i32,
     v: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let snapi = snapi_env(&env, e);
     with_cb_context(&mut env, e, || unsafe {
         snapi_bridge_set_element(snapi, o as u32, idx as u32, v as u32)
     })
 }
+}
 
+native_import! {
 fn guest_napi_get_element(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
     o: i32,
     idx: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -2453,14 +2771,16 @@ fn guest_napi_get_element(
     }
     Ok(s)
 }
+}
 
+native_import! {
 fn guest_napi_has_element(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
     o: i32,
     idx: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -2471,14 +2791,16 @@ fn guest_napi_has_element(
     }
     Ok(s)
 }
+}
 
+native_import! {
 fn guest_napi_delete_element(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
     o: i32,
     idx: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
     let snapi = snapi_env(&env, e);
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -2489,22 +2811,26 @@ fn guest_napi_delete_element(
     }
     Ok(s)
 }
+}
 
+native_import! {
 fn guest_napi_get_array_length(mut env: FunctionEnvMut<NapiEnv>, e: i32, ah: i32, rp: i32) -> i32 {
     let mut r: u32 = 0;
-    let s = unsafe { snapi_bridge_get_array_length(snapi_env(&env, e), ah as u32, &mut r) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_get_array_length(snapi_env(&env, e), ah as u32, &mut r)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, r);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_get_property_names(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
     o: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
     let snapi = snapi_env(&env, e);
     // Property enumeration can synchronously invoke a Proxy's ownKeys trap.
@@ -2516,7 +2842,9 @@ fn guest_napi_get_property_names(
     }
     Ok(s)
 }
+}
 
+native_import! {
 fn guest_napi_get_all_property_names(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2525,7 +2853,7 @@ fn guest_napi_get_all_property_names(
     filter: i32,
     conversion: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
     let snapi = snapi_env(&env, e);
     // Property enumeration can synchronously invoke a Proxy's ownKeys trap.
@@ -2537,26 +2865,34 @@ fn guest_napi_get_all_property_names(
     }
     Ok(s)
 }
+}
 
+native_import! {
 fn guest_napi_get_prototype(mut env: FunctionEnvMut<NapiEnv>, e: i32, o: i32, rp: i32) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_get_prototype(snapi_env(&env, e), o as u32, &mut out) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_get_prototype(snapi_env(&env, e), o as u32, &mut out)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
-
-fn guest_napi_object_freeze(env: FunctionEnvMut<NapiEnv>, e: i32, o: i32) -> i32 {
-    unsafe { snapi_bridge_object_freeze(snapi_env(&env, e), o as u32) }
 }
 
-fn guest_napi_object_seal(env: FunctionEnvMut<NapiEnv>, e: i32, o: i32) -> i32 {
-    unsafe { snapi_bridge_object_seal(snapi_env(&env, e), o as u32) }
+native_import! {
+fn guest_napi_object_freeze(mut env: FunctionEnvMut<NapiEnv>, e: i32, o: i32) -> i32 {
+    unsafe { parked_bridge!(env, snapi_bridge_object_freeze(snapi_env(&env, e), o as u32)) }
+}
+}
+
+native_import! {
+fn guest_napi_object_seal(mut env: FunctionEnvMut<NapiEnv>, e: i32, o: i32) -> i32 {
+    unsafe { parked_bridge!(env, snapi_bridge_object_seal(snapi_env(&env, e), o as u32)) }
+}
 }
 
 // --- Comparison ---
 
+native_import! {
 fn guest_napi_strict_equals(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2566,19 +2902,23 @@ fn guest_napi_strict_equals(
 ) -> i32 {
     let mut r: i32 = 0;
     let s =
-        unsafe { snapi_bridge_strict_equals(snapi_env(&env, e), lhs as u32, rhs as u32, &mut r) };
+        unsafe { parked_bridge!(env, snapi_bridge_strict_equals(snapi_env(&env, e), lhs as u32, rhs as u32, &mut r)) };
     if s == 0 {
         write_guest_u8(&mut env, rp as u32, r as u8);
     }
     s
 }
+}
 
 // --- Error handling ---
 
-fn guest_napi_throw(env: FunctionEnvMut<NapiEnv>, e: i32, err: i32) -> i32 {
-    unsafe { snapi_bridge_throw(snapi_env(&env, e), err as u32) }
+native_import! {
+fn guest_napi_throw(mut env: FunctionEnvMut<NapiEnv>, e: i32, err: i32) -> i32 {
+    unsafe { parked_bridge!(env, snapi_bridge_throw(snapi_env(&env, e), err as u32)) }
+}
 }
 
+native_import! {
 fn guest_napi_throw_error(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2596,14 +2936,16 @@ fn guest_napi_throw_error(
     let c_code = code_bytes.map(|b| CString::new(b).unwrap_or_default());
     let c_msg = CString::new(msg_bytes).unwrap_or_default();
     unsafe {
-        snapi_bridge_throw_error(
+        parked_bridge!(env, snapi_bridge_throw_error(
             snapi_env(&env, e),
             c_code.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             c_msg.as_ptr(),
-        )
+        ))
     }
 }
+}
 
+native_import! {
 fn guest_napi_throw_type_error(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2621,14 +2963,16 @@ fn guest_napi_throw_type_error(
     let c_code = code_bytes.map(|b| CString::new(b).unwrap_or_default());
     let c_msg = CString::new(msg_bytes).unwrap_or_default();
     unsafe {
-        snapi_bridge_throw_type_error(
+        parked_bridge!(env, snapi_bridge_throw_type_error(
             snapi_env(&env, e),
             c_code.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             c_msg.as_ptr(),
-        )
+        ))
     }
 }
+}
 
+native_import! {
 fn guest_napi_throw_range_error(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2646,43 +2990,49 @@ fn guest_napi_throw_range_error(
     let c_code = code_bytes.map(|b| CString::new(b).unwrap_or_default());
     let c_msg = CString::new(msg_bytes).unwrap_or_default();
     unsafe {
-        snapi_bridge_throw_range_error(
+        parked_bridge!(env, snapi_bridge_throw_range_error(
             snapi_env(&env, e),
             c_code.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             c_msg.as_ptr(),
-        )
+        ))
     }
 }
+}
 
+native_import! {
 fn guest_napi_is_exception_pending(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i32) -> i32 {
     let mut r: i32 = 0;
-    let s = unsafe { snapi_bridge_is_exception_pending(snapi_env(&env, e), &mut r) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_is_exception_pending(snapi_env(&env, e), &mut r)) };
     if s == 0 {
         write_guest_u8(&mut env, rp as u32, r as u8);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_get_and_clear_last_exception(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
     rp: i32,
 ) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_get_and_clear_last_exception(snapi_env(&env, e), &mut out) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_get_and_clear_last_exception(snapi_env(&env, e), &mut out)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
 // --- Promise ---
 
+native_import! {
 fn guest_napi_create_promise(mut env: FunctionEnvMut<NapiEnv>, e: i32, dp: i32, rp: i32) -> i32 {
     let mut deferred_id: u32 = 0;
     let mut promise_id: u32 = 0;
     let s = unsafe {
-        snapi_bridge_create_promise(snapi_env(&env, e), &mut deferred_id, &mut promise_id)
+        parked_bridge!(env, snapi_bridge_create_promise(snapi_env(&env, e), &mut deferred_id, &mut promise_id))
     };
     if s == 0 {
         write_guest_u32(&mut env, dp as u32, deferred_id);
@@ -2690,17 +3040,23 @@ fn guest_napi_create_promise(mut env: FunctionEnvMut<NapiEnv>, e: i32, dp: i32, 
     }
     s
 }
-
-fn guest_napi_resolve_deferred(env: FunctionEnvMut<NapiEnv>, e: i32, d: i32, v: i32) -> i32 {
-    unsafe { snapi_bridge_resolve_deferred(snapi_env(&env, e), d as u32, v as u32) }
 }
 
-fn guest_napi_reject_deferred(env: FunctionEnvMut<NapiEnv>, e: i32, d: i32, v: i32) -> i32 {
-    unsafe { snapi_bridge_reject_deferred(snapi_env(&env, e), d as u32, v as u32) }
+native_import! {
+fn guest_napi_resolve_deferred(mut env: FunctionEnvMut<NapiEnv>, e: i32, d: i32, v: i32) -> i32 {
+    unsafe { parked_bridge!(env, snapi_bridge_resolve_deferred(snapi_env(&env, e), d as u32, v as u32)) }
+}
+}
+
+native_import! {
+fn guest_napi_reject_deferred(mut env: FunctionEnvMut<NapiEnv>, e: i32, d: i32, v: i32) -> i32 {
+    unsafe { parked_bridge!(env, snapi_bridge_reject_deferred(snapi_env(&env, e), d as u32, v as u32)) }
+}
 }
 
 // --- ArrayBuffer ---
 
+native_import! {
 fn guest_napi_create_arraybuffer(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2722,14 +3078,14 @@ fn guest_napi_create_arraybuffer(
         let mut out: u32 = 0;
         let mut backing_store_token: u64 = 0;
         let s = unsafe {
-            snapi_bridge_create_external_arraybuffer_finalized(
+            parked_bridge!(env, snapi_bridge_create_external_arraybuffer_finalized(
                 snapi_env(&env, e),
                 host_addr,
                 byte_length as u32,
                 hint,
                 &mut backing_store_token,
                 &mut out,
-            )
+            ))
         };
         if s == 0 {
             write_guest_u32(&mut env, rp as u32, out);
@@ -2745,7 +3101,7 @@ fn guest_napi_create_arraybuffer(
         // Fallback: host-memory-backed arraybuffer (non-WASIX path)
         let mut out: u32 = 0;
         let s = unsafe {
-            snapi_bridge_create_arraybuffer(snapi_env(&env, e), byte_length as u32, &mut out)
+            parked_bridge!(env, snapi_bridge_create_arraybuffer(snapi_env(&env, e), byte_length as u32, &mut out))
         };
         if s == 0 {
             write_guest_u32(&mut env, rp as u32, out);
@@ -2753,7 +3109,21 @@ fn guest_napi_create_arraybuffer(
         s
     }
 }
+}
 
+// Snapshot resident bounds and address while the original Store is borrowed.
+// No view or NapiEnv reference survives the parked engine call.
+fn snapshot_host_span(env: &FunctionEnvMut<NapiEnv>, offset: u32, length: u32) -> Option<u64> {
+    let memory = env.data().memory.clone()?;
+    let view = memory.view(env);
+    let end = u64::from(offset).checked_add(u64::from(length))?;
+    if end > view.data_size() {
+        return None;
+    }
+    (view.data_ptr() as u64).checked_add(u64::from(offset))
+}
+
+native_import! {
 fn guest_napi_create_external_arraybuffer(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2763,16 +3133,8 @@ fn guest_napi_create_external_arraybuffer(
     finalize_hint: i32,
     rp: i32,
 ) -> i32 {
-    let memory = env.data().memory.clone();
-    let Some(memory) = memory else {
+    let Some(host_addr) = snapshot_host_span(&env, external_data as u32, byte_length as u32) else {
         return 1;
-    };
-
-    let host_addr: u64 = {
-        let (_, store_ref) = env.data_and_store_mut();
-        let view = memory.view(&store_ref);
-        let host_base = view.data_ptr() as u64;
-        host_base + external_data as u32 as u64
     };
 
     let mut out: u32 = 0;
@@ -2782,7 +3144,7 @@ fn guest_napi_create_external_arraybuffer(
     // the deferred drain. Otherwise the plain path (no finalizer).
     let s = if finalize_cb != 0 {
         unsafe {
-            snapi_bridge_create_external_arraybuffer_guest_finalized(
+            parked_bridge!(env, snapi_bridge_create_external_arraybuffer_guest_finalized(
                 snapi_env(&env, e),
                 host_addr,
                 byte_length as u32,
@@ -2792,17 +3154,17 @@ fn guest_napi_create_external_arraybuffer(
                 finalize_hint as u32,
                 &mut backing_store_token,
                 &mut out,
-            )
+            ))
         }
     } else {
         unsafe {
-            snapi_bridge_create_external_arraybuffer(
+            parked_bridge!(env, snapi_bridge_create_external_arraybuffer(
                 snapi_env(&env, e),
                 host_addr,
                 byte_length as u32,
                 &mut backing_store_token,
                 &mut out,
-            )
+            ))
         }
     };
     if s == 0 {
@@ -2810,9 +3172,11 @@ fn guest_napi_create_external_arraybuffer(
     }
     s
 }
+}
 
 // NOTE: napi_create_external_buffer takes (env, length, data, ...) — unlike
 // napi_create_external_arraybuffer, which takes (env, data, length, ...).
+native_import! {
 fn guest_napi_create_external_buffer(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2822,23 +3186,15 @@ fn guest_napi_create_external_buffer(
     finalize_hint: i32,
     rp: i32,
 ) -> i32 {
-    let memory = env.data().memory.clone();
-    let Some(memory) = memory else {
+    let Some(host_addr) = snapshot_host_span(&env, external_data as u32, byte_length as u32) else {
         return 1;
-    };
-
-    let host_addr: u64 = {
-        let (_, store_ref) = env.data_and_store_mut();
-        let view = memory.view(&store_ref);
-        let host_base = view.data_ptr() as u64;
-        host_base + external_data as u32 as u64
     };
 
     let mut out: u32 = 0;
     let mut backing_store_token: u64 = 0;
     let s = if finalize_cb != 0 {
         unsafe {
-            snapi_bridge_create_external_buffer_guest_finalized(
+            parked_bridge!(env, snapi_bridge_create_external_buffer_guest_finalized(
                 snapi_env(&env, e),
                 host_addr,
                 byte_length as u32,
@@ -2848,17 +3204,17 @@ fn guest_napi_create_external_buffer(
                 finalize_hint as u32,
                 &mut backing_store_token,
                 &mut out,
-            )
+            ))
         }
     } else {
         unsafe {
-            snapi_bridge_create_external_buffer(
+            parked_bridge!(env, snapi_bridge_create_external_buffer(
                 snapi_env(&env, e),
                 host_addr,
                 byte_length as u32,
                 &mut backing_store_token,
                 &mut out,
-            )
+            ))
         }
     };
     if s == 0 {
@@ -2866,7 +3222,9 @@ fn guest_napi_create_external_buffer(
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_get_arraybuffer_info(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2878,13 +3236,13 @@ fn guest_napi_get_arraybuffer_info(
     let mut bl: u32 = 0;
     let mut backing_store_token: u64 = 0;
     let s = unsafe {
-        snapi_bridge_get_arraybuffer_info(
+        parked_bridge!(env, snapi_bridge_get_arraybuffer_info(
             snapi_env(&env, e),
             vh as u32,
             &mut host_data_addr,
             &mut bl,
             &mut backing_store_token,
-        )
+        ))
     };
     if s != 0 {
         return s;
@@ -2902,11 +3260,15 @@ fn guest_napi_get_arraybuffer_info(
     }
     0
 }
-
-fn guest_napi_detach_arraybuffer(env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32) -> i32 {
-    unsafe { snapi_bridge_detach_arraybuffer(snapi_env(&env, e), vh as u32) }
 }
 
+native_import! {
+fn guest_napi_detach_arraybuffer(mut env: FunctionEnvMut<NapiEnv>, e: i32, vh: i32) -> i32 {
+    unsafe { parked_bridge!(env, snapi_bridge_detach_arraybuffer(snapi_env(&env, e), vh as u32)) }
+}
+}
+
+native_import! {
 fn guest_napi_is_detached_arraybuffer(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2914,13 +3276,15 @@ fn guest_napi_is_detached_arraybuffer(
     rp: i32,
 ) -> i32 {
     let mut r: i32 = 0;
-    let s = unsafe { snapi_bridge_is_detached_arraybuffer(snapi_env(&env, e), vh as u32, &mut r) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_is_detached_arraybuffer(snapi_env(&env, e), vh as u32, &mut r)) };
     if s == 0 {
         write_guest_u8(&mut env, rp as u32, r as u8);
     }
     s
 }
+}
 
+native_import! {
 fn guest_node_api_is_sharedarraybuffer(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2928,13 +3292,15 @@ fn guest_node_api_is_sharedarraybuffer(
     rp: i32,
 ) -> i32 {
     let mut r = 0i32;
-    let s = unsafe { snapi_bridge_is_sharedarraybuffer(snapi_env(&env, e), value as u32, &mut r) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_is_sharedarraybuffer(snapi_env(&env, e), value as u32, &mut r)) };
     if s == 0 {
         write_guest_u8(&mut env, rp as u32, r as u8);
     }
     s
 }
+}
 
+native_import! {
 fn guest_node_api_create_sharedarraybuffer(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2945,12 +3311,12 @@ fn guest_node_api_create_sharedarraybuffer(
     let mut host_data_addr = 0u64;
     let mut out = 0u32;
     let s = unsafe {
-        snapi_bridge_create_sharedarraybuffer(
+        parked_bridge!(env, snapi_bridge_create_sharedarraybuffer(
             snapi_env(&env, e),
             byte_length as u32,
             &mut host_data_addr,
             &mut out,
-        )
+        ))
     };
     if s != 0 {
         return s;
@@ -2962,9 +3328,11 @@ fn guest_node_api_create_sharedarraybuffer(
     write_guest_u32(&mut env, rp as u32, out);
     s
 }
+}
 
+native_import! {
 fn guest_node_api_set_prototype(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: i32,
     object: i32,
     prototype: i32,
@@ -2972,12 +3340,14 @@ fn guest_node_api_set_prototype(
     let object_id = if object > 0 { object as u32 } else { 0 };
     let prototype_id = if prototype > 0 { prototype as u32 } else { 0 };
     unsafe {
-        snapi_bridge_node_api_set_prototype(snapi_env(&env, napi_env), object_id, prototype_id)
+        parked_bridge!(env, snapi_bridge_node_api_set_prototype(snapi_env(&env, napi_env), object_id, prototype_id))
     }
+}
 }
 
 // --- TypedArray ---
 
+native_import! {
 fn guest_napi_create_typedarray(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -2989,21 +3359,23 @@ fn guest_napi_create_typedarray(
 ) -> i32 {
     let mut out: u32 = 0;
     let s = unsafe {
-        snapi_bridge_create_typedarray(
+        parked_bridge!(env, snapi_bridge_create_typedarray(
             snapi_env(&env, e),
             typ,
             length as u32,
             ab as u32,
             offset as u32,
             &mut out,
-        )
+        ))
     };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 #[allow(clippy::too_many_arguments)]
 fn guest_napi_get_typedarray_info(
     mut env: FunctionEnvMut<NapiEnv>,
@@ -3022,7 +3394,7 @@ fn guest_napi_get_typedarray_info(
     let mut bo: u32 = 0;
     let mut backing_store_token: u64 = 0;
     let s = unsafe {
-        snapi_bridge_get_typedarray_info(
+        parked_bridge!(env, snapi_bridge_get_typedarray_info(
             snapi_env(&env, e),
             vh as u32,
             &mut typ,
@@ -3031,7 +3403,7 @@ fn guest_napi_get_typedarray_info(
             &mut ab,
             &mut bo,
             &mut backing_store_token,
-        )
+        ))
     };
     if s == 0 {
         if tp > 0 {
@@ -3060,9 +3432,11 @@ fn guest_napi_get_typedarray_info(
     }
     s
 }
+}
 
 // --- DataView ---
 
+native_import! {
 fn guest_napi_create_dataview(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -3073,20 +3447,22 @@ fn guest_napi_create_dataview(
 ) -> i32 {
     let mut out: u32 = 0;
     let s = unsafe {
-        snapi_bridge_create_dataview(
+        parked_bridge!(env, snapi_bridge_create_dataview(
             snapi_env(&env, e),
             bl as u32,
             ab as u32,
             bo as u32,
             &mut out,
-        )
+        ))
     };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_get_dataview_info(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -3102,7 +3478,7 @@ fn guest_napi_get_dataview_info(
     let mut bo: u32 = 0;
     let mut backing_store_token: u64 = 0;
     let s = unsafe {
-        snapi_bridge_get_dataview_info(
+        parked_bridge!(env, snapi_bridge_get_dataview_info(
             snapi_env(&env, e),
             vh as u32,
             &mut bl,
@@ -3110,7 +3486,7 @@ fn guest_napi_get_dataview_info(
             &mut ab,
             &mut bo,
             &mut backing_store_token,
-        )
+        ))
     };
     if s == 0 {
         if blp > 0 {
@@ -3131,9 +3507,11 @@ fn guest_napi_get_dataview_info(
     }
     s
 }
+}
 
 // --- References ---
 
+native_import! {
 fn guest_napi_create_reference(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -3143,36 +3521,44 @@ fn guest_napi_create_reference(
 ) -> i32 {
     let mut ref_id: u32 = 0;
     let s = unsafe {
-        snapi_bridge_create_reference(snapi_env(&env, e), vh as u32, irc as u32, &mut ref_id)
+        parked_bridge!(env, snapi_bridge_create_reference(snapi_env(&env, e), vh as u32, irc as u32, &mut ref_id))
     };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, ref_id);
     }
     s
 }
-
-fn guest_napi_delete_reference(env: FunctionEnvMut<NapiEnv>, e: i32, r: i32) -> i32 {
-    unsafe { snapi_bridge_delete_reference(snapi_env(&env, e), r as u32) }
 }
 
+native_import! {
+fn guest_napi_delete_reference(mut env: FunctionEnvMut<NapiEnv>, e: i32, r: i32) -> i32 {
+    unsafe { parked_bridge!(env, snapi_bridge_delete_reference(snapi_env(&env, e), r as u32)) }
+}
+}
+
+native_import! {
 fn guest_napi_reference_ref(mut env: FunctionEnvMut<NapiEnv>, e: i32, r: i32, rp: i32) -> i32 {
     let mut count: u32 = 0;
-    let s = unsafe { snapi_bridge_reference_ref(snapi_env(&env, e), r as u32, &mut count) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_reference_ref(snapi_env(&env, e), r as u32, &mut count)) };
     if s == 0 && rp > 0 {
         write_guest_u32(&mut env, rp as u32, count);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_reference_unref(mut env: FunctionEnvMut<NapiEnv>, e: i32, r: i32, rp: i32) -> i32 {
     let mut count: u32 = 0;
-    let s = unsafe { snapi_bridge_reference_unref(snapi_env(&env, e), r as u32, &mut count) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_reference_unref(snapi_env(&env, e), r as u32, &mut count)) };
     if s == 0 && rp > 0 {
         write_guest_u32(&mut env, rp as u32, count);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_get_reference_value(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -3180,50 +3566,58 @@ fn guest_napi_get_reference_value(
     rp: i32,
 ) -> i32 {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_get_reference_value(snapi_env(&env, e), r as u32, &mut out) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_get_reference_value(snapi_env(&env, e), r as u32, &mut out)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
 // --- Handle scopes ---
 
+native_import! {
 fn guest_napi_open_handle_scope(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i32) -> i32 {
     let mut scope_id: u32 = 0;
-    let s = unsafe { snapi_bridge_open_handle_scope(snapi_env(&env, e), &mut scope_id) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_open_handle_scope(snapi_env(&env, e), &mut scope_id)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, scope_id);
     }
     s
 }
-fn guest_napi_close_handle_scope(env: FunctionEnvMut<NapiEnv>, e: i32, scope: i32) -> i32 {
-    let s = unsafe { snapi_bridge_close_handle_scope(snapi_env(&env, e), scope as u32) };
-    if s == 0 {}
-    s
+}
+native_import! {
+fn guest_napi_close_handle_scope(mut env: FunctionEnvMut<NapiEnv>, e: i32, scope: i32) -> i32 {
+    unsafe { parked_bridge!(env, snapi_bridge_close_handle_scope(snapi_env(&env, e), scope as u32)) }
+}
 }
 
+native_import! {
 fn guest_napi_open_escapable_handle_scope(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
     rp: i32,
 ) -> i32 {
     let mut scope_id: u32 = 0;
-    let s = unsafe { snapi_bridge_open_escapable_handle_scope(snapi_env(&env, e), &mut scope_id) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_open_escapable_handle_scope(snapi_env(&env, e), &mut scope_id)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, scope_id);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_close_escapable_handle_scope(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
     scope: i32,
 ) -> i32 {
-    unsafe { snapi_bridge_close_escapable_handle_scope(snapi_env(&env, e), scope as u32) }
+    unsafe { parked_bridge!(env, snapi_bridge_close_escapable_handle_scope(snapi_env(&env, e), scope as u32)) }
+}
 }
 
+native_import! {
 fn guest_napi_escape_handle(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -3233,16 +3627,18 @@ fn guest_napi_escape_handle(
 ) -> i32 {
     let mut out: u32 = 0;
     let s = unsafe {
-        snapi_bridge_escape_handle(snapi_env(&env, e), scope as u32, escapee as u32, &mut out)
+        parked_bridge!(env, snapi_bridge_escape_handle(snapi_env(&env, e), scope as u32, escapee as u32, &mut out))
     };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
 // --- Type tagging ---
 
+native_import! {
 fn guest_napi_type_tag_object(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -3255,9 +3651,11 @@ fn guest_napi_type_tag_object(
     };
     let lower = u64::from_le_bytes(tag_bytes[0..8].try_into().unwrap());
     let upper = u64::from_le_bytes(tag_bytes[8..16].try_into().unwrap());
-    unsafe { snapi_bridge_type_tag_object(snapi_env(&env, e), obj as u32, lower, upper) }
+    unsafe { parked_bridge!(env, snapi_bridge_type_tag_object(snapi_env(&env, e), obj as u32, lower, upper)) }
+}
 }
 
+native_import! {
 fn guest_napi_check_object_type_tag(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -3272,16 +3670,18 @@ fn guest_napi_check_object_type_tag(
     let upper = u64::from_le_bytes(tag_bytes[8..16].try_into().unwrap());
     let mut r: i32 = 0;
     let s = unsafe {
-        snapi_bridge_check_object_type_tag(snapi_env(&env, e), obj as u32, lower, upper, &mut r)
+        parked_bridge!(env, snapi_bridge_check_object_type_tag(snapi_env(&env, e), obj as u32, lower, upper, &mut r))
     };
     if s == 0 {
         write_guest_u8(&mut env, rp as u32, r as u8);
     }
     s
 }
+}
 
 // --- Function calling ---
 
+native_import! {
 fn guest_napi_call_function(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -3290,7 +3690,7 @@ fn guest_napi_call_function(
     argc: i32,
     argv_ptr: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let argc_u = argc as u32;
     let argv_ids = if argc_u > 0 {
         let Some(ids) = read_guest_u32_array(&mut env, argv_ptr, argc_u as usize) else {
@@ -3319,9 +3719,11 @@ fn guest_napi_call_function(
     }
     Ok(s)
 }
+}
 
 // --- napi_create_function ---
 
+native_import! {
 fn guest_napi_create_function(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -3347,17 +3749,17 @@ fn guest_napi_create_function(
 
     // Allocate a registration ID in the C++ callback registry
     let snapi = snapi_env(&env, e);
-    let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
+    let reg_id = unsafe { parked_bridge!(env, snapi_bridge_alloc_cb_reg_id(snapi)) };
 
     // Register the WASM callback and data pointer in the C++ registry
-    unsafe { snapi_bridge_register_callback(snapi, reg_id, e as u32, cb as u32, data as u64) };
+    unsafe { parked_bridge!(env, snapi_bridge_register_callback(snapi, reg_id, e as u32, cb as u32, data as u64)) };
 
     // Create a JS function in V8 with generic_wasm_callback as its native callback.
     // The reg_id is stored as the function's data pointer so generic_wasm_callback
     // can look up which WASM function to invoke.
     let c_name = CString::new(name_bytes).unwrap_or_default();
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_create_function(snapi, c_name.as_ptr(), wl, reg_id, &mut out) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_create_function(snapi, c_name.as_ptr(), wl, reg_id, &mut out)) };
     if s != 0 {
         return s;
     }
@@ -3365,9 +3767,11 @@ fn guest_napi_create_function(
     write_guest_u32(&mut env, rp as u32, out);
     0
 }
+}
 
 // --- napi_get_cb_info ---
 
+native_import! {
 fn guest_napi_get_cb_info(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -3381,8 +3785,12 @@ fn guest_napi_get_cb_info(
     // guest heap from this hot per-callback import so store-free allocations
     // (V8 backing stores) rarely find it empty. No-op for shared memories.
     if let Some(heap) = env.data().guest_heap.clone() {
-        let (_, mut store_ref) = env.data_and_store_mut();
-        heap.maybe_refill(&mut store_ref);
+        let refill = env.data().native_guest_refill.clone();
+        if let Some(refill) = refill {
+            let _ = heap.refill_leased(&mut env.as_store_mut(), &*refill, 0, true);
+        } else {
+            heap.maybe_refill(&mut env.as_store_mut());
+        }
     }
     // Read the caller's requested argc (size of their argv array)
     let wanted: u32 = if argc_ptr > 0 {
@@ -3406,7 +3814,7 @@ fn guest_napi_get_cb_info(
     let mut data_val: u64 = 0;
 
     let s = unsafe {
-        snapi_bridge_get_cb_info(
+        parked_bridge!(env, snapi_bridge_get_cb_info(
             snapi_env(&env, e),
             if _cbinfo > 0 { _cbinfo as u32 } else { 0 },
             &mut actual_argc,
@@ -3418,7 +3826,7 @@ fn guest_napi_get_cb_info(
             wanted,
             &mut this_id,
             &mut data_val,
-        )
+        ))
     };
     if s != 0 {
         return s;
@@ -3449,9 +3857,11 @@ fn guest_napi_get_cb_info(
 
     0
 }
+}
 
 // --- napi_get_new_target ---
 
+native_import! {
 fn guest_napi_get_new_target(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -3460,16 +3870,17 @@ fn guest_napi_get_new_target(
 ) -> i32 {
     let mut out: u32 = 0;
     let s = unsafe {
-        snapi_bridge_get_new_target(
+        parked_bridge!(env, snapi_bridge_get_new_target(
             snapi_env(&env, e),
             if _cbinfo > 0 { _cbinfo as u32 } else { 0 },
             &mut out,
-        )
+        ))
     };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
+}
 }
 
 // --- napi_define_class ---
@@ -3484,6 +3895,7 @@ fn guest_napi_get_new_target(
 //   offset 28: void* data               (4 bytes, guest pointer)
 const PROP_DESC_SIZE: usize = 32;
 
+native_import! {
 #[allow(clippy::too_many_arguments)]
 fn guest_napi_define_class(
     mut env: FunctionEnvMut<NapiEnv>,
@@ -3511,15 +3923,15 @@ fn guest_napi_define_class(
 
     // Register the constructor callback
     let snapi = snapi_env(&env, e);
-    let ctor_reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
+    let ctor_reg_id = unsafe { parked_bridge!(env, snapi_bridge_alloc_cb_reg_id(snapi)) };
     unsafe {
-        snapi_bridge_register_callback(
+        parked_bridge!(env, snapi_bridge_register_callback(
             snapi,
             ctor_reg_id,
             e as u32,
             constructor as u32,
             ctor_data as u64,
-        )
+        ))
     };
 
     let pc = prop_count as u32;
@@ -3529,7 +3941,7 @@ fn guest_napi_define_class(
         // No properties — simple case
         let mut out: u32 = 0;
         let s = unsafe {
-            snapi_bridge_define_class(
+            parked_bridge!(env, snapi_bridge_define_class(
                 snapi_env(&env, e),
                 c_name.as_ptr(),
                 wl,
@@ -3544,7 +3956,7 @@ fn guest_napi_define_class(
                 std::ptr::null(),
                 std::ptr::null(),
                 &mut out,
-            )
+            ))
         };
         if s != 0 {
             return s;
@@ -3620,9 +4032,9 @@ fn guest_napi_define_class(
         // Determine property type and register callbacks as needed
         if method_ptr != 0 {
             // Method property
-            let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
+            let reg_id = unsafe { parked_bridge!(env, snapi_bridge_alloc_cb_reg_id(snapi)) };
             unsafe {
-                snapi_bridge_register_callback(snapi, reg_id, e as u32, method_ptr, data_ptr as u64)
+                parked_bridge!(env, snapi_bridge_register_callback(snapi, reg_id, e as u32, method_ptr, data_ptr as u64))
             };
             prop_types.push(1);
             prop_value_ids.push(0);
@@ -3631,16 +4043,16 @@ fn guest_napi_define_class(
             prop_setter_reg_ids.push(0);
         } else if getter_ptr != 0 && setter_ptr != 0 {
             // Getter + Setter
-            let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
+            let reg_id = unsafe { parked_bridge!(env, snapi_bridge_alloc_cb_reg_id(snapi)) };
             unsafe {
-                snapi_bridge_register_callback_pair(
+                parked_bridge!(env, snapi_bridge_register_callback_pair(
                     snapi,
                     reg_id,
                     e as u32,
                     getter_ptr,
                     setter_ptr,
                     data_ptr as u64,
-                )
+                ))
             };
             prop_types.push(4);
             prop_value_ids.push(0);
@@ -3649,9 +4061,9 @@ fn guest_napi_define_class(
             prop_setter_reg_ids.push(0);
         } else if getter_ptr != 0 {
             // Getter only
-            let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
+            let reg_id = unsafe { parked_bridge!(env, snapi_bridge_alloc_cb_reg_id(snapi)) };
             unsafe {
-                snapi_bridge_register_callback(snapi, reg_id, e as u32, getter_ptr, data_ptr as u64)
+                parked_bridge!(env, snapi_bridge_register_callback(snapi, reg_id, e as u32, getter_ptr, data_ptr as u64))
             };
             prop_types.push(2);
             prop_value_ids.push(0);
@@ -3660,9 +4072,9 @@ fn guest_napi_define_class(
             prop_setter_reg_ids.push(0);
         } else if setter_ptr != 0 {
             // Setter only
-            let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
+            let reg_id = unsafe { parked_bridge!(env, snapi_bridge_alloc_cb_reg_id(snapi)) };
             unsafe {
-                snapi_bridge_register_callback(snapi, reg_id, e as u32, setter_ptr, data_ptr as u64)
+                parked_bridge!(env, snapi_bridge_register_callback(snapi, reg_id, e as u32, setter_ptr, data_ptr as u64))
             };
             prop_types.push(3);
             prop_value_ids.push(0);
@@ -3689,7 +4101,7 @@ fn guest_napi_define_class(
 
     let mut out: u32 = 0;
     let s = unsafe {
-        snapi_bridge_define_class(
+        parked_bridge!(env, snapi_bridge_define_class(
             snapi_env(&env, e),
             c_name.as_ptr(),
             wl,
@@ -3704,7 +4116,7 @@ fn guest_napi_define_class(
             prop_setter_reg_ids.as_ptr(),
             prop_attributes.as_ptr(),
             &mut out,
-        )
+        ))
     };
     if s != 0 {
         return s;
@@ -3712,7 +4124,9 @@ fn guest_napi_define_class(
     write_guest_u32(&mut env, rp as u32, out);
     0
 }
+}
 
+native_import! {
 fn guest_napi_define_properties(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -3724,7 +4138,7 @@ fn guest_napi_define_properties(
     let pc = prop_count as u32;
     if pc == 0 {
         return unsafe {
-            snapi_bridge_define_properties(
+            parked_bridge!(env, snapi_bridge_define_properties(
                 snapi,
                 obj as u32,
                 0,
@@ -3736,7 +4150,7 @@ fn guest_napi_define_properties(
                 std::ptr::null(),
                 std::ptr::null(),
                 std::ptr::null(),
-            )
+            ))
         };
     }
 
@@ -3803,9 +4217,9 @@ fn guest_napi_define_properties(
         prop_name_ids.push(name_id);
 
         if method_ptr != 0 {
-            let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
+            let reg_id = unsafe { parked_bridge!(env, snapi_bridge_alloc_cb_reg_id(snapi)) };
             unsafe {
-                snapi_bridge_register_callback(snapi, reg_id, e as u32, method_ptr, data_ptr as u64)
+                parked_bridge!(env, snapi_bridge_register_callback(snapi, reg_id, e as u32, method_ptr, data_ptr as u64))
             };
             prop_types.push(1);
             prop_value_ids.push(0);
@@ -3813,16 +4227,16 @@ fn guest_napi_define_properties(
             prop_getter_reg_ids.push(0);
             prop_setter_reg_ids.push(0);
         } else if getter_ptr != 0 && setter_ptr != 0 {
-            let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
+            let reg_id = unsafe { parked_bridge!(env, snapi_bridge_alloc_cb_reg_id(snapi)) };
             unsafe {
-                snapi_bridge_register_callback_pair(
+                parked_bridge!(env, snapi_bridge_register_callback_pair(
                     snapi,
                     reg_id,
                     e as u32,
                     getter_ptr,
                     setter_ptr,
                     data_ptr as u64,
-                )
+                ))
             };
             prop_types.push(4);
             prop_value_ids.push(0);
@@ -3830,9 +4244,9 @@ fn guest_napi_define_properties(
             prop_getter_reg_ids.push(reg_id);
             prop_setter_reg_ids.push(0);
         } else if getter_ptr != 0 {
-            let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
+            let reg_id = unsafe { parked_bridge!(env, snapi_bridge_alloc_cb_reg_id(snapi)) };
             unsafe {
-                snapi_bridge_register_callback(snapi, reg_id, e as u32, getter_ptr, data_ptr as u64)
+                parked_bridge!(env, snapi_bridge_register_callback(snapi, reg_id, e as u32, getter_ptr, data_ptr as u64))
             };
             prop_types.push(2);
             prop_value_ids.push(0);
@@ -3840,9 +4254,9 @@ fn guest_napi_define_properties(
             prop_getter_reg_ids.push(reg_id);
             prop_setter_reg_ids.push(0);
         } else if setter_ptr != 0 {
-            let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
+            let reg_id = unsafe { parked_bridge!(env, snapi_bridge_alloc_cb_reg_id(snapi)) };
             unsafe {
-                snapi_bridge_register_callback(snapi, reg_id, e as u32, setter_ptr, data_ptr as u64)
+                parked_bridge!(env, snapi_bridge_register_callback(snapi, reg_id, e as u32, setter_ptr, data_ptr as u64))
             };
             prop_types.push(3);
             prop_value_ids.push(0);
@@ -3866,7 +4280,7 @@ fn guest_napi_define_properties(
     }
 
     unsafe {
-        snapi_bridge_define_properties(
+        parked_bridge!(env, snapi_bridge_define_properties(
             snapi,
             obj as u32,
             pc,
@@ -3878,18 +4292,20 @@ fn guest_napi_define_properties(
             prop_getter_reg_ids.as_ptr(),
             prop_setter_reg_ids.as_ptr(),
             prop_attributes.as_ptr(),
-        )
+        ))
     }
+}
 }
 
 // --- Script execution ---
 
+native_import! {
 fn guest_napi_run_script(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
     sh: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let snapi = snapi_env(&env, e);
     let mut out: u32 = 0;
     let s = with_cb_context(&mut env, e, || unsafe {
@@ -3901,9 +4317,11 @@ fn guest_napi_run_script(
     }
     Ok(s)
 }
+}
 
 // --- UTF-16 strings ---
 
+native_import! {
 fn guest_napi_create_string_utf16(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -3916,10 +4334,7 @@ fn guest_napi_create_string_utf16(
     let char_count: usize = if wl == 0xFFFFFFFFu32 {
         // Auto-length: scan for null terminator (u16 == 0)
         let mut scan_len: usize = 0;
-        loop {
-            let Some(bytes) = read_guest_bytes(&mut env, str_ptr + (scan_len as i32 * 2), 2) else {
-                break;
-            };
+        while let Some(bytes) = read_guest_bytes(&mut env, str_ptr + (scan_len as i32 * 2), 2) {
             let ch = u16::from_le_bytes([bytes[0], bytes[1]]);
             if ch == 0 {
                 break;
@@ -3945,19 +4360,21 @@ fn guest_napi_create_string_utf16(
     let mut out: u32 = 0;
     // Always pass the actual char count to the 64-bit bridge (not the WASM32 NAPI_AUTO_LENGTH sentinel)
     let s = unsafe {
-        snapi_bridge_create_string_utf16(
+        parked_bridge!(env, snapi_bridge_create_string_utf16(
             snapi_env(&env, e),
             u16_data.as_ptr(),
             char_count as u32,
             &mut out,
-        )
+        ))
     };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_get_value_string_utf16(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -3978,7 +4395,7 @@ fn guest_napi_get_value_string_utf16(
     let mut hb = vec![0u16; hbs];
     let mut rl: usize = 0;
     let s = unsafe {
-        snapi_bridge_get_value_string_utf16(
+        parked_bridge!(env, snapi_bridge_get_value_string_utf16(
             snapi_env(&env, e),
             vh as u32,
             if hbs > 0 {
@@ -3988,7 +4405,7 @@ fn guest_napi_get_value_string_utf16(
             },
             hbs,
             &mut rl,
-        )
+        ))
     };
     if s != 0 {
         return s;
@@ -4004,9 +4421,11 @@ fn guest_napi_get_value_string_utf16(
     }
     0
 }
+}
 
 // --- BigInt words ---
 
+native_import! {
 fn guest_napi_create_bigint_words(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -4026,14 +4445,16 @@ fn guest_napi_create_bigint_words(
         .collect();
     let mut out: u32 = 0;
     let s = unsafe {
-        snapi_bridge_create_bigint_words(snapi_env(&env, e), sign_bit, wc, words.as_ptr(), &mut out)
+        parked_bridge!(env, snapi_bridge_create_bigint_words(snapi_env(&env, e), sign_bit, wc, words.as_ptr(), &mut out))
     };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, out);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_get_value_bigint_words(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -4052,13 +4473,13 @@ fn guest_napi_get_value_bigint_words(
         // Query mode: just get the word count
         let mut sign: i32 = 0;
         let s = unsafe {
-            snapi_bridge_get_value_bigint_words(
+            parked_bridge!(env, snapi_bridge_get_value_bigint_words(
                 snapi_env(&env, e),
                 vh as u32,
                 &mut sign,
                 &mut word_count,
                 std::ptr::null_mut(),
-            )
+            ))
         };
         if s == 0 {
             write_guest_i32(&mut env, sign_ptr as u32, sign);
@@ -4075,13 +4496,13 @@ fn guest_napi_get_value_bigint_words(
     let mut sign: i32 = 0;
     let mut words = vec![0u64; word_count];
     let s = unsafe {
-        snapi_bridge_get_value_bigint_words(
+        parked_bridge!(env, snapi_bridge_get_value_bigint_words(
             snapi_env(&env, e),
             vh as u32,
             &mut sign,
             &mut word_count,
             words.as_mut_ptr(),
-        )
+        ))
     };
     if s == 0 {
         write_guest_i32(&mut env, sign_ptr as u32, sign);
@@ -4095,60 +4516,177 @@ fn guest_napi_get_value_bigint_words(
     }
     s
 }
+}
 
 // --- Instance data ---
 
+native_import! {
 fn guest_napi_set_instance_data(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
     data: i32,
     _finalize_cb: i32,
     _finalize_hint: i32,
 ) -> i32 {
-    unsafe { snapi_bridge_set_instance_data(snapi_env(&env, e), data as u64) }
+    unsafe { parked_bridge!(env, snapi_bridge_set_instance_data(snapi_env(&env, e), data as u64)) }
+}
 }
 
+native_import! {
 fn guest_napi_get_instance_data(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i32) -> i32 {
     let mut data: u64 = 0;
-    let s = unsafe { snapi_bridge_get_instance_data(snapi_env(&env, e), &mut data) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_get_instance_data(snapi_env(&env, e), &mut data)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, data as u32);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_adjust_external_memory(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
     change: i64,
     rp: i32,
-) -> i32 {
-    // Charge a positive delta up front so an over-budget declaration fails
-    // before V8 is told about the memory.
-    if change > 0 && !env.data_mut().charge_declared_external(change as u64) {
-        return 1;
-    }
+) -> Result<i32, RuntimeError> {
+    use crate::env::DeclaredExternalCharge;
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
-    let mut adjusted: i64 = 0;
-    let s =
-        unsafe { snapi_bridge_adjust_external_memory(snapi_env(&env, e), change, &mut adjusted) };
-    if s != 0 {
-        if change > 0 {
-            env.data_mut().uncharge_declared_external(change as u64);
+    let target = snapi_env(&env, e);
+    if target.is_null() {
+        return Ok(1);
+    }
+    let Some(environment) = env.pin_frame() else {
+        return Ok(1);
+    };
+    let budget = env.data().budget.clone();
+    // Every accountant callback, including receipt rollback during unwind,
+    // runs while the original Store borrow is inaccessible.
+    let adjustment: Result<(i32, i64), RuntimeError> = env.as_store_mut().parked(|| {
+        let charge = if change > 0 {
+            let Some(charge) = DeclaredExternalCharge::reserve(budget.clone(), change as u64)
+            else {
+                return Ok((1, 0));
+            };
+            Some(charge)
+        } else {
+            None
+        };
+        let call = wasmer::Store::with_current(|store| {
+            // Restore the counted Store wrapper before replaying any panic.
+            catch_unwind(AssertUnwindSafe(|| {
+                let mut current = environment.try_as_env_mut(store)?;
+                if !current.data().creation_enabled()
+                    || current.data().resolve_napi_env(e) != target
+                {
+                    return None;
+                }
+                // Pending positive receipts are not committed declarations.
+                // A nested negative delta must not consume their CPP credit.
+                if change < 0
+                    && !current
+                        .data()
+                        .has_declared_external(e as u32, change.unsigned_abs())
+                {
+                    return None;
+                }
+                let mut cpp_status = 1;
+                let mut adjusted = 0;
+                let callback = catch_unwind(AssertUnwindSafe(|| {
+                    with_cb_context(&mut current, e, || unsafe {
+                        cpp_status =
+                            snapi_bridge_adjust_external_memory(target, change, &mut adjusted);
+                        cpp_status
+                    })
+                }));
+                // The same temporary owns original-cell cleanup even when a
+                // callback replaces its slot. Follow actual CPP acceptance
+                // before replaying a callback failure reported after CPP exit.
+                let release = if cpp_status == 0 {
+                    if change > 0 {
+                        current
+                            .data_mut()
+                            .record_declared_external(e as u32, change as u64);
+                        0
+                    } else {
+                        current
+                            .data_mut()
+                            .take_declared_external(e as u32, change.unsigned_abs())
+                    }
+                } else {
+                    0
+                };
+                Some((cpp_status, adjusted, release, callback))
+            }))
+        });
+        let Some(call) = call else {
+            return Ok((1, 0));
+        };
+        let Some((status, adjusted, release, callback)) = (match call {
+            Ok(result) => result,
+            Err(panic) => resume_unwind(panic),
+        }) else {
+            return Ok((1, 0));
+        };
+        settle_external_adjustment(charge, &budget, status, release, callback)?;
+        // A negative adjustment's accountant can itself detach this cell.
+        // Reject further guest writes through a stale attachment.
+        let attached = wasmer::Store::with_current(|store| {
+            environment.try_as_env_mut(store).is_some_and(|current| {
+                current.data().creation_enabled() && current.data().resolve_napi_env(e) == target
+            })
+        })
+        .unwrap_or(false);
+        Ok((if attached { status } else { 1 }, adjusted))
+    });
+    let (status, adjusted) = adjustment?;
+    if status == 0 {
+        write_guest_i64(&mut env, rp as u32, adjusted);
+    }
+    Ok(status)
+}
+}
+
+/// Reconcile owned charge cleanup before replaying the exact bridge outcome.
+/// Called only after original-cell bookkeeping and counted Store restoration.
+pub(crate) fn settle_external_adjustment(
+    charge: Option<crate::env::DeclaredExternalCharge>,
+    budget: &crate::ResourceBudget,
+    cpp_status: i32,
+    release: u64,
+    callback: std::thread::Result<Result<i32, RuntimeError>>,
+) -> Result<(), RuntimeError> {
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+    let cleanup = catch_unwind(AssertUnwindSafe(|| {
+        if cpp_status == 0 {
+            if let Some(charge) = charge {
+                charge.commit();
+            }
+            budget.uncharge(crate::Pool::V8External, release);
+        } else {
+            drop(charge);
         }
-        return s;
+    }));
+    match (callback, cleanup) {
+        (Ok(Ok(_)), Ok(())) => Ok(()),
+        (Ok(Ok(_)), Err(panic)) => resume_unwind(panic),
+        (first, cleanup) => {
+            if let Err(secondary) = cleanup {
+                let _ = catch_unwind(AssertUnwindSafe(|| drop(secondary)));
+            }
+            match first {
+                Ok(Err(error)) => Err(error),
+                Err(panic) => resume_unwind(panic),
+                Ok(Ok(_)) => unreachable!(),
+            }
+        }
     }
-
-    if change < 0 {
-        env.data_mut()
-            .uncharge_declared_external(change.unsigned_abs());
-    }
-    write_guest_i64(&mut env, rp as u32, adjusted);
-    s
 }
 
 // --- Node Buffers ---
 
+native_import! {
 fn guest_napi_create_buffer(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -4167,14 +4705,14 @@ fn guest_napi_create_buffer(
         let mut buf_id: u32 = 0;
         let mut backing_store_token: u64 = 0;
         let s = unsafe {
-            snapi_bridge_create_external_buffer_finalized(
+            parked_bridge!(env, snapi_bridge_create_external_buffer_finalized(
                 snapi_env(&env, e),
                 host_addr,
                 length as u32,
                 hint,
                 &mut backing_store_token,
                 &mut buf_id,
-            )
+            ))
         };
         if s != 0 {
             crate::guest_heap::GuestHeap::reclaim_finalize_ctx(hint);
@@ -4192,7 +4730,7 @@ fn guest_napi_create_buffer(
         let mut host_data: u64 = 0;
         let mut out: u32 = 0;
         let s = unsafe {
-            snapi_bridge_create_buffer(snapi_env(&env, e), length as u32, &mut host_data, &mut out)
+            parked_bridge!(env, snapi_bridge_create_buffer(snapi_env(&env, e), length as u32, &mut host_data, &mut out))
         };
         if s != 0 {
             return s;
@@ -4201,7 +4739,9 @@ fn guest_napi_create_buffer(
         0
     }
 }
+}
 
+native_import! {
 fn guest_napi_create_buffer_copy(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -4226,14 +4766,14 @@ fn guest_napi_create_buffer_copy(
         let mut buf_id: u32 = 0;
         let mut backing_store_token: u64 = 0;
         let s = unsafe {
-            snapi_bridge_create_external_buffer_finalized(
+            parked_bridge!(env, snapi_bridge_create_external_buffer_finalized(
                 snapi_env(&env, e),
                 host_addr,
                 length as u32,
                 hint,
                 &mut backing_store_token,
                 &mut buf_id,
-            )
+            ))
         };
         if s != 0 {
             crate::guest_heap::GuestHeap::reclaim_finalize_ctx(hint);
@@ -4251,13 +4791,13 @@ fn guest_napi_create_buffer_copy(
         let mut result_host_data: u64 = 0;
         let mut out: u32 = 0;
         let s = unsafe {
-            snapi_bridge_create_buffer_copy(
+            parked_bridge!(env, snapi_bridge_create_buffer_copy(
                 snapi_env(&env, e),
                 length as u32,
                 src_data.as_ptr(),
                 &mut result_host_data,
                 &mut out,
-            )
+            ))
         };
         if s == 0 {
             write_guest_u32(&mut env, rp as u32, out);
@@ -4265,9 +4805,11 @@ fn guest_napi_create_buffer_copy(
         s
     }
 }
+}
 
 guest_is_check!(guest_napi_is_buffer, snapi_bridge_is_buffer);
 
+native_import! {
 fn guest_napi_get_buffer_info(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -4279,13 +4821,13 @@ fn guest_napi_get_buffer_info(
     let mut bl: u32 = 0;
     let mut backing_store_token: u64 = 0;
     let s = unsafe {
-        snapi_bridge_get_buffer_info(
+        parked_bridge!(env, snapi_bridge_get_buffer_info(
             snapi_env(&env, e),
             vh as u32,
             &mut host_data,
             &mut bl,
             &mut backing_store_token,
-        )
+        ))
     };
     if s != 0 {
         return s;
@@ -4301,7 +4843,10 @@ fn guest_napi_get_buffer_info(
     }
     0
 }
+}
 
+native_import! {
+#[allow(clippy::too_many_arguments)] // The guest ABI fixes this import's signature.
 fn guest_unofficial_napi_acquire_buffer_lease(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -4325,7 +4870,7 @@ fn guest_unofficial_napi_acquire_buffer_lease(
     let mut lease_id = 0u32;
     let mut host_ptr = 0u64;
     let status = unsafe {
-        snapi_bridge_unofficial_acquire_buffer_lease(
+        parked_bridge!(env, snapi_bridge_unofficial_acquire_buffer_lease(
             snapi_env(&env, e),
             value as u32,
             byte_offset as u32,
@@ -4333,7 +4878,7 @@ fn guest_unofficial_napi_acquire_buffer_lease(
             mode,
             &mut lease_id,
             &mut host_ptr,
-        )
+        ))
     };
     if status != 0 {
         return status;
@@ -4350,13 +4895,13 @@ fn guest_unofficial_napi_acquire_buffer_lease(
     } else {
         let Some(heap) = env.data().guest_heap.clone() else {
             let _ = unsafe {
-                snapi_bridge_unofficial_release_buffer_lease(snapi_env(&env, e), lease_id, 0)
+                parked_bridge!(env, snapi_bridge_unofficial_release_buffer_lease(snapi_env(&env, e), lease_id, 0))
             };
             return 9;
         };
         let Some(ptr) = alloc_guest(&mut env, &heap, byte_len, false) else {
             let _ = unsafe {
-                snapi_bridge_unofficial_release_buffer_lease(snapi_env(&env, e), lease_id, 0)
+                parked_bridge!(env, snapi_bridge_unofficial_release_buffer_lease(snapi_env(&env, e), lease_id, 0))
             };
             return 9;
         };
@@ -4365,7 +4910,7 @@ fn guest_unofficial_napi_acquire_buffer_lease(
             if !write_guest_bytes(&mut env, ptr, source) {
                 heap.free_offset(ptr);
                 let _ = unsafe {
-                    snapi_bridge_unofficial_release_buffer_lease(snapi_env(&env, e), lease_id, 0)
+                    parked_bridge!(env, snapi_bridge_unofficial_release_buffer_lease(snapi_env(&env, e), lease_id, 0))
                 };
                 return 9;
             }
@@ -4387,7 +4932,9 @@ fn guest_unofficial_napi_acquire_buffer_lease(
     write_guest_u32(&mut env, data_out as u32, guest_ptr);
     0
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_release_buffer_lease(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -4410,7 +4957,7 @@ fn guest_unofficial_napi_release_buffer_lease(
                 heap.free_offset(lease.guest_ptr);
             }
             let _ = unsafe {
-                snapi_bridge_unofficial_release_buffer_lease(snapi_env(&env, e), lease_id as u32, 0)
+                parked_bridge!(env, snapi_bridge_unofficial_release_buffer_lease(snapi_env(&env, e), lease_id as u32, 0))
             };
             return 9;
         };
@@ -4428,10 +4975,12 @@ fn guest_unofficial_napi_release_buffer_lease(
         heap.free_offset(lease.guest_ptr);
     }
     unsafe {
-        snapi_bridge_unofficial_release_buffer_lease(snapi_env(&env, e), lease_id as u32, modified)
+        parked_bridge!(env, snapi_bridge_unofficial_release_buffer_lease(snapi_env(&env, e), lease_id as u32, modified))
     }
 }
+}
 
+native_import! {
 fn guest_unofficial_napi_create_guest_backed_typedarray(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -4446,13 +4995,13 @@ fn guest_unofficial_napi_create_guest_backed_typedarray(
     let mut host_ptr = 0u64;
     let mut value_id = 0u32;
     let status = unsafe {
-        snapi_bridge_unofficial_create_guest_backed_typedarray(
+        parked_bridge!(env, snapi_bridge_unofficial_create_guest_backed_typedarray(
             snapi_env(&env, e),
             type_,
             length as u32,
             &mut host_ptr,
             &mut value_id,
-        )
+        ))
     };
     if status != 0 {
         return status;
@@ -4468,15 +5017,17 @@ fn guest_unofficial_napi_create_guest_backed_typedarray(
     write_guest_u32(&mut env, result_out as u32, value_id);
     0
 }
+}
 
 // --- Node version ---
 
+native_import! {
 fn guest_napi_get_node_version(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i32) -> i32 {
     let mut major: u32 = 0;
     let mut minor: u32 = 0;
     let mut patch: u32 = 0;
     let s = unsafe {
-        snapi_bridge_get_node_version(snapi_env(&env, e), &mut major, &mut minor, &mut patch)
+        parked_bridge!(env, snapi_bridge_get_node_version(snapi_env(&env, e), &mut major, &mut minor, &mut patch))
     };
     if s != 0 {
         return s;
@@ -4507,9 +5058,11 @@ fn guest_napi_get_node_version(mut env: FunctionEnvMut<NapiEnv>, e: i32, rp: i32
     }
     0
 }
+}
 
 // --- Object wrapping ---
 
+native_import! {
 fn guest_napi_wrap(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -4525,7 +5078,7 @@ fn guest_napi_wrap(
     if finalize_cb != 0 {
         let mut ref_out: u32 = 0;
         let s = unsafe {
-            snapi_bridge_wrap_finalized(
+            parked_bridge!(env, snapi_bridge_wrap_finalized(
                 snapi_env(&env, e),
                 obj as u32,
                 native_data as u64,
@@ -4538,7 +5091,7 @@ fn guest_napi_wrap(
                 } else {
                     std::ptr::null_mut()
                 },
-            )
+            ))
         };
         if s == 0 && ref_ptr > 0 {
             write_guest_u32(&mut env, ref_ptr as u32, ref_out);
@@ -4551,17 +5104,17 @@ fn guest_napi_wrap(
     // mint the caller's ref separately as a weak reference, matching the
     // refcount-0 ref napi_wrap would return.
     let s = unsafe {
-        snapi_bridge_wrap(
+        parked_bridge!(env, snapi_bridge_wrap(
             snapi_env(&env, e),
             obj as u32,
             native_data as u64,
             std::ptr::null_mut(),
-        )
+        ))
     };
     if s == 0 && ref_ptr > 0 {
         let mut ref_out: u32 = 0;
         let rs = unsafe {
-            snapi_bridge_create_reference(snapi_env(&env, e), obj as u32, 0, &mut ref_out)
+            parked_bridge!(env, snapi_bridge_create_reference(snapi_env(&env, e), obj as u32, 0, &mut ref_out))
         };
         if rs != 0 {
             return rs;
@@ -4570,25 +5123,31 @@ fn guest_napi_wrap(
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_unwrap(mut env: FunctionEnvMut<NapiEnv>, e: i32, obj: i32, rp: i32) -> i32 {
     let mut data: u64 = 0;
-    let s = unsafe { snapi_bridge_unwrap(snapi_env(&env, e), obj as u32, &mut data) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_unwrap(snapi_env(&env, e), obj as u32, &mut data)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, data as u32);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_remove_wrap(mut env: FunctionEnvMut<NapiEnv>, e: i32, obj: i32, rp: i32) -> i32 {
     let mut data: u64 = 0;
-    let s = unsafe { snapi_bridge_remove_wrap(snapi_env(&env, e), obj as u32, &mut data) };
+    let s = unsafe { parked_bridge!(env, snapi_bridge_remove_wrap(snapi_env(&env, e), obj as u32, &mut data)) };
     if s == 0 {
         write_guest_u32(&mut env, rp as u32, data as u32);
     }
     s
 }
+}
 
+native_import! {
 fn guest_napi_add_finalizer(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -4606,7 +5165,7 @@ fn guest_napi_add_finalizer(
     };
     let s = if finalize_cb != 0 {
         unsafe {
-            snapi_bridge_add_finalizer_cb(
+            parked_bridge!(env, snapi_bridge_add_finalizer_cb(
                 snapi_env(&env, e),
                 obj as u32,
                 data as u64,
@@ -4615,11 +5174,11 @@ fn guest_napi_add_finalizer(
                 data as u32,
                 finalize_hint as u32,
                 ref_out_ptr,
-            )
+            ))
         }
     } else {
         unsafe {
-            snapi_bridge_add_finalizer(snapi_env(&env, e), obj as u32, data as u64, ref_out_ptr)
+            parked_bridge!(env, snapi_bridge_add_finalizer(snapi_env(&env, e), obj as u32, data as u64, ref_out_ptr))
         }
     };
     if s == 0 && ref_ptr > 0 {
@@ -4627,18 +5186,24 @@ fn guest_napi_add_finalizer(
     }
     s
 }
+}
 
 // --- Misc stubs ---
 
+native_import! {
 fn guest_napi_get_last_error_info(_env: FunctionEnvMut<NapiEnv>, _e: i32, _rp: i32) -> i32 {
     0
 }
+}
 
+native_import! {
 fn guest_napi_get_version(mut env: FunctionEnvMut<NapiEnv>, _e: i32, rp: i32) -> i32 {
     write_guest_u32(&mut env, rp as u32, 8);
     0
 }
+}
 
+native_import! {
 fn guest_napi_fatal_error(
     mut env: FunctionEnvMut<NapiEnv>,
     loc_ptr: i32,
@@ -4678,9 +5243,11 @@ fn guest_napi_fatal_error(
     );
     std::process::abort();
 }
+}
 
 // --- Constructor ---
 
+native_import! {
 fn guest_napi_new_instance(
     mut env: FunctionEnvMut<NapiEnv>,
     e: i32,
@@ -4688,7 +5255,7 @@ fn guest_napi_new_instance(
     argc: i32,
     argv_ptr: i32,
     rp: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let argc_u = argc as u32;
     let argv_ids = if argc_u > 0 {
         let Some(ids) = read_guest_u32_array(&mut env, argv_ptr, argc_u as usize) else {
@@ -4709,6 +5276,7 @@ fn guest_napi_new_instance(
         write_guest_u32(&mut env, rp as u32, out);
     }
     Ok(s)
+}
 }
 
 // ============================================================

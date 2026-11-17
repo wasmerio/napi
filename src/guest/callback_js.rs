@@ -1,11 +1,11 @@
 use std::ffi::c_void;
 
-use wasmer::{FunctionEnvMut, Table, Value};
+use wasmer::{AsStoreAsync, AsStoreMut, FunctionEnvMut, Table, Value};
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use std::future::Future;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
-use wasmer::AsyncFunctionEnvMut;
+use wasmer::{AsyncFunctionEnvMut, WeakAsyncFunctionEnvMut};
 
 use crate::{NapiEnv, snapi::SnapiEnv};
 
@@ -31,7 +31,7 @@ unsafe impl Send for CallbackInvocationCtx {}
 enum CallbackEnv {
     Sync(*mut RawFunctionEnvMut),
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
-    Async(AsyncFunctionEnvMut<NapiEnv>),
+    Async(WeakAsyncFunctionEnvMut<NapiEnv>),
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -42,7 +42,11 @@ pub(crate) fn install_persistent_callback_state(
     async_env: AsyncFunctionEnvMut<NapiEnv>,
 ) {
     let mut ctx = Box::new(CallbackInvocationCtx {
-        env: CallbackEnv::Async(async_env),
+        env: CallbackEnv::Async(
+            async_env
+                .downgrade()
+                .expect("browser callback context requires an asynchronous Store"),
+        ),
     });
     let ctx_ptr = (&mut *ctx as *mut CallbackInvocationCtx).cast::<c_void>();
     env.data_mut()
@@ -53,12 +57,42 @@ pub(crate) fn install_persistent_callback_state(
     }
 }
 
+fn with_current_env_mut<R>(
+    env: &AsyncFunctionEnvMut<NapiEnv>,
+    f: impl FnOnce(FunctionEnvMut<'_, NapiEnv>) -> R,
+) -> Option<R> {
+    let id = env.as_store_async().store_id();
+    wasmer::Store::with_current(|store| {
+        if store.objects_mut().id() != id {
+            return None;
+        }
+        Some(f(env.as_ref().into_mut(store)))
+    })
+    .flatten()
+}
+
+/// Keep the exact async Store alive until the outer provider frame has finished
+/// its result/value-frame cleanup, beyond the inner trampoline's short upgrade.
+pub(crate) unsafe fn pin_callback_store(
+    callback_ctx: *mut c_void,
+) -> Option<AsyncFunctionEnvMut<NapiEnv>> {
+    if callback_ctx.is_null() {
+        return None;
+    }
+    let ctx = unsafe { &*(callback_ctx as *const CallbackInvocationCtx) };
+    match &ctx.env {
+        CallbackEnv::Sync(_) => None,
+        CallbackEnv::Async(env) => env.upgrade(),
+    }
+}
+
 struct CallbackStateGuard {
     _ctx: Box<CallbackInvocationCtx>,
     snapi_env: SnapiEnv,
     prev: *mut c_void,
     env: *mut RawFunctionEnvMut,
     owner_id: u64,
+    _operation: Option<crate::snapi_js::HostJsOperation>,
 }
 
 impl Drop for CallbackStateGuard {
@@ -86,6 +120,7 @@ fn install_callback_state(
         return None;
     }
 
+    let operation = unsafe { crate::snapi_js::HostJsOperation::enter(snapi_env) };
     let env_ptr = (env as *mut FunctionEnvMut<'_, NapiEnv>).cast::<RawFunctionEnvMut>();
     let mut ctx = Box::new(CallbackInvocationCtx {
         env: CallbackEnv::Sync(env_ptr),
@@ -104,6 +139,7 @@ fn install_callback_state(
         snapi_env,
         prev,
         owner_id,
+        _operation: operation,
     })
 }
 
@@ -114,29 +150,9 @@ fn call_guest_callback(
     wasm_fn_ptr: u32,
     callback_arg: u32,
 ) -> u32 {
-    let func = match env.data().func_cache.get(&wasm_fn_ptr).cloned() {
-        Some(func) => func,
-        None => {
-            let Some(elem) = table.get(env, wasm_fn_ptr) else {
-                eprintln!("[callback trampoline] table entry missing for function {wasm_fn_ptr}");
-                return 0;
-            };
-            let func = match elem {
-                Value::FuncRef(Some(func)) => func,
-                Value::FuncRef(None) => {
-                    eprintln!("[callback trampoline] null function reference at {wasm_fn_ptr}");
-                    return 0;
-                }
-                other => {
-                    eprintln!(
-                        "[callback trampoline] non-function table value at {wasm_fn_ptr}: {other:?}"
-                    );
-                    return 0;
-                }
-            };
-            env.data_mut().func_cache.insert(wasm_fn_ptr, func.clone());
-            func
-        }
+    let Some(Value::FuncRef(Some(func))) = table.get(env, wasm_fn_ptr) else {
+        eprintln!("[callback trampoline] table entry missing for function {wasm_fn_ptr}");
+        return 0;
     };
     let result = func.call(
         env,
@@ -163,16 +179,9 @@ fn call_guest_finalizer(
     data: u32,
     hint: u32,
 ) -> u32 {
-    let func = match env.data().func_cache.get(&wasm_fn_ptr).cloned() {
-        Some(func) => func,
-        None => {
-            let Some(Value::FuncRef(Some(func))) = table.get(env, wasm_fn_ptr) else {
-                eprintln!("[finalizer trampoline] table entry missing for function {wasm_fn_ptr}");
-                return 0;
-            };
-            env.data_mut().func_cache.insert(wasm_fn_ptr, func.clone());
-            func
-        }
+    let Some(Value::FuncRef(Some(func))) = table.get(env, wasm_fn_ptr) else {
+        eprintln!("[finalizer trampoline] table entry missing for function {wasm_fn_ptr}");
+        return 0;
     };
     match func.call(
         env,
@@ -472,6 +481,7 @@ where
         return future.await;
     }
 
+    let _operation = unsafe { crate::snapi_js::HostJsOperation::enter(snapi_env) };
     let owner_id = {
         let mut locked = env.write().await;
         let owner_id = locked.data_mut().next_host_buffer_owner();
@@ -514,9 +524,12 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
         eprintln!("[callback trampoline] no active callback scope available");
         return 0;
     }
-    let ctx = unsafe { &mut *(callback_ctx as *mut CallbackInvocationCtx) };
-    match &mut ctx.env {
+    let ctx = unsafe { &*(callback_ctx as *const CallbackInvocationCtx) };
+    match &ctx.env {
         CallbackEnv::Sync(env) => {
+            // Copy the stored raw pointer; the shared reference is to its
+            // context slot, not to the FunctionEnvMut it designates.
+            let env = *env;
             if env.is_null() {
                 eprintln!("[callback trampoline] callback scope env cleared");
                 return 0;
@@ -530,7 +543,10 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
         }
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
         CallbackEnv::Async(env) => {
-            if let Some(result) = env.with_current_mut(|mut sync_env| {
+            let Some(env) = env.upgrade() else {
+                return 0;
+            };
+            if let Some(result) = with_current_env_mut(&env, |mut sync_env| {
                 let Some(table) = sync_env.data().table.clone() else {
                     eprintln!("[callback trampoline] guest function table is not installed");
                     return 0;
@@ -577,7 +593,7 @@ pub extern "C" fn snapi_host_invoke_wasm_finalizer(
     if callback_ctx.is_null() {
         return CALLBACK_DEFERRED;
     }
-    let ctx = unsafe { &mut *(callback_ctx as *mut CallbackInvocationCtx) };
+    let ctx = unsafe { &*(callback_ctx as *const CallbackInvocationCtx) };
     let invoke = |env: &mut FunctionEnvMut<NapiEnv>| {
         let Some(table) = env.data().table.clone() else {
             return 0;
@@ -595,8 +611,11 @@ pub extern "C" fn snapi_host_invoke_wasm_finalizer(
         }
         result
     };
-    match &mut ctx.env {
+    match &ctx.env {
         CallbackEnv::Sync(env) => {
+            // Copy the stored raw pointer; the shared reference is to its
+            // context slot, not to the FunctionEnvMut it designates.
+            let env = *env;
             if env.is_null() {
                 return CALLBACK_DEFERRED;
             }
@@ -604,7 +623,10 @@ pub extern "C" fn snapi_host_invoke_wasm_finalizer(
         }
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
         CallbackEnv::Async(env) => {
-            if let Some(result) = env.with_current_mut(|mut sync_env| invoke(&mut sync_env)) {
+            let Some(env) = env.upgrade() else {
+                return 0;
+            };
+            if let Some(result) = with_current_env_mut(&env, |mut sync_env| invoke(&mut sync_env)) {
                 return result;
             }
             if let Some(mut locked) = env.try_write() {

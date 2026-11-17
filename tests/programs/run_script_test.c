@@ -9,6 +9,7 @@
 static int wrap_finalizer_count = 0;
 static int add_finalizer_count = 0;
 static int facade_evaluation_count = 0;
+static int nested_script_calls = 0;
 
 typedef struct {
   napi_value proxy;
@@ -126,6 +127,28 @@ static int RunStringScript(napi_env env,
       env, result, result_out, result_capacity, &result_length);
 }
 
+static napi_value NAPI_CDECL NestedScriptLeaf(napi_env env,
+                                               napi_callback_info info) {
+  (void)info;
+  nested_script_calls++;
+  napi_value result = NULL;
+  if (napi_create_int32(env, 40, &result) != napi_ok) return NULL;
+  return result;
+}
+
+static napi_value NAPI_CDECL NestedScriptEval(napi_env env,
+                                               napi_callback_info info) {
+  (void)info;
+  napi_value source = NULL;
+  napi_value result = NULL;
+  if (napi_create_string_utf8(env, "nestedScriptLeaf() + 2",
+                              NAPI_AUTO_LENGTH, &source) != napi_ok ||
+      napi_run_script(env, source, &result) != napi_ok) {
+    return NULL;
+  }
+  return result;
+}
+
 int main(void) {
   napi_env env = napi_wasm_init_env();
   CHECK_OR_FAIL(env != NULL, "napi_wasm_init_env returned NULL");
@@ -153,6 +176,25 @@ int main(void) {
   double num;
   NAPI_CALL(env, napi_get_value_double(env, num_result, &num));
   CHECK_OR_FAIL(num > 13.9 && num < 14.1, "expected 14");
+
+  // Script -> guest callback -> script -> guest callback must not retain a
+  // mutable host-provider state borrow across either evaluation boundary.
+  napi_value script_global;
+  napi_value nested_script_leaf;
+  napi_value nested_script_eval;
+  NAPI_CALL(env, napi_get_global(env, &script_global));
+  NAPI_CALL(env, napi_create_function(env, "nestedScriptLeaf", NAPI_AUTO_LENGTH,
+                                      NestedScriptLeaf, NULL, &nested_script_leaf));
+  NAPI_CALL(env, napi_create_function(env, "nestedScriptEval", NAPI_AUTO_LENGTH,
+                                      NestedScriptEval, NULL, &nested_script_eval));
+  NAPI_CALL(env, napi_set_named_property(env, script_global,
+                                         "nestedScriptLeaf", nested_script_leaf));
+  NAPI_CALL(env, napi_set_named_property(env, script_global,
+                                         "nestedScriptEval", nested_script_eval));
+  int32_t nested_script_result = 0;
+  NAPI_CALL(env, RunInt32Script(env, "nestedScriptEval()", &nested_script_result));
+  CHECK_OR_FAIL(nested_script_result == 42 && nested_script_calls == 1,
+                "nested run_script callback did not preserve provider state");
 
   // Property-name enumeration is a host-to-JS boundary: a Proxy can invoke a
   // guest ownKeys callback while an outer guest callback still owns the store.
@@ -287,6 +329,22 @@ int main(void) {
   NAPI_CALL(env, napi_get_value_int32(env, context_result, &marker));
   CHECK_OR_FAIL(marker == 73,
                 "contextify_run_script escaped its explicit context");
+
+  NAPI_CALL(env, napi_set_named_property(env, sandbox,
+                                         "nestedScriptEval", nested_script_eval));
+  napi_value nested_context_source_text;
+  NAPI_CALL(env, napi_create_string_utf8(env, "nestedScriptEval()",
+                                          NAPI_AUTO_LENGTH,
+                                          &nested_context_source_text));
+  const unofficial_napi_js_source nested_context_source =
+      unofficial_napi_js_source_from_text(nested_context_source_text);
+  NAPI_CALL(env, unofficial_napi_contextify_run_script(
+                     env, context, &nested_context_source, undefined_value,
+                     0, 0, -1, true, false, false, undefined_value,
+                     &context_result));
+  NAPI_CALL(env, napi_get_value_int32(env, context_result, &nested_script_result));
+  CHECK_OR_FAIL(nested_script_result == 42 && nested_script_calls == 2,
+                "nested contextify callback did not preserve provider state");
 
   napi_value parameters;
   napi_value context_extensions;

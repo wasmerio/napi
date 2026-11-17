@@ -95,7 +95,7 @@ pub enum Pool {
     /// live usage, so the guarantee never races V8's GC.
     V8HeapReserved,
     /// V8 external memory the guest has explicitly declared via
-    /// `napi_adjust_external_memory` (`NapiEnv::charge_declared_external`).
+    /// `napi_adjust_external_memory` (`NapiEnv::record_declared_external`).
     /// ArrayBuffer/Buffer backing stores are NOT charged here: GuestHeap is
     /// the only allocation path for them and they're charged as
     /// [`Pool::WasmLinear`] instead — see [`crate::guest_heap::GuestHeap`].
@@ -189,6 +189,32 @@ pub enum EnvRejected {
     HeapDoesNotFit,
 }
 
+// The final accountant destructor is another user callback. It can run
+// while an earlier uncharge/query panic is unwinding through the last budget.
+// Suppress only that secondary failure; an ordinary first Drop panic remains
+// visible to the enclosing Rust/FFI outcome fence.
+struct AccountantOwner(Option<Arc<dyn NapiMemoryAccountant>>);
+impl std::ops::Deref for AccountantOwner {
+    type Target = Option<Arc<dyn NapiMemoryAccountant>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl Drop for AccountantOwner {
+    fn drop(&mut self) {
+        let unwinding = std::thread::panicking();
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(self.0.take())));
+        if let Err(panic) = outcome {
+            if unwinding {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(panic)));
+            } else {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+}
+
 /// One shared accountant per app, `Arc`-shared into every pool that allocates.
 ///
 /// Charging is **reserve-based**: bytes are charged before (or exactly at) the
@@ -200,7 +226,7 @@ pub struct ResourceBudget {
     mem_total: u64,
     /// Sum of all currently-charged bytes across every pool.
     mem_charged: AtomicU64,
-    accountant: Option<Arc<dyn NapiMemoryAccountant>>,
+    accountant: AccountantOwner,
     /// Per-pool charge, for observability and reconciliation.
     wasm_linear: AtomicU64,
     v8_heap_reserved: AtomicU64,
@@ -244,15 +270,30 @@ impl ResourceBudget {
     /// charged those bytes by the time we see them; charging again would
     /// count one allocation twice against the same total. With no accountant
     /// nothing else is counting, so the heap charges its own claims.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) fn wasm_is_externally_accounted(&self) -> bool {
         self.accountant.is_some()
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn accounting_identity(self: &Arc<Self>) -> std::sync::Weak<dyn Send + Sync> {
+        // MemoryCharge retains this budget and its protected AccountantOwner.
+        // Weak identity must not become an independent last accountant owner.
+        let source: Arc<dyn Send + Sync> = match self.accountant.as_ref() {
+            Some(accountant) => accountant.clone(),
+            None => self.clone(),
+        };
+        Arc::downgrade(&source)
+    }
+
     pub fn with_accountant(accountant: Arc<dyn NapiMemoryAccountant>) -> Arc<Self> {
+        // Install cleanup custody BEFORE the first custom limit query.
+        let accountant = AccountantOwner(Some(accountant));
+        let mem_total = accountant.as_ref().unwrap().memory_limit();
         Arc::new(Self {
-            mem_total: accountant.memory_limit(),
+            mem_total,
             mem_charged: AtomicU64::new(0),
-            accountant: Some(accountant),
+            accountant,
             wasm_linear: AtomicU64::new(0),
             v8_heap_reserved: AtomicU64::new(0),
             v8_external: AtomicU64::new(0),
@@ -264,7 +305,7 @@ impl ResourceBudget {
         Self {
             mem_total,
             mem_charged: AtomicU64::new(0),
-            accountant: None,
+            accountant: AccountantOwner(None),
             wasm_linear: AtomicU64::new(0),
             v8_heap_reserved: AtomicU64::new(0),
             v8_external: AtomicU64::new(0),
@@ -307,7 +348,7 @@ impl ResourceBudget {
             return Ok(());
         }
 
-        if let Some(accountant) = &self.accountant {
+        if let Some(accountant) = self.accountant.as_ref() {
             if !accountant.try_charge(bytes) {
                 return Err(OverBudget {
                     pool,
@@ -358,7 +399,7 @@ impl ResourceBudget {
         }
         self.pool_counter(pool).fetch_sub(bytes, Ordering::AcqRel);
         self.mem_charged.fetch_sub(bytes, Ordering::AcqRel);
-        if let Some(accountant) = &self.accountant {
+        if let Some(accountant) = self.accountant.as_ref() {
             accountant.uncharge(bytes);
         }
     }
@@ -414,17 +455,27 @@ impl ResourceBudget {
         if !self.try_acquire_isolate(max_envs) {
             return Err(EnvRejected::TooManyEnvs);
         }
+        // Planning and charging may call the embedder. Retain the acquired
+        // slot until every fallible step has produced an owned reservation.
+        struct AcquiredSlot<'a>(Option<&'a ResourceBudget>);
+        impl Drop for AcquiredSlot<'_> {
+            fn drop(&mut self) {
+                if let Some(budget) = self.0.take() {
+                    budget.release_isolate();
+                }
+            }
+        }
+        let mut slot = AcquiredSlot(Some(self));
         let Some(reservation) = self.plan_heap_reservation(req) else {
-            self.release_isolate();
             return Err(EnvRejected::HeapDoesNotFit);
         };
         if self
             .try_charge(Pool::V8HeapReserved, reservation.ceiling_bytes)
             .is_err()
         {
-            self.release_isolate();
             return Err(EnvRejected::HeapDoesNotFit);
         }
+        slot.0 = None;
         Ok(reservation)
     }
 
@@ -433,8 +484,10 @@ impl ResourceBudget {
     ///
     /// [`try_reserve_env`]: ResourceBudget::try_reserve_env
     pub fn release_env(&self, ceiling_bytes: u64) {
-        self.uncharge(Pool::V8HeapReserved, ceiling_bytes);
+        // Both counters are released even if the custom accountant panics.
+        // A successfully created provider must already have been disposed.
         self.release_isolate();
+        self.uncharge(Pool::V8HeapReserved, ceiling_bytes);
     }
 
     /// Atomically claim an isolate slot if under `max_envs` (always succeeds
@@ -544,6 +597,54 @@ pub(crate) struct EnvHeapCharge {
 /// call. The tracker is freed only at env teardown — after the callback is
 /// removed from the isolate and while no JS runs — so a non-null pointer is
 /// valid for every real invocation.
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+#[unsafe(no_mangle)]
+pub extern "C" fn napi_host_near_heap_limit_grant(
+    data: *const c_void,
+    current_limit: usize,
+    _initial_limit: usize,
+) -> usize {
+    if data.is_null() {
+        return current_limit;
+    }
+    // SAFETY: see the function's safety contract.
+    let tracker = unsafe { &*(data as *const EnvHeapCharge) };
+    let grant = crate::native_frame::synchronous(|_| {
+        let step = DEFAULT_HEAP_GROW_STEP;
+        match tracker.budget.try_charge(Pool::V8HeapReserved, step) {
+            Ok(()) => {
+                // Publish the owned grant before any later callback/metadata
+                // query. Provider retirement releases this exact amount.
+                tracker.granted.fetch_add(step, Ordering::AcqRel);
+                current_limit.saturating_add(step as usize)
+            }
+            Err(_) => {
+                tracker.host_stopped.store(true, Ordering::Release);
+                unsafe {
+                    crate::snapi::snapi_bridge_native_fail_current();
+                }
+                unwind_heap_slack(tracker, current_limit)
+            }
+        }
+    });
+    grant.unwrap_or_else(|| {
+        tracker.host_stopped.store(true, Ordering::Release);
+        // A panic/retirement failure was already recorded and requested the
+        // narrow physical termination leaf inside the synchronous wrapper.
+        unwind_heap_slack(tracker, current_limit)
+    })
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+fn unwind_heap_slack(tracker: &EnvHeapCharge, current_limit: usize) -> usize {
+    if tracker.unwind_slack_available.swap(false, Ordering::AcqRel) {
+        current_limit.saturating_add(DEFAULT_UNWIND_SLACK as usize)
+    } else {
+        current_limit
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn napi_host_near_heap_limit_grant(
     data: *const c_void,
@@ -590,6 +691,18 @@ struct MemoryCharge {
     budget: Arc<ResourceBudget>,
     /// Bytes currently charged for this allocation.
     bytes: AtomicU64,
+    // One real allocation mutation at a time, shared across wrapped clones.
+    mutating: AtomicBool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct MemoryMutation<'a>(&'a AtomicBool);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for MemoryMutation<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -599,7 +712,17 @@ impl MemoryCharge {
         Ok(Arc::new(Self {
             budget,
             bytes: AtomicU64::new(bytes),
+            mutating: AtomicBool::new(false),
         }))
+    }
+
+    fn begin_mutation(&self) -> Result<MemoryMutation<'_>, MemoryError> {
+        self.mutating
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| {
+                MemoryError::Generic("a shared memory mutation is already active".into())
+            })?;
+        Ok(MemoryMutation(&self.mutating))
     }
 }
 
@@ -651,6 +774,47 @@ fn over_budget_to_memory_error(err: OverBudget) -> MemoryError {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl LinearMemory for BudgetedMemory {
+    fn host_memory_access(&self) -> Result<wasmer::sys::HostMemoryAccess, MemoryError> {
+        let mut access = self.inner.host_memory_access()?;
+        if access.retain_owner(self.charge.clone()).is_err() {
+            return Err(MemoryError::Generic(
+                "native access already has an accounting owner".into(),
+            ));
+        }
+        if access
+            .set_accounting_identity(self.budget().accounting_identity())
+            .is_err()
+        {
+            return Err(MemoryError::Generic(
+                "native access already identifies a funding source".into(),
+            ));
+        }
+        Ok(access)
+    }
+
+    fn retain_host_allocation(&self) -> Result<wasmer::sys::HostMemoryAllocation, MemoryError> {
+        let mut allocation = self.inner.retain_host_allocation()?;
+        if allocation.retain_owner(self.charge.clone()).is_err() {
+            return Err(MemoryError::Generic(
+                "allocation already has an accounting owner".into(),
+            ));
+        }
+        Ok(allocation)
+    }
+
+    fn pin_host_range(
+        &self,
+        range: std::ops::Range<u64>,
+    ) -> Result<wasmer::sys::HostMemoryPin, MemoryError> {
+        let mut pin = self.inner.pin_host_range(range)?;
+        if pin.retain_owner(self.charge.clone()).is_err() {
+            return Err(MemoryError::Generic(
+                "host range already has an accounting owner".into(),
+            ));
+        }
+        Ok(pin)
+    }
+
     fn ty(&self) -> MemoryType {
         self.inner.ty()
     }
@@ -663,36 +827,52 @@ impl LinearMemory for BudgetedMemory {
         self.inner.style()
     }
 
-    fn grow(&mut self, delta: Pages) -> Result<Pages, MemoryError> {
-        let delta_bytes = pages_to_bytes(delta);
-        // Reserve first: a denied charge must look exactly like hitting the
-        // memory's maximum, so the guest's `memory.grow` returns -1.
-        self.budget()
-            .try_charge(Pool::WasmLinear, delta_bytes)
-            .map_err(|_| MemoryError::CouldNotGrow {
-                current: self.inner.size(),
-                attempted_delta: delta,
-            })?;
+    fn begin_host_mapping_change(
+        &self,
+        range: std::ops::Range<u64>,
+    ) -> Result<wasmer::sys::HostMemoryMappingChange, MemoryError> {
+        self.inner.begin_host_mapping_change(range)
+    }
 
-        match self.inner.grow(delta) {
-            Ok(previous) => {
-                self.charge.bytes.fetch_add(delta_bytes, Ordering::AcqRel);
-                Ok(previous)
+    fn grow(&mut self, delta: Pages) -> Result<Pages, MemoryError> {
+        wasmer::sys::with_memory_grow_callback(|| {
+            if delta == Pages(0) {
+                return self.inner.grow(delta);
             }
-            Err(err) => {
-                // The real grow failed (e.g. hit its own maximum); give the
-                // reservation back so it does not leak against the budget.
-                self.budget().uncharge(Pool::WasmLinear, delta_bytes);
-                Err(err)
+            let _mutation = self.charge.begin_mutation()?;
+            let delta_bytes = pages_to_bytes(delta);
+            // Reserve first: a denied charge must look exactly like hitting the
+            // memory's maximum, so the guest's `memory.grow` returns -1.
+            self.budget()
+                .try_charge(Pool::WasmLinear, delta_bytes)
+                .map_err(|_| MemoryError::CouldNotGrow {
+                    current: self.inner.size(),
+                    attempted_delta: delta,
+                })?;
+
+            match self.inner.grow(delta) {
+                Ok(previous) => {
+                    self.charge.bytes.fetch_add(delta_bytes, Ordering::AcqRel);
+                    Ok(previous)
+                }
+                Err(err) => {
+                    // The real grow failed (e.g. hit its own maximum); give the
+                    // reservation back so it does not leak against the budget.
+                    self.budget().uncharge(Pool::WasmLinear, delta_bytes);
+                    Err(err)
+                }
             }
-        }
+        })
     }
 
     fn grow_at_least(&mut self, min_size: u64) -> Result<(), MemoryError> {
+        // Reject a competing mutation before any backend size/mapping lock.
+        let _mutation = self.charge.begin_mutation()?;
         let before = pages_to_bytes(self.inner.size());
         if min_size <= before {
-            // Already big enough; the inner call is a no-op that cannot grow.
-            return self.inner.grow_at_least(min_size);
+            // Linearize this no-op at the observed size. Delegating after a
+            // competing reset could otherwise perform uncharged actual growth.
+            return Ok(());
         }
 
         // Reserve an upper bound (page-rounded target minus current) up front,
@@ -723,6 +903,7 @@ impl LinearMemory for BudgetedMemory {
     }
 
     fn reset(&mut self) -> Result<(), MemoryError> {
+        let _mutation = self.charge.begin_mutation()?;
         self.inner.reset()?;
         // reset only ever shrinks; release the freed bytes.
         let after = pages_to_bytes(self.inner.size());
@@ -870,7 +1051,7 @@ impl<T: Tunables> Tunables for BudgetedTunables<T> {
         &self,
         ty: &MemoryType,
         style: &MemoryStyle,
-        vm_definition_location: std::ptr::NonNull<VMMemoryDefinition>,
+        vm_definition_location: wasmer::sys::vm::VMDefinitionLocation<VMMemoryDefinition>,
     ) -> Result<VMMemory, MemoryError> {
         let adjusted = self.adjust_memory(ty);
         self.validate_memory(&adjusted)?;
@@ -890,7 +1071,7 @@ impl<T: Tunables> Tunables for BudgetedTunables<T> {
         &self,
         ty: &TableType,
         style: &TableStyle,
-        vm_definition_location: std::ptr::NonNull<VMTableDefinition>,
+        vm_definition_location: wasmer::sys::vm::VMDefinitionLocation<VMTableDefinition>,
     ) -> Result<VMTable, String> {
         // SAFETY: contract forwarded to base.
         unsafe { self.base.create_vm_table(ty, style, vm_definition_location) }
@@ -917,6 +1098,224 @@ mod tests {
         let tunables = budgeted_tunables(budget);
         engine.set_tunables(tunables);
         Store::new(engine)
+    }
+
+    #[test]
+    fn detached_shared_memory_preserves_growth_and_copy_accounting() {
+        let budget = ResourceBudget::with_memory_limit(8 * PAGE);
+        let shared = {
+            let mut store = budgeted_store(budget.clone());
+            let memory = Memory::new(&mut store, MemoryType::new(2, Some(8), true)).unwrap();
+            let shared = memory.as_shared(&store).unwrap();
+            assert_eq!(budget.memory_charged(), 2 * PAGE);
+            shared
+        };
+        assert_eq!(
+            budget.memory_charged(),
+            2 * PAGE,
+            "detached bytes remain charged"
+        );
+        let sibling = shared.clone();
+        let mut store = Store::default();
+        let memory = shared.try_attach(&mut store).unwrap();
+        memory.grow(&mut store, Pages(2)).unwrap();
+        assert_eq!(
+            budget.memory_charged(),
+            4 * PAGE,
+            "reattachment keeps wrapped growth"
+        );
+        let copied = memory.copy(&store).unwrap();
+        assert_eq!(
+            budget.memory_charged(),
+            8 * PAGE,
+            "physical copies have their own charge"
+        );
+        assert!(memory.grow(&mut store, Pages(1)).is_err());
+        assert_eq!(budget.memory_charged(), 8 * PAGE);
+        drop(copied);
+        assert_eq!(budget.memory_charged(), 4 * PAGE);
+        memory.grow(&mut store, Pages(1)).unwrap();
+        assert_eq!(budget.memory_charged(), 5 * PAGE);
+        drop(store);
+        assert_eq!(
+            budget.memory_charged(),
+            5 * PAGE,
+            "the detached sibling owns the same allocation"
+        );
+        drop(sibling);
+        assert_eq!(budget.memory_charged(), 0);
+    }
+
+    #[test]
+    fn native_access_identifies_the_actual_shared_funding_source() {
+        struct Accountant(AtomicU64);
+        impl NapiMemoryAccountant for Accountant {
+            fn memory_limit(&self) -> u64 {
+                u64::MAX
+            }
+            fn memory_charged(&self) -> u64 {
+                self.0.load(Ordering::SeqCst)
+            }
+            fn try_charge(&self, bytes: u64) -> bool {
+                self.0.fetch_add(bytes, Ordering::SeqCst);
+                true
+            }
+            fn uncharge(&self, bytes: u64) {
+                self.0.fetch_sub(bytes, Ordering::SeqCst);
+            }
+        }
+        let standalone = ResourceBudget::unlimited();
+        let other = ResourceBudget::unlimited();
+        let mut store = budgeted_store(standalone.clone());
+        let memory = Memory::new(&mut store, MemoryType::new(2, Some(4), false)).unwrap();
+        let access = memory.host_memory_access(&store).unwrap();
+        assert!(access.is_accounted_by(&standalone.accounting_identity()));
+        assert!(!access.is_accounted_by(&other.accounting_identity()));
+        let accountant = Arc::new(Accountant(AtomicU64::new(0)));
+        let a = ResourceBudget::with_accountant(accountant.clone());
+        let b = ResourceBudget::with_accountant(accountant.clone());
+        let unrelated = ResourceBudget::with_accountant(Arc::new(Accountant(AtomicU64::new(0))));
+        let mut store = budgeted_store(a.clone());
+        let memory = Memory::new(&mut store, MemoryType::new(2, Some(4), true)).unwrap();
+        let access = memory.host_memory_access(&store).unwrap();
+        assert!(access.is_accounted_by(&a.accounting_identity()));
+        assert!(access.is_accounted_by(&b.accounting_identity()));
+        assert!(!access.is_accounted_by(&unrelated.accounting_identity()));
+        assert!(!access.is_accounted_by(&standalone.accounting_identity()));
+        let mut unmetered = Store::default();
+        let memory = Memory::new(&mut unmetered, MemoryType::new(2, Some(4), false)).unwrap();
+        assert!(
+            !memory
+                .host_memory_access(&unmetered)
+                .unwrap()
+                .is_accounted_by(&a.accounting_identity())
+        );
+    }
+
+    #[test]
+    fn detached_native_access_and_derived_pins_retain_exact_allocation_charges() {
+        use std::sync::atomic::AtomicUsize;
+        struct ObserveStore(Arc<AtomicUsize>);
+        impl Drop for ObserveStore {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        for shared in [false, true] {
+            let budget = ResourceBudget::with_memory_limit(8 * PAGE);
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let access = {
+                let mut store = budgeted_store(budget.clone());
+                let _env = wasmer::FunctionEnv::new(&mut store, ObserveStore(dropped.clone()));
+                let memory = Memory::new(&mut store, MemoryType::new(2, Some(4), shared)).unwrap();
+                let access = memory.host_memory_access(&store).unwrap();
+                memory.grow(&mut store, 1).unwrap();
+                assert_eq!(access.host_data().unwrap().1, 3 * PAGE);
+                assert!(memory.reset(&mut store).is_err());
+                assert_eq!(budget.memory_charged(), 3 * PAGE);
+                access
+            };
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            assert_eq!(budget.memory_charged(), 3 * PAGE);
+            let pin = access.pin_host_range(PAGE..2 * PAGE).unwrap();
+            drop(access);
+            assert_eq!(budget.memory_charged(), 3 * PAGE);
+            // SAFETY: the originating Store is gone; the pin owns the exact bytes.
+            unsafe {
+                pin.as_ptr().write(42);
+                assert_eq!(pin.as_ptr().read(), 42);
+            }
+            drop(pin);
+            assert_eq!(budget.memory_charged(), 0);
+        }
+    }
+
+    #[test]
+    fn detached_native_copy_charges_and_reset_are_independent() {
+        for shared in [false, true] {
+            let budget = ResourceBudget::with_memory_limit(8 * PAGE);
+            let raw =
+                VMMemory::new(&MemoryType::new(2, Some(4), shared), &MemoryStyle::Static).unwrap();
+            let mut memory = BudgetedMemory::new(raw, budget.clone()).unwrap();
+            let access = memory.host_memory_access().unwrap();
+            let mut copy = memory.copy().unwrap();
+            let copied = copy.host_memory_access().unwrap();
+            assert_ne!(access.host_data().unwrap().0, copied.host_data().unwrap().0);
+            assert_eq!(budget.memory_charged(), 4 * PAGE);
+            copy.grow(Pages(1)).unwrap();
+            assert_eq!(budget.memory_charged(), 5 * PAGE);
+            assert_eq!(access.host_data().unwrap().1, 2 * PAGE);
+            assert_eq!(copied.host_data().unwrap().1, 3 * PAGE);
+            assert!(copy.reset().is_err());
+            assert_eq!(budget.memory_charged(), 5 * PAGE);
+            drop(access);
+            memory.reset().unwrap();
+            assert_eq!(budget.memory_charged(), 3 * PAGE);
+            drop(memory);
+            drop(copy);
+            assert_eq!(budget.memory_charged(), 3 * PAGE);
+            drop(copied);
+            assert_eq!(budget.memory_charged(), 0);
+        }
+    }
+
+    #[test]
+    fn a_native_pin_retains_its_memory_charge_after_store_and_shared_handles_drop() {
+        use std::sync::atomic::AtomicUsize;
+        struct ObserveStore(Arc<AtomicUsize>);
+        impl Drop for ObserveStore {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let budget = ResourceBudget::with_memory_limit(4 * PAGE);
+        let stores = Arc::new(AtomicUsize::new(0));
+        let pin = {
+            let mut store = budgeted_store(budget.clone());
+            let _env = wasmer::FunctionEnv::new(&mut store, ObserveStore(stores.clone()));
+            let memory = Memory::new(&mut store, MemoryType::new(2, Some(4), true)).unwrap();
+            let shared = memory.as_shared(&store).unwrap();
+            shared.pin_host_range(PAGE..2 * PAGE).unwrap()
+        };
+        assert_eq!(
+            stores.load(Ordering::SeqCst),
+            1,
+            "the pin must not retain its Store"
+        );
+        assert_eq!(
+            budget.memory_charged(),
+            2 * PAGE,
+            "physical bytes are still owned"
+        );
+        // SAFETY: the exact pin alone retains these anonymous writable bytes.
+        unsafe {
+            pin.as_ptr().write(42);
+            assert_eq!(pin.as_ptr().read(), 42);
+        }
+        drop(pin);
+        assert_eq!(budget.memory_charged(), 0);
+    }
+
+    #[test]
+    fn budgeted_memory_forwards_mapping_change_exclusion() {
+        let budget = ResourceBudget::with_memory_limit(4 * PAGE);
+        let mut store = budgeted_store(budget.clone());
+        let memory = Memory::new(&mut store, MemoryType::new(2, Some(4), true)).unwrap();
+        let mapping = memory
+            .begin_host_mapping_change(&store, PAGE..2 * PAGE)
+            .unwrap();
+        assert!(mapping.was_private());
+        let shared = memory.as_shared(&store).unwrap();
+        assert!(shared.pin_host_range(PAGE..2 * PAGE).is_err());
+        drop(mapping);
+        assert!(
+            shared.pin_host_range(PAGE..2 * PAGE).is_err(),
+            "unfinished mapping stays unknown"
+        );
+        assert_eq!(budget.memory_charged(), 2 * PAGE);
+        drop(shared);
+        drop(store);
+        assert_eq!(budget.memory_charged(), 0);
     }
 
     #[test]
@@ -974,11 +1373,8 @@ mod tests {
         assert_eq!(budget.memory_charged(), PAGE, "minimum charged up front");
 
         let mut pages = 1u32;
-        loop {
-            match memory.grow(&mut store, Pages(1)) {
-                Ok(_) => pages += 1,
-                Err(_) => break,
-            }
+        while memory.grow(&mut store, Pages(1)).is_ok() {
+            pages += 1;
             assert!(pages <= 100, "grow was never capped");
         }
 
@@ -1317,5 +1713,691 @@ mod external_accountant_tests {
         budget.uncharge(Pool::V8HeapReserved, 60);
         assert_eq!(accountant.memory_charged(), 40);
         assert_eq!(budget.snapshot().v8_heap_reserved, 0);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod isolate_slot_panic_tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    // Match external_accountant_tests. Each mode panics before an admission
+    // side effect. Provider disposal ordering is a separate invariant.
+    struct PanickingAccountant {
+        operation: AtomicUsize,
+        charged: AtomicU64,
+    }
+    impl NapiMemoryAccountant for PanickingAccountant {
+        fn memory_limit(&self) -> u64 {
+            assert_ne!(
+                self.operation.load(Ordering::SeqCst),
+                1,
+                "memory limit panic"
+            );
+            512 * MIB
+        }
+        fn memory_charged(&self) -> u64 {
+            assert_ne!(
+                self.operation.load(Ordering::SeqCst),
+                2,
+                "memory charged panic"
+            );
+            self.charged.load(Ordering::SeqCst)
+        }
+        fn try_charge(&self, bytes: u64) -> bool {
+            assert_ne!(self.operation.load(Ordering::SeqCst), 3, "charge panic");
+            self.charged.fetch_add(bytes, Ordering::SeqCst);
+            true
+        }
+        fn uncharge(&self, bytes: u64) {
+            self.charged.fetch_sub(bytes, Ordering::SeqCst);
+            assert_ne!(self.operation.load(Ordering::SeqCst), 4, "uncharge panic");
+        }
+    }
+
+    #[test]
+    fn accountant_panics_do_not_strand_isolate_slots() {
+        let accountant = Arc::new(PanickingAccountant {
+            operation: AtomicUsize::new(0),
+            charged: AtomicU64::new(0),
+        });
+        let budget = ResourceBudget::with_accountant(accountant.clone());
+        for operation in [1, 2, 3] {
+            accountant.operation.store(operation, Ordering::SeqCst);
+            assert!(
+                catch_unwind(AssertUnwindSafe(
+                    || budget.try_reserve_env(RequestedHeap::default(), Some(1))
+                ))
+                .is_err()
+            );
+            accountant.operation.store(0, Ordering::SeqCst);
+            assert_eq!(
+                budget.live_isolates(),
+                0,
+                "failed planning/charge releases its slot"
+            );
+            assert_eq!(budget.snapshot().v8_heap_reserved, 0);
+            let next = budget
+                .try_reserve_env(RequestedHeap::default(), Some(1))
+                .unwrap();
+            budget.release_env(next.ceiling_bytes);
+        }
+        // This unit owns only a reservation, not a provider. Native lifecycle
+        // tests independently require CPP disposal before this release.
+        let reservation = budget
+            .try_reserve_env(RequestedHeap::default(), Some(1))
+            .unwrap();
+        accountant.operation.store(4, Ordering::SeqCst);
+        assert!(
+            catch_unwind(AssertUnwindSafe(
+                || budget.release_env(reservation.ceiling_bytes)
+            ))
+            .is_err()
+        );
+        accountant.operation.store(0, Ordering::SeqCst);
+        assert_eq!(budget.live_isolates(), 0);
+        assert_eq!(budget.snapshot().v8_heap_reserved, 0);
+        let fresh = budget
+            .try_reserve_env(RequestedHeap::default(), Some(1))
+            .unwrap();
+        budget.release_env(fresh.ceiling_bytes);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod shared_memory_mutation_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    // Match external_accountant_tests: take the callback out of TLS before
+    // invoking it; the accountant itself remains Send + Sync and scalar-only.
+    thread_local! {
+        static ON_CHARGE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    struct Accountant(AtomicU64);
+    impl NapiMemoryAccountant for Accountant {
+        fn memory_limit(&self) -> u64 {
+            8 * WASM_PAGE_SIZE as u64
+        }
+        fn memory_charged(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+        fn try_charge(&self, bytes: u64) -> bool {
+            let callback = ON_CHARGE.with(|slot| slot.borrow_mut().take());
+            if let Some(callback) = callback {
+                callback();
+            }
+            self.0.fetch_add(bytes, Ordering::SeqCst);
+            true
+        }
+        fn uncharge(&self, bytes: u64) {
+            self.0.fetch_sub(bytes, Ordering::SeqCst);
+        }
+    }
+
+    fn shared_memory(budget: Arc<ResourceBudget>) -> BudgetedMemory {
+        let base = BaseTunables::new();
+        let ty = MemoryType::new(1, Some(8), true);
+        let inner = base
+            .create_host_memory(&ty, &base.memory_style(&ty))
+            .unwrap();
+        BudgetedMemory::new(inner, budget).unwrap()
+    }
+
+    #[test]
+    fn reentrant_shared_mutation_preserves_exact_physical_charge() {
+        let page = WASM_PAGE_SIZE as u64;
+        for reset in [false, true] {
+            let accountant = Arc::new(Accountant(AtomicU64::new(0)));
+            let budget = ResourceBudget::with_accountant(accountant.clone());
+            let mut memory = shared_memory(budget.clone());
+            let sibling = Rc::new(RefCell::new(memory.try_clone().unwrap()));
+            let nested = sibling.clone();
+            let denied = Arc::new(AtomicBool::new(false));
+            let observed = denied.clone();
+            ON_CHARGE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let result = if reset {
+                        nested.borrow_mut().reset()
+                    } else {
+                        nested.borrow_mut().grow_at_least(3 * page)
+                    };
+                    observed.store(result.is_err(), Ordering::SeqCst);
+                }));
+            });
+            memory.grow_at_least(2 * page).unwrap();
+            let physical = pages_to_bytes(memory.size());
+            let recorded = memory.charge.bytes.load(Ordering::SeqCst);
+            let pool = budget.snapshot().wasm_linear;
+            // Dispose every real memory owner BEFORE the discriminators. The
+            // old code over-records after nested grow (underflow on last Drop),
+            // or undercharges physical pages after nested reset.
+            drop(sibling);
+            drop(memory);
+            assert_eq!(
+                budget.snapshot().wasm_linear,
+                0,
+                "last physical owner must release exactly the pool's charge"
+            );
+            assert_eq!(accountant.memory_charged(), 0);
+            assert_eq!(
+                pool, physical,
+                "the pool must match physical resident pages"
+            );
+            assert_eq!(
+                recorded, physical,
+                "last-owner charge must match physical pages"
+            );
+            assert!(denied.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn shared_mutation_token_is_released_after_accountant_panic() {
+        let page = WASM_PAGE_SIZE as u64;
+        let accountant = Arc::new(Accountant(AtomicU64::new(0)));
+        let budget = ResourceBudget::with_accountant(accountant.clone());
+        let mut memory = shared_memory(budget.clone());
+        let marker = Arc::new(());
+        let payload = marker.clone();
+        ON_CHARGE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || std::panic::panic_any(payload)))
+        });
+        let panic =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| memory.grow(Pages(1))))
+                .unwrap_err();
+        assert!(Arc::ptr_eq(
+            panic.downcast_ref::<Arc<()>>().unwrap(),
+            &marker
+        ));
+        assert_eq!(memory.grow(Pages(0)).unwrap(), Pages(1));
+        assert_eq!(memory.grow(Pages(1)).unwrap(), Pages(1));
+        memory.grow_at_least(2 * page).unwrap();
+        assert_eq!(budget.snapshot().wasm_linear, 2 * page);
+        memory.reset().unwrap();
+        assert_eq!(memory.size(), Pages(0));
+        assert_eq!(budget.snapshot().wasm_linear, 0);
+        memory.grow_at_least(page).unwrap();
+        assert_eq!(budget.snapshot().wasm_linear, page);
+        drop(memory);
+        assert_eq!(budget.snapshot().wasm_linear, 0);
+        assert_eq!(accountant.memory_charged(), 0);
+    }
+
+    #[test]
+    fn shared_worker_mutations_wait_for_no_callback_or_mapping_lock() {
+        let page = WASM_PAGE_SIZE as u64;
+        let accountant = Arc::new(Accountant(AtomicU64::new(0)));
+        let budget = ResourceBudget::with_accountant(accountant.clone());
+        let mut memory = shared_memory(budget.clone());
+        let mut sibling = memory.try_clone().unwrap();
+        let charge = memory.charge.clone();
+        let held = charge.begin_mutation().unwrap();
+        let worker = std::thread::spawn(move || {
+            let grow = sibling.grow(Pages(1)).is_err();
+            let at_least = sibling.grow_at_least(page).is_err();
+            let reset = sibling.reset().is_err();
+            let zero = sibling.grow(Pages(0)).unwrap();
+            (sibling, grow, at_least, reset, zero)
+        });
+        let (mut sibling, grow, at_least, reset, zero) = worker.join().unwrap();
+        assert!(grow && at_least && reset);
+        assert_eq!(zero, Pages(1));
+        drop(held);
+        drop(charge);
+        memory.grow(Pages(1)).unwrap();
+        sibling.grow_at_least(3 * page).unwrap();
+        assert_eq!(pages_to_bytes(memory.size()), 3 * page);
+        assert_eq!(budget.snapshot().wasm_linear, 3 * page);
+        drop(sibling);
+        drop(memory);
+        assert_eq!(budget.snapshot().wasm_linear, 0);
+        assert_eq!(accountant.memory_charged(), 0);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod memory_grow_callback_tests {
+    use super::*;
+    use std::{
+        cell::RefCell,
+        panic::{AssertUnwindSafe, catch_unwind, panic_any},
+        process::{Child, Command},
+        time::Instant,
+    };
+    use wasmer::sys::{Cranelift, EngineBuilder};
+    use wasmer::{AsStoreRef, Imports, Instance, Memory, Module, Store};
+
+    thread_local! {
+        static ON_CHARGE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+    struct Accountant(AtomicU64);
+    impl NapiMemoryAccountant for Accountant {
+        fn memory_limit(&self) -> u64 {
+            8 * WASM_PAGE_SIZE as u64
+        }
+        fn memory_charged(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+        fn try_charge(&self, bytes: u64) -> bool {
+            let callback = ON_CHARGE.with(|slot| slot.borrow_mut().take());
+            if let Some(callback) = callback {
+                callback();
+            }
+            self.0.fetch_add(bytes, Ordering::SeqCst);
+            true
+        }
+        fn uncharge(&self, bytes: u64) {
+            self.0.fetch_sub(bytes, Ordering::SeqCst);
+        }
+    }
+
+    // Production Phase1 wraps imported/host-created memory only. This sibling
+    // also wraps a defined memory to exercise the other VM libcall with the
+    // actual BudgetedMemory consumer, without changing production policy.
+    struct DefinedTunables {
+        host: BudgetedTunables<BaseTunables>,
+        budget: Arc<ResourceBudget>,
+    }
+    impl Tunables for DefinedTunables {
+        fn memory_style(&self, ty: &MemoryType) -> MemoryStyle {
+            self.host.memory_style(ty)
+        }
+        fn table_style(&self, ty: &TableType) -> TableStyle {
+            self.host.table_style(ty)
+        }
+        fn create_host_memory(
+            &self,
+            ty: &MemoryType,
+            style: &MemoryStyle,
+        ) -> Result<VMMemory, MemoryError> {
+            self.host.create_host_memory(ty, style)
+        }
+        unsafe fn create_vm_memory(
+            &self,
+            ty: &MemoryType,
+            style: &MemoryStyle,
+            location: wasmer::sys::vm::VMDefinitionLocation<VMMemoryDefinition>,
+        ) -> Result<VMMemory, MemoryError> {
+            // SAFETY: forward the exact initialization location and its owner.
+            let inner = unsafe { self.host.create_vm_memory(ty, style, location) }?;
+            Ok(VMMemory::from(
+                Box::new(BudgetedMemory::new(inner, self.budget.clone())?)
+                    as Box<dyn LinearMemory + Send + Sync>,
+            ))
+        }
+        fn create_host_table(&self, ty: &TableType, style: &TableStyle) -> Result<VMTable, String> {
+            self.host.create_host_table(ty, style)
+        }
+        unsafe fn create_vm_table(
+            &self,
+            ty: &TableType,
+            style: &TableStyle,
+            location: wasmer::sys::vm::VMDefinitionLocation<VMTableDefinition>,
+        ) -> Result<VMTable, String> {
+            // SAFETY: the caller's initialization contract is forwarded intact.
+            unsafe { self.host.create_vm_table(ty, style, location) }
+        }
+    }
+
+    fn setup(imported: bool) -> (Store, Instance, Arc<ResourceBudget>, Arc<Accountant>) {
+        let accountant = Arc::new(Accountant(AtomicU64::new(0)));
+        let budget = ResourceBudget::with_accountant(accountant.clone());
+        let mut engine = EngineBuilder::new(Cranelift::default()).engine();
+        engine.set_tunables(DefinedTunables {
+            host: budgeted_tunables(budget.clone()),
+            budget: budget.clone(),
+        });
+        let mut store = Store::new(engine);
+        let declaration = if imported {
+            "(import \"env\" \"memory\" (memory 1 3))"
+        } else {
+            "(memory 1 3)"
+        };
+        let module = Module::new(
+            &store,
+            format!(
+                r#"(module {declaration}
+                (export "memory" (memory 0))
+                (func (export "run") (result i32)
+                    i32.const 1 memory.grow drop
+                    i32.const 0 i32.const 1 i32.store
+                    i32.const 42)
+                (func (export "fresh") (result i32) i32.const 42))"#
+            ),
+        )
+        .unwrap();
+        let mut imports = Imports::new();
+        if imported {
+            let memory = Memory::new(&mut store, MemoryType::new(1, Some(3), false)).unwrap();
+            imports.define("env", "memory", memory);
+        }
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        assert_eq!(budget.snapshot().wasm_linear, WASM_PAGE_SIZE as u64);
+        (store, instance, budget, accountant)
+    }
+
+    fn continuation(instance: &Instance, store: &impl AsStoreRef) -> u32 {
+        let mut bytes = [0; 4];
+        instance
+            .exports
+            .get_memory("memory")
+            .unwrap()
+            .view(store)
+            .read(0, &mut bytes)
+            .unwrap();
+        u32::from_le_bytes(bytes)
+    }
+    fn ready_work() {
+        let mut other = Store::default();
+        let module = Module::new(
+            &other,
+            "(module (func (export \"run\") (result i32) i32.const 42))",
+        )
+        .unwrap();
+        let instance = Instance::new(&mut other, &module, &Imports::new()).unwrap();
+        assert_eq!(
+            instance
+                .exports
+                .get_typed_function::<(), i32>(&other, "run")
+                .unwrap()
+                .call(&mut other)
+                .unwrap(),
+            42
+        );
+    }
+    fn subprocess(name: &str) -> bool {
+        const CHILD: &str = "NAPI_MEMORY_GROW_CALLBACK_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        struct OwnedChild(Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = OwnedChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap(),
+        );
+        let started = Instant::now();
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "budgeted grow proof failed: {status}");
+                return false;
+            }
+            assert!(started.elapsed() < Duration::from_secs(30));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn builtin_budgeted_growth_allows_independent_ready_work() {
+        if !subprocess(
+            "budget::memory_grow_callback_tests::builtin_budgeted_growth_allows_independent_ready_work",
+        ) {
+            return;
+        }
+        for imported in [false, true] {
+            for typed in [false, true] {
+                let (mut store, instance, budget, accountant) = setup(imported);
+                let calls = Arc::new(AtomicUsize::new(0));
+                let observed = calls.clone();
+                ON_CHARGE.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        ready_work();
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    }))
+                });
+                let value = if typed {
+                    instance
+                        .exports
+                        .get_typed_function::<(), i32>(&store, "run")
+                        .unwrap()
+                        .call(&mut store)
+                        .unwrap()
+                } else {
+                    instance
+                        .exports
+                        .get_function("run")
+                        .unwrap()
+                        .call(&mut store, &[])
+                        .unwrap()[0]
+                        .i32()
+                        .unwrap()
+                };
+                assert_eq!(value, 42);
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(continuation(&instance, &store), 1);
+                assert_eq!(budget.snapshot().wasm_linear, 2 * WASM_PAGE_SIZE as u64);
+                drop(instance);
+                drop(store);
+                assert_eq!(budget.snapshot().wasm_linear, 0);
+                assert_eq!(accountant.memory_charged(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_budgeted_growth_preserves_accountant_panic_and_charge() {
+        if !subprocess(
+            "budget::memory_grow_callback_tests::builtin_budgeted_growth_preserves_accountant_panic_and_charge",
+        ) {
+            return;
+        }
+        for imported in [false, true] {
+            for typed in [false, true] {
+                let (mut store, instance, budget, accountant) = setup(imported);
+                let original = Arc::new(());
+                let payload = original.clone();
+                ON_CHARGE.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        ready_work();
+                        panic_any(payload);
+                    }))
+                });
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    if typed {
+                        instance
+                            .exports
+                            .get_typed_function::<(), i32>(&store, "run")
+                            .unwrap()
+                            .call(&mut store)
+                            .unwrap();
+                    } else {
+                        instance
+                            .exports
+                            .get_function("run")
+                            .unwrap()
+                            .call(&mut store, &[])
+                            .unwrap();
+                    }
+                }));
+                let panic = outcome.unwrap_err();
+                assert!(Arc::ptr_eq(
+                    panic.downcast_ref::<Arc<()>>().unwrap(),
+                    &original
+                ));
+                assert_eq!(continuation(&instance, &store), 0);
+                assert_eq!(budget.snapshot().wasm_linear, WASM_PAGE_SIZE as u64);
+                // The mutation token must have been released during transport.
+                instance
+                    .exports
+                    .get_function("run")
+                    .unwrap()
+                    .call(&mut store, &[])
+                    .unwrap();
+                assert_eq!(continuation(&instance, &store), 1);
+                assert_eq!(budget.snapshot().wasm_linear, 2 * WASM_PAGE_SIZE as u64);
+                drop(instance);
+                drop(store);
+                assert_eq!(budget.snapshot().wasm_linear, 0);
+                assert_eq!(accountant.memory_charged(), 0);
+            }
+        }
+    }
+
+    #[cfg(feature = "experimental-async")]
+    #[test]
+    fn retired_builtin_budgeted_growth_stops_before_guest_store() {
+        if !subprocess(
+            "budget::memory_grow_callback_tests::retired_builtin_budgeted_growth_stops_before_guest_store",
+        ) {
+            return;
+        }
+        use std::{
+            future::Future,
+            rc::Rc,
+            task::{Context, Poll, Waker},
+        };
+        use wasmer::{
+            AsStoreAsync, AsStoreMut,
+            sys::{NativeInvocationScope, WeakNativeInvocation},
+        };
+        for imported in [false, true] {
+            let (mut store, instance, budget, accountant) = setup(imported);
+            let scope = Rc::new(RefCell::new(
+                NativeInvocationScope::bind(&mut store).unwrap(),
+            ));
+            let root_scope = scope.clone();
+            let expected = Rc::new(RefCell::new(None));
+            let expected_abort = expected.clone();
+            ON_CHARGE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    ready_work();
+                    let root = WeakNativeInvocation::current().unwrap();
+                    root_scope.borrow().close();
+                    *expected_abort.borrow_mut() = root.retirement_error();
+                }))
+            });
+            let function = instance.exports.get_function("run").unwrap().clone();
+            let fresh = instance.exports.get_function("fresh").unwrap().clone();
+            let store = store.into_async();
+            let mut call = Box::pin(function.call_async(&store, vec![]));
+            let outcome = call.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+            drop(call);
+            let Poll::Ready(Err(error)) = outcome else {
+                panic!("retired grow did not abort")
+            };
+            let expected = expected.borrow_mut().take().unwrap();
+            assert!(error.is_host_abort());
+            assert!(std::ptr::eq(
+                error.downcast_ref::<std::io::Error>().unwrap(),
+                expected.downcast_ref::<std::io::Error>().unwrap()
+            ));
+            let continued = {
+                let guard = store.store().write();
+                continuation(&instance, &guard)
+            };
+            let settled = {
+                let mut scope = scope.borrow_mut();
+                let mut wait = Box::pin(scope.close_and_wait());
+                wait.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            };
+            assert!(matches!(settled, Poll::Ready(Ok(()))));
+            let (next_scope, next_store) = {
+                let mut guard = store.store().write();
+                scope
+                    .borrow()
+                    .successor(&store, &mut guard.as_store_mut())
+                    .unwrap()
+            };
+            let mut next = Box::pin(fresh.call_async(&next_store, vec![]));
+            assert!(
+                matches!(next.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(Ok(ref values)) if values[0].i32() == Some(42))
+            );
+            drop(next);
+            drop(next_scope);
+            drop(next_store);
+            drop(scope);
+            drop(instance);
+            drop(store);
+            assert_eq!(budget.snapshot().wasm_linear, 0);
+            assert_eq!(accountant.memory_charged(), 0);
+            assert_eq!(continued, 0, "guest continued after retired memory.grow");
+        }
+    }
+
+    #[test]
+    fn last_accountant_drop_preserves_prior_uncharge_or_query_panic() {
+        if !subprocess(
+            "budget::memory_grow_callback_tests::last_accountant_drop_preserves_prior_uncharge_or_query_panic",
+        ) {
+            return;
+        }
+        struct LastAccountant {
+            charged: Arc<AtomicU64>,
+            drops: Arc<AtomicUsize>,
+            first: Arc<()>,
+            second: Arc<()>,
+            mode: u8,
+        }
+        impl NapiMemoryAccountant for LastAccountant {
+            fn memory_limit(&self) -> u64 {
+                if self.mode == 1 {
+                    panic_any(self.first.clone());
+                }
+                u64::MAX
+            }
+            fn memory_charged(&self) -> u64 {
+                self.charged.load(Ordering::SeqCst)
+            }
+            fn try_charge(&self, bytes: u64) -> bool {
+                self.charged.fetch_add(bytes, Ordering::SeqCst);
+                true
+            }
+            fn uncharge(&self, bytes: u64) {
+                self.charged.fetch_sub(bytes, Ordering::SeqCst);
+                if self.mode == 0 {
+                    panic_any(self.first.clone());
+                }
+            }
+        }
+        impl Drop for LastAccountant {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                panic_any(self.second.clone());
+            }
+        }
+        for mode in 0..3 {
+            let first = Arc::new(());
+            let second = Arc::new(());
+            let charged = Arc::new(AtomicU64::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let accountant = Arc::new(LastAccountant {
+                charged: charged.clone(),
+                drops: drops.clone(),
+                first: first.clone(),
+                second: second.clone(),
+                mode,
+            });
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                // Move the SOLE accountant Arc into its actual budget owner.
+                let budget = ResourceBudget::with_accountant(accountant);
+                let base = BaseTunables::new();
+                let ty = MemoryType::new(1, Some(2), true);
+                let inner = base
+                    .create_host_memory(&ty, &base.memory_style(&ty))
+                    .unwrap();
+                // The real physical memory/last MemoryCharge owns the budget;
+                // all bytes/counters settle before we inspect either payload.
+                let memory = BudgetedMemory::new(inner, budget).unwrap();
+                drop(memory);
+            }));
+            let expected = if mode == 2 { &second } else { &first };
+            assert_eq!(charged.load(Ordering::SeqCst), 0);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert!(Arc::ptr_eq(
+                outcome.unwrap_err().downcast_ref::<Arc<()>>().unwrap(),
+                expected
+            ));
+        }
     }
 }

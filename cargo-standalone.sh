@@ -9,7 +9,7 @@ vendored_manifest="$repo_root/Cargo.toml"
 standalone_manifest="$repo_root/Cargo.standalone.toml"
 
 need_standalone=0
-for dep in api cache compiler-llvm types wasix virtual-fs; do
+for dep in cache wasix/api wasix/exec wasix/dylink c-api-imports; do
   if [[ ! -f "$repo_root/../$dep/Cargo.toml" ]]; then
     need_standalone=1
     break
@@ -48,6 +48,9 @@ fi
 if [[ $use_standalone -eq 0 ]]; then
   exec "${cargo_cmd[@]}" "$subcommand" --manifest-path "$vendored_manifest" "$@"
 fi
+
+# Match the workspace's private-git credential-helper path outside its config tree.
+export CARGO_NET_GIT_FETCH_WITH_CLI="${CARGO_NET_GIT_FETCH_WITH_CLI:-true}"
 
 standalone_parent="$(dirname "$repo_root")"
 if [[ -w "$standalone_parent" ]]; then

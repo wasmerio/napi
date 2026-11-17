@@ -51,12 +51,23 @@ pub struct SnapiUnofficialHeapCodeStatistics {
 }
 
 unsafe extern "C" {
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_v8_allocator_active() -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_native_heap_refill_allowed() -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_native_current_holder() -> *mut c_void;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_native_retirement_holder() -> *mut c_void;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_native_fail_current();
     pub fn snapi_bridge_init() -> i32;
     pub fn snapi_bridge_set_v8_worker_thread_count(count: u32) -> i32;
     pub fn snapi_bridge_unofficial_configure_runtime(
         engine_flags: *const i8,
         engine_flags_length: u32,
     ) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_unofficial_create_env(
         module_api_version: i32,
         guest_heap_ctx: *const core::ffi::c_void,
@@ -73,7 +84,30 @@ unsafe extern "C" {
         guest_heap_ctx: *const core::ffi::c_void,
         env_out: *mut SnapiEnv,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_prepare_created_env(
+        state: SnapiEnv,
+        tracker: *const core::ffi::c_void,
+        value_limit: u64,
+    ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_publish_created_env(state: SnapiEnv);
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_begin_retirement(states: *const SnapiEnv, count: usize) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_finish_retirement(
+        state: SnapiEnv,
+        cleanup: i32,
+        before_destroy: unsafe extern "C" fn(*mut core::ffi::c_void),
+        data: *mut core::ffi::c_void,
+    ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_destroy_retired_state(state: SnapiEnv);
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
+    pub fn snapi_bridge_unofficial_can_release_env(env: SnapiEnv) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_unofficial_release_env_with_loop(env: SnapiEnv, loop_id: u32) -> i32;
     pub fn snapi_bridge_unofficial_collect_garbage(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_event_loop_checkpoint(
@@ -82,14 +116,18 @@ unsafe extern "C" {
         has_runnable_work: i32,
         checkpoint_state: *mut u32,
     ) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_drain_pending_callbacks(env: SnapiEnv) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_drain_all_guest_finalizers(env: SnapiEnv) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_register_guest_buffer_finalizer(
         env: SnapiEnv,
         value_id: u32,
         guest_ptr: u32,
         recyclable: i32,
     ) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_take_ready_guest_buffer_finalizer(
         env: SnapiEnv,
         force: i32,
@@ -115,17 +153,6 @@ unsafe extern "C" {
         after_callback_id: u32,
         resolve_callback_id: u32,
     ) -> i32;
-    /// Register a host-owned near-heap-limit callback that charges V8 heap
-    /// growth against the resource budget. `data` is an
-    /// `*const crate::budget::EnvHeapCharge` passed opaquely to the callback.
-    pub fn snapi_bridge_unofficial_set_host_near_heap_limit_callback(
-        env: SnapiEnv,
-        data: *const c_void,
-    ) -> i32;
-    /// Cap the number of live per-value host handles (and callback
-    /// registrations) this env may hold, bounding host-side bookkeeping RSS.
-    /// `limit == 0` means unlimited.
-    pub fn snapi_bridge_unofficial_set_value_limit(env: SnapiEnv, limit: u64) -> i32;
     pub fn snapi_bridge_unofficial_get_promise_details(
         env: SnapiEnv,
         promise_id: u32,
@@ -246,6 +273,7 @@ unsafe extern "C" {
         expose_numeric_values: i32,
         json_out: *mut u32,
     ) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_free_buffer(data: *mut c_void);
     pub fn snapi_bridge_unofficial_structured_clone(
         env: SnapiEnv,
@@ -630,6 +658,7 @@ unsafe extern "C" {
         byte_length: u32,
         out_id: *mut u32,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_create_external_arraybuffer(
         env: SnapiEnv,
         data_addr: u64,
@@ -637,6 +666,7 @@ unsafe extern "C" {
         backing_store_token_out: *mut u64,
         out_id: *mut u32,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_create_external_buffer(
         env: SnapiEnv,
         data_addr: u64,
@@ -644,6 +674,7 @@ unsafe extern "C" {
         backing_store_token_out: *mut u64,
         out_id: *mut u32,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_create_external_arraybuffer_finalized(
         env: SnapiEnv,
         data_addr: u64,
@@ -652,6 +683,7 @@ unsafe extern "C" {
         backing_store_token_out: *mut u64,
         out_id: *mut u32,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_create_external_buffer_finalized(
         env: SnapiEnv,
         data_addr: u64,
@@ -660,6 +692,7 @@ unsafe extern "C" {
         backing_store_token_out: *mut u64,
         out_id: *mut u32,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_create_external_arraybuffer_guest_finalized(
         env: SnapiEnv,
         data_addr: u64,
@@ -671,6 +704,7 @@ unsafe extern "C" {
         backing_store_token_out: *mut u64,
         out_id: *mut u32,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_create_external_buffer_guest_finalized(
         env: SnapiEnv,
         data_addr: u64,
@@ -739,6 +773,7 @@ unsafe extern "C" {
         byte_offset_out: *mut u32,
         backing_store_token_out: *mut u64,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_attach_guest_heap_finalizer(
         env: SnapiEnv,
         id: u32,
@@ -832,6 +867,7 @@ unsafe extern "C" {
         adjusted: *mut i64,
     ) -> i32;
     // Node Buffers
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_create_buffer(
         env: SnapiEnv,
         length: u32,
@@ -846,6 +882,7 @@ unsafe extern "C" {
         out_id: *mut u32,
     ) -> i32;
     pub fn snapi_bridge_is_buffer(env: SnapiEnv, id: u32, result: *mut i32) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_get_buffer_info(
         env: SnapiEnv,
         id: u32,
@@ -853,6 +890,7 @@ unsafe extern "C" {
         length_out: *mut u32,
         backing_store_token_out: *mut u64,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_unofficial_acquire_buffer_lease(
         env: SnapiEnv,
         value_id: u32,
@@ -862,11 +900,13 @@ unsafe extern "C" {
         lease_out: *mut u32,
         data_out: *mut u64,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_unofficial_release_buffer_lease(
         env: SnapiEnv,
         lease_id: u32,
         modified: i32,
     ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub fn snapi_bridge_unofficial_create_guest_backed_typedarray(
         env: SnapiEnv,
         type_: i32,
@@ -874,17 +914,13 @@ unsafe extern "C" {
         data_out: *mut u64,
         value_out: *mut u32,
     ) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_get_backing_store_token(env: SnapiEnv, id: u32, token_out: *mut u64)
     -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_overwrite_value_bytes(
         env: SnapiEnv,
         id: u32,
-        data: *const core::ffi::c_void,
-        len: u32,
-    ) -> i32;
-    pub fn snapi_bridge_overwrite_reference_bytes(
-        env: SnapiEnv,
-        reference_id: u32,
         data: *const core::ffi::c_void,
         len: u32,
     ) -> i32;
@@ -946,6 +982,7 @@ unsafe extern "C" {
         reg_id: u32,
         out_id: *mut u32,
     ) -> i32;
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub fn snapi_bridge_swap_active_callback_ctx(
         env: SnapiEnv,
         callback_ctx: *mut c_void,

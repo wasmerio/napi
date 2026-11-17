@@ -1,206 +1,161 @@
-use std::ffi::c_void;
+use crate::{
+    NapiEnv,
+    native_frame::{CallbackFailure, FrameHolder, ImportScope},
+    snapi::SnapiEnv,
+};
+#[cfg(test)]
+use std::sync::{Arc, atomic::Ordering};
+use std::{
+    ffi::c_void,
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+};
 
-use wasmer::{AsStoreMut, FunctionEnv, FunctionEnvMut, Store, StoreMut, Table, Value};
-use wasmer_wasix::WasiError;
-use wasmer_wasix::wasmer_wasix_types::wasi::ExitCode;
+use wasmer::{AsStoreMut, FunctionEnvMut, RuntimeError, Store, StoreMut, Table, Value};
 
-use crate::{NapiEnv, snapi::SnapiEnv};
-
-thread_local! {
-    /// A guest instance exit (`WasiError::Exit`) that trapped out of a guest
-    /// callback and must be re-raised through the N-API import layers.
-    ///
-    /// When the guest calls `_exit`/`proc_exit` — e.g. Node's fatal-exception
-    /// path taking `std::_Exit` on the main thread after an unhandled exception
-    /// — WASI `proc_exit` unwinds the guest and the [`func.call`] that dispatched
-    /// the callback returns a trap carrying [`WasiError::Exit`]. The trampoline
-    /// runs inside host V8 (a native C++ frame that cannot carry a Rust trap), so
-    /// it cannot re-raise directly. Instead it stashes the exit here; the nearest
-    /// enclosing N-API import boundary ([`with_cb_context`]) takes it back out and
-    /// returns it as an `Err`, so wasmer re-raises the same exit through every
-    /// guest→host layer until the runner (`bin_factory`/`thread_spawn`) handles
-    /// it — the standard WASIX process-exit propagation. Swallowing it (the old
-    /// behavior) left the host event loop spinning forever (observed as
-    /// `test-tls-handshake-exception` hanging).
-    ///
-    /// This terminates only the guest instance whose callback exited, never the
-    /// host process.
-    ///
-    /// [`func.call`]: wasmer::Function::call
-    /// [`with_cb_context`]: crate::guest::napi::with_cb_context
-    static PENDING_GUEST_EXIT: std::cell::Cell<Option<ExitCode>> =
-        const { std::cell::Cell::new(None) };
+// Native typed handlers expose the same primitive Wasm ABI while returning
+// callback failures only after original-cell cleanup has completed.
+pub(super) trait NativeImportOutput {
+    type Value: Copy;
+    fn into_native_result(self) -> Result<Self::Value, RuntimeError>;
 }
 
-/// If a guest callback trapped with a WASI process exit, stash the exit code so
-/// the enclosing import boundary can re-raise it, and report whether it did.
-/// Non-exit traps return `false` and are left for the caller to log.
-fn stash_guest_exit(err: &wasmer::RuntimeError) -> bool {
-    if let Some(WasiError::Exit(code)) = err.downcast_ref::<WasiError>() {
-        PENDING_GUEST_EXIT.with(|slot| slot.set(Some(*code)));
-        return true;
+impl NativeImportOutput for i32 {
+    type Value = i32;
+    fn into_native_result(self) -> Result<i32, RuntimeError> {
+        Ok(self)
     }
-    false
+}
+impl NativeImportOutput for () {
+    type Value = ();
+    fn into_native_result(self) -> Result<(), RuntimeError> {
+        Ok(self)
+    }
+}
+impl NativeImportOutput for Result<i32, RuntimeError> {
+    type Value = i32;
+    fn into_native_result(self) -> Result<i32, RuntimeError> {
+        self
+    }
 }
 
-/// Take a pending guest instance exit stashed by a callback trampoline, if any.
-/// Called at each N-API import boundary to re-raise the exit outward.
-pub(crate) fn take_pending_guest_exit() -> Option<ExitCode> {
-    PENDING_GUEST_EXIT.with(|slot| slot.take())
+pub(super) fn with_native_import<O: NativeImportOutput>(
+    env: FunctionEnvMut<NapiEnv>,
+    body: impl FnOnce(FunctionEnvMut<NapiEnv>) -> O,
+) -> Result<O::Value, RuntimeError> {
+    let mut scope = ImportScope::enter(env.pin_frame(), Some(env.data().host_stop_flag()));
+    let mut value = None;
+    let failure = match catch_unwind(AssertUnwindSafe(|| body(env).into_native_result())) {
+        Ok(Ok(result)) => {
+            value = Some(result);
+            None
+        }
+        Ok(Err(error)) => Some(CallbackFailure::Guest(error)),
+        Err(panic) => Some(CallbackFailure::Panic(panic)),
+    };
+    scope.failure.body_finished(failure);
+    scope.finish();
+    match scope.failure.take() {
+        Some(CallbackFailure::Guest(error)) => Err(error),
+        Some(CallbackFailure::Panic(panic)) => resume_unwind(panic),
+        None => Ok(value.unwrap()),
+    }
 }
 
-/// What a V8 callback needs to reach the guest: a handle to the N-API env of
-/// the import that installed it. The handle is store-free, so this holds
-/// nothing that points into the installer's stack frame — the store itself is
-/// picked back up from the thread, which the installer lends by parking its
-/// own borrow (see [`with_callback_state`]). C++ only ever passes this back as
-/// an opaque pointer.
-struct CallbackInvocationCtx {
-    func_env: FunctionEnv<NapiEnv>,
+/// All native CPP calls now obtain their exact context from the physical
+/// header. The import row is already installed by with_native_import.
+pub fn with_callback_state<R: Copy>(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    _snapi_env: SnapiEnv,
+    body: impl FnOnce() -> R,
+) -> Result<R, RuntimeError> {
+    let result = env.as_store_mut().parked(body);
+    crate::native_frame::replay_current()?;
+    Ok(result)
 }
 
 fn call_guest_callback(
     store: &mut StoreMut<'_>,
-    func_env: &FunctionEnv<NapiEnv>,
-    table: &Table,
-    guest_env: i32,
+    table: Option<Table>,
     wasm_fn_ptr: u32,
-    callback_arg: u32,
-) -> u32 {
-    let func = match func_env.as_ref(store).func_cache.get(&wasm_fn_ptr).cloned() {
-        Some(func) => func,
-        None => {
-            let Some(elem) = table.get(store, wasm_fn_ptr) else {
-                return 0;
-            };
-            let func = match elem {
-                Value::FuncRef(Some(func)) => func,
-                Value::FuncRef(None) => return 0,
-                _ => return 0,
-            };
-            func_env
-                .as_mut(store)
-                .func_cache
-                .insert(wasm_fn_ptr, func.clone());
-            func
-        }
+    args: &[Value],
+) -> Result<u32, RuntimeError> {
+    let Some(table) = table else {
+        return Ok(0);
     };
-    match func.call(
-        store,
-        &[Value::I32(guest_env), Value::I32(callback_arg as i32)],
-    ) {
-        Ok(ret_vals) => match ret_vals.first() {
-            Some(Value::I32(v)) => *v as u32,
-            Some(Value::I64(v)) => *v as u32,
-            _ => 0,
-        },
-        Err(err) => {
-            if stash_guest_exit(&err) {
-                return 0;
-            }
-            eprintln!("[callback trampoline] error calling function: {err}");
+    // A guest can replace a table entry without changing its signature.
+    let Some(Value::FuncRef(Some(func))) = table.get(store, wasm_fn_ptr) else {
+        return Ok(0);
+    };
+    let values = func.call(store, args)?;
+    Ok(match values.first() {
+        Some(Value::I32(value)) => *value as u32,
+        Some(Value::I64(value)) => *value as u32,
+        _ => 0,
+    })
+}
+
+fn invoke(callback_ctx: *mut c_void, wasm_fn_ptr: u32, args: &[Value]) -> u32 {
+    if callback_ctx.is_null() {
+        return 0;
+    }
+    // The invocation's stack context outlives the bridge and its callbacks.
+    let ctx = unsafe { &*callback_ctx.cast::<FrameHolder>() };
+    match catch_unwind(AssertUnwindSafe(|| invoke_inner(ctx, wasm_fn_ptr, args))) {
+        Ok(value) => value,
+        Err(panic) => {
+            ctx.fail(CallbackFailure::Panic(panic));
             0
         }
     }
 }
 
-/// Like [`call_guest_callback`] but passes two data arguments in addition to
-/// the guest env handle. Used to dispatch N-API finalizers into the guest,
-/// whose ABI is `void finalize(napi_env env, void* data, void* hint)`.
-fn call_guest_callback2(
-    store: &mut StoreMut<'_>,
-    func_env: &FunctionEnv<NapiEnv>,
-    table: &Table,
-    guest_env: i32,
-    wasm_fn_ptr: u32,
-    arg0: u32,
-    arg1: u32,
-) -> u32 {
-    let func = match func_env.as_ref(store).func_cache.get(&wasm_fn_ptr).cloned() {
-        Some(func) => func,
-        None => {
-            let Some(elem) = table.get(store, wasm_fn_ptr) else {
-                return 0;
-            };
-            let func = match elem {
-                Value::FuncRef(Some(func)) => func,
-                Value::FuncRef(None) => return 0,
-                _ => return 0,
-            };
-            func_env
-                .as_mut(store)
-                .func_cache
-                .insert(wasm_fn_ptr, func.clone());
-            func
+fn invoke_inner(ctx: &FrameHolder, wasm_fn_ptr: u32, args: &[Value]) -> u32 {
+    if ctx.failed() {
+        return 0;
+    }
+    let dispatched = Store::with_current(|store| {
+        let Some(mut environment) = ctx
+            .environment
+            .as_ref()
+            .and_then(|pin| pin.try_as_env_mut(store))
+        else {
+            return Ok(Ok(0));
+        };
+        if !environment.data_mut().enter_callback() {
+            return Ok(Ok(0));
         }
-    };
-    match func.call(
-        store,
-        &[
-            Value::I32(guest_env),
-            Value::I32(arg0 as i32),
-            Value::I32(arg1 as i32),
-        ],
-    ) {
-        Ok(ret_vals) => match ret_vals.first() {
-            Some(Value::I32(v)) => *v as u32,
-            Some(Value::I64(v)) => *v as u32,
-            _ => 0,
-        },
-        Err(err) => {
-            if stash_guest_exit(&err) {
-                return 0;
+        let table = environment.data().table.clone();
+        // End every T borrow before guest entry. The same temporary retains the
+        // exact original cell for leave_callback even if guest removes its slot.
+        // Catch before with_current releases its counted Store borrow wrapper.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            call_guest_callback(&mut environment.as_store_mut(), table, wasm_fn_ptr, args)
+        }));
+        let cleanup = catch_unwind(AssertUnwindSafe(|| environment.data_mut().leave_callback()));
+        match (result, cleanup) {
+            (result, Ok(())) => result,
+            (Ok(Ok(_)), Err(panic)) => Err(panic),
+            (result, Err(secondary)) => {
+                // Preserve the original callback failure after paired cleanup.
+                let _ = catch_unwind(AssertUnwindSafe(|| drop(secondary)));
+                result
             }
-            eprintln!("[finalizer trampoline] error calling guest finalizer: {err}");
+        }
+    });
+    match dispatched {
+        Some(Ok(Ok(value))) => value,
+        Some(Ok(Err(error))) => {
+            ctx.fail(CallbackFailure::Guest(error));
             0
         }
-    }
-}
-
-/// Install a callback-invocation context for the duration of `f`, so host V8
-/// callbacks fired inside the bridge call can be dispatched into the wasm
-/// guest (see [`snapi_host_invoke_wasm_callback`]).
-pub fn with_callback_state<R>(
-    env: &mut FunctionEnvMut<NapiEnv>,
-    snapi_env: SnapiEnv,
-    f: impl FnOnce() -> R,
-) -> R {
-    if snapi_env.is_null() {
-        // There is no guest callback context to install. Keep this path out of
-        // Wasmer's store-lending TLS; callers that allocate guest memory pass
-        // their store explicitly.
-        return f();
-    }
-
-    let mut ctx = CallbackInvocationCtx {
-        func_env: env.as_ref(),
-    };
-    let prev = unsafe {
-        crate::snapi::snapi_bridge_swap_active_callback_ctx(
-            snapi_env,
-            (&mut ctx as *mut CallbackInvocationCtx).cast::<c_void>(),
-        )
-    };
-    struct CallbackStateGuard {
-        snapi_env: SnapiEnv,
-        prev: *mut c_void,
-    }
-    impl Drop for CallbackStateGuard {
-        fn drop(&mut self) {
-            unsafe {
-                crate::snapi::snapi_bridge_swap_active_callback_ctx(self.snapi_env, self.prev);
-            }
+        Some(Err(panic)) => {
+            ctx.fail(CallbackFailure::Panic(panic));
+            0
         }
+        None => 0,
     }
-    let _guard = CallbackStateGuard { snapi_env, prev };
-    // Only bridges explicitly wrapped in this invocation guard lend the store.
-    // Ordinary N-API imports keep their store local and pass it directly to
-    // guest-heap allocation instead of publishing it through runtime TLS.
-    env.as_store_mut().parked(f)
 }
 
-/// Rust trampoline called from C++ when a V8 callback fires.
-/// Re-enters the active guest callback scope and dispatches into the WASM guest.
 #[unsafe(no_mangle)]
 pub extern "C" fn snapi_host_invoke_wasm_callback(
     callback_ctx: *mut c_void,
@@ -208,56 +163,15 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
     wasm_fn_ptr: u32,
     callback_arg: u32,
 ) -> u32 {
-    if callback_ctx.is_null() {
-        eprintln!("[callback trampoline] no active callback scope available");
-        return 0;
-    }
-    // SAFETY: `callback_ctx` is the context `with_callback_state` installed,
-    // which outlives the bridge call this fired inside.
-    let ctx = unsafe { &*(callback_ctx as *const CallbackInvocationCtx) };
-    let func_env = ctx.func_env.clone();
-
-    let dispatched = Store::with_current(|store| {
-        let Some(table) = func_env.as_ref(store).table.clone() else {
-            return 0;
-        };
-
-        // Bound guest↔host callback reentrancy so a runaway recursion cannot
-        // overflow the host native stack (an uncatchable SIGSEGV that would take
-        // down every co-tenant). Refuse the callback past the limit rather than
-        // crash. The increment below always pairs with the decrement, since
-        // `call_guest_callback` returns normally on both success and trap.
-        if !func_env.as_mut(store).enter_callback() {
-            eprintln!("[callback trampoline] reentrancy depth limit exceeded");
-            return 0;
-        }
-        let result = call_guest_callback(
-            store,
-            &func_env,
-            &table,
-            guest_env as i32,
-            wasm_fn_ptr,
-            callback_arg,
-        );
-        func_env.as_mut(store).leave_callback();
-        result
-    });
-
-    match dispatched {
-        Some(result) => result,
-        None => {
-            // The import that entered V8 did not lend its store, so there is
-            // no way back into the guest from here.
-            eprintln!("[callback trampoline] no store lent to this thread");
-            0
-        }
-    }
+    invoke(
+        callback_ctx,
+        wasm_fn_ptr,
+        &[
+            Value::I32(guest_env as i32),
+            Value::I32(callback_arg as i32),
+        ],
+    )
 }
-
-/// Rust trampoline called from C++ when a guest-registered N-API finalizer
-/// fires (during the deferred finalizer drain, which runs inside a guest→bridge
-/// import call, so an active callback scope is available). Re-enters the guest
-/// and dispatches `finalize(env, data, hint)` through the indirect table.
 #[unsafe(no_mangle)]
 pub extern "C" fn snapi_host_invoke_wasm_finalizer(
     callback_ctx: *mut c_void,
@@ -266,36 +180,247 @@ pub extern "C" fn snapi_host_invoke_wasm_finalizer(
     data: u32,
     hint: u32,
 ) -> u32 {
-    if callback_ctx.is_null() {
-        // No active guest call to re-enter (e.g. fired during env teardown,
-        // when the guest instance is going away regardless). Nothing to do.
-        return 0;
-    }
-    // SAFETY: as in `snapi_host_invoke_wasm_callback`.
-    let ctx = unsafe { &*(callback_ctx as *const CallbackInvocationCtx) };
-    let func_env = ctx.func_env.clone();
+    invoke(
+        callback_ctx,
+        wasm_fn_ptr,
+        &[
+            Value::I32(guest_env as i32),
+            Value::I32(data as i32),
+            Value::I32(hint as i32),
+        ],
+    )
+}
 
-    Store::with_current(|store| {
-        let Some(table) = func_env.as_ref(store).table.clone() else {
-            return 0;
-        };
-        // Same reentrancy bound as the regular callback trampoline: a finalizer
-        // may itself create/free values and trigger more callbacks.
-        if !func_env.as_mut(store).enter_callback() {
-            eprintln!("[finalizer trampoline] reentrancy depth limit exceeded");
-            return 0;
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+    use crate::budget::{NapiMemoryAccountant, Pool, ResourceBudget};
+    use std::{
+        collections::HashSet,
+        process::{Child, Command},
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, AtomicU64, AtomicUsize},
+        },
+        time::{Duration, Instant},
+    };
+    use wasmer::sys::vm::{StoreObject, VMFunctionEnvironment, VMFunctionEnvironmentIdentity};
+    use wasmer::{Function, FunctionEnv, Imports, Instance, Module};
+
+    struct Accountant {
+        charged: AtomicU64,
+        armed: AtomicBool,
+        drops: AtomicUsize,
+        payload: Arc<()>,
+    }
+    impl NapiMemoryAccountant for Accountant {
+        fn memory_limit(&self) -> u64 {
+            1024 * 1024
         }
-        let result = call_guest_callback2(
-            store,
-            &func_env,
-            &table,
-            guest_env as i32,
-            wasm_fn_ptr,
-            data,
-            hint,
+        fn memory_charged(&self) -> u64 {
+            self.charged.load(Ordering::SeqCst)
+        }
+        fn try_charge(&self, bytes: u64) -> bool {
+            self.charged.fetch_add(bytes, Ordering::SeqCst);
+            true
+        }
+        fn uncharge(&self, bytes: u64) {
+            self.charged.fetch_sub(bytes, Ordering::SeqCst);
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                std::panic::panic_any(self.payload.clone());
+            }
+        }
+    }
+    #[derive(Debug)]
+    struct Original(Arc<()>);
+    impl std::fmt::Display for Original {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("original import failure")
+        }
+    }
+    impl std::error::Error for Original {}
+    #[derive(Clone, Copy)]
+    enum Body {
+        Success,
+        Error,
+        Panic,
+    }
+
+    fn body(
+        mut env: FunctionEnvMut<NapiEnv>,
+        identity: &VMFunctionEnvironmentIdentity,
+        mode: Body,
+        original: &Arc<()>,
+    ) -> Result<i32, RuntimeError> {
+        // This is the sole original NapiEnv, validated while Store was idle.
+        // Its raw owner is removed without accessing T through that owner.
+        let owner = &mut VMFunctionEnvironment::list_mut(env.objects_mut().as_sys_mut())[0];
+        assert_eq!(owner.identity(), *identity);
+        drop(std::mem::replace(owner, VMFunctionEnvironment::new(())));
+        match mode {
+            Body::Success => Ok(42),
+            Body::Error => Err(RuntimeError::user(Box::new(Original(original.clone())))),
+            Body::Panic => std::panic::panic_any(original.clone()),
+        }
+    }
+    fn proof(mode: Body) {
+        for typed in [false, true] {
+            let original = Arc::new(());
+            let cleanup = Arc::new(());
+            let accountant = Arc::new(Accountant {
+                charged: AtomicU64::new(0),
+                armed: AtomicBool::new(false),
+                drops: AtomicUsize::new(0),
+                payload: cleanup.clone(),
+            });
+            let budget = ResourceBudget::with_accountant(accountant.clone());
+            budget.try_charge(Pool::V8External, 64).unwrap();
+            let mut data = NapiEnv::new(
+                budget.clone(),
+                None,
+                Arc::new(Mutex::new(HashSet::new())),
+                Arc::new(AtomicBool::new(false)),
+            );
+            // Owned ledger-only cleanup, not an actual V8 provider callback.
+            // It supplies a deterministic final T destructor after slot removal.
+            data.record_declared_external(1, 64);
+            let mut store = Store::default();
+            assert!(VMFunctionEnvironment::list(store.objects_mut().as_sys_mut()).is_empty());
+            let env = FunctionEnv::new(&mut store, data);
+            let identity =
+                VMFunctionEnvironment::list(store.objects_mut().as_sys_mut())[0].identity();
+            let payload = original.clone();
+            let function = Function::new_typed_with_env(
+                &mut store,
+                &env,
+                move |env: FunctionEnvMut<NapiEnv>| -> Result<i32, RuntimeError> {
+                    with_native_import(env, |env| body(env, &identity, mode, &payload))
+                },
+            );
+            let module = Module::new(
+                &store,
+                r#"(module
+                (import "test" "import" (func $import (result i32)))
+                (func (export "run") (result i32) call $import)
+                (func (export "fresh") (result i32) i32.const 42))"#,
+            )
+            .unwrap();
+            let mut imports = Imports::new();
+            imports.define("test", "import", function);
+            let instance = Instance::new(&mut store, &module, &imports).unwrap();
+            accountant.armed.store(true, Ordering::SeqCst);
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                if typed {
+                    instance
+                        .exports
+                        .get_typed_function::<(), i32>(&store, "run")
+                        .unwrap()
+                        .call(&mut store)
+                } else {
+                    instance
+                        .exports
+                        .get_function("run")
+                        .unwrap()
+                        .call(&mut store, &[])
+                        .map(|values| values[0].i32().unwrap())
+                }
+            }));
+            let fresh = instance
+                .exports
+                .get_typed_function::<(), i32>(&store, "fresh")
+                .unwrap()
+                .call(&mut store)
+                .unwrap();
+            drop(instance);
+            drop(imports);
+            drop(env);
+            drop(store);
+            assert_eq!(fresh, 42);
+            assert_eq!(budget.snapshot().v8_external, 0);
+            assert_eq!(accountant.memory_charged(), 0);
+            assert_eq!(accountant.drops.load(Ordering::SeqCst), 1);
+            match mode {
+                Body::Error => {
+                    let error = outcome
+                        .expect("cleanup panic replaced original import error")
+                        .unwrap_err();
+                    assert!(Arc::ptr_eq(
+                        &error.downcast_ref::<Original>().unwrap().0,
+                        &original
+                    ));
+                }
+                Body::Panic => {
+                    let panic = outcome.unwrap_err();
+                    assert!(Arc::ptr_eq(
+                        panic.downcast_ref::<Arc<()>>().unwrap(),
+                        &original
+                    ));
+                }
+                Body::Success => {
+                    let panic = outcome.unwrap_err();
+                    assert!(Arc::ptr_eq(
+                        panic.downcast_ref::<Arc<()>>().unwrap(),
+                        &cleanup
+                    ));
+                }
+            }
+        }
+    }
+    fn subprocess(name: &str) -> bool {
+        const CHILD: &str = "NAPI_NATIVE_IMPORT_OUTCOME_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        struct OwnedChild(Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = OwnedChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap(),
         );
-        func_env.as_mut(store).leave_callback();
-        result
-    })
-    .unwrap_or(0)
+        let started = Instant::now();
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "native import outcome proof failed: {status}"
+                );
+                return false;
+            }
+            assert!(started.elapsed() < Duration::from_secs(30));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    #[test]
+    fn native_import_preserves_error_after_removed_cell_cleanup_panics() {
+        if subprocess(
+            "guest::callback::import_tests::native_import_preserves_error_after_removed_cell_cleanup_panics",
+        ) {
+            proof(Body::Error);
+        }
+    }
+    #[test]
+    fn native_import_preserves_panic_after_removed_cell_cleanup_panics() {
+        if subprocess(
+            "guest::callback::import_tests::native_import_preserves_panic_after_removed_cell_cleanup_panics",
+        ) {
+            proof(Body::Panic);
+        }
+    }
+    #[test]
+    fn native_import_reports_cleanup_panic_after_successful_body() {
+        if subprocess(
+            "guest::callback::import_tests::native_import_reports_cleanup_panic_after_successful_body",
+        ) {
+            proof(Body::Success);
+        }
+    }
 }
