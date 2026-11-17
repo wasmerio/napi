@@ -250,3 +250,65 @@ gitlink to this branch's final head, and include the lock dependency entry for
 `parking_lot 0.12.5`. No product submodule pointer was changed in its main
 checkout. No further blocking facade API GAP was found. Remaining TODOs are M3
 (copy contention/read guard) and L9 (direct nonshared registration retirement).
+
+## Protected heap prefunding follow-up
+
+Protected allocator backing is now funded after managed-lane admission and before
+planning/reserving an isolate's heap ceiling. A clamped ceiling therefore sees
+the already-funded arena rather than consuming the bytes needed to create it.
+Protected host reservations use soft WasmLinear accounting, including memory
+growth through budgeted tunables. The budget-specific scope covers only each
+reservation poll and restores the previous mode on return, Pending or panic;
+ordinary guest memory growth retains its existing accounting.
+
+The protected-lease suite adds a 160 MiB aggregate-budget regression with a
+104 MiB guest, verifying the actual protected heap acquired its 16 MiB prefund
+before isolate ceiling planning. A budget unit regression
+checks actual memory-growth denial and restoration after Pending and panic.
+NAPI-only file command admission remains an upstream facade/exec gap; this
+change neither alters its fixtures nor adds a synthetic WASIX import to them.
+
+Validation on product `9c23b0c2c3591021a5b11ce69a91bd384aa0d387`
+(runtime `93ebbc98e695c0727f9107c444edfb166bf22ac6`):
+
+```sh
+CARGO_TARGET_DIR=$PWD/target RUST_MIN_STACK=16777216 CARGO_BUILD_JOBS=2 \
+  cargo test --quiet --locked --offline --no-fail-fast \
+  -p wasmer-napi --features cli -- --test-threads=1
+```
+
+The final full invocation passed: **284 passed, 0 failed, 3 ignored**, including
+all 34 original native/WASIX fixture comparisons. The protected-heap order
+regression was separately proven failing with the original order and passing
+with the fix. V8 CTest passed **113/113** and QuickJS CTest **102/102**, retaining
+Make's existing deep-freeze exclusion. Rust formatting and `git diff --check`
+passed. Strict Clippy remains blocked by three unchanged `build.rs` findings:
+`manual_is_multiple_of` at line 394 and `type_complexity` at lines 422 and 759.
+
+Edge validation uses a detached scratch worktree of `wasixv2/n` at
+`9f80e75debef8d9b43edbcce68b5479ac8d975ef`, with a local `wasmer-napi` patch
+pointing at this branch's sources. The scratch lock changes only that package's
+source identity; product stays pinned to `2ae152aa3aaa0dac00b74c58ece2121f9c77ae0e`.
+Build outputs live in the scratch worktree. The build uses installed Nix
+CMake/pkg-config and OpenSSL (`OPENSSL_NO_VENDOR=1`). No Edge source or commits
+are changed. The focused command passed **1/1**:
+
+```sh
+RUST_MIN_STACK=16777216 cargo test --quiet --offline -p edge \
+  --test napi_metering wasm_memory_shrinks_the_v8_heap_within_one_quota \
+  -- --exact --nocapture
+```
+
+The full Edge command (`cargo test --quiet --locked --offline -p edge --test
+napi_metering -- --test-threads=1`) finished **14 passed, 4 failed**. All four
+remaining failures report `ENOEXEC` from NAPI-only file admission:
+
+- `importing_napi_with_exported_memory_does_not_initialize_it`
+- `importing_napi_without_calling_it_does_not_start_a_v8_lane`
+- `legacy_create_env_activates_one_instance_lane_on_first_call`
+- `legacy_default_flags_do_not_activate_or_charge_an_instance_lane`
+
+NAPI-ABI remains assigned upstream; no admission workaround or Edge fixture
+changes are included here. The start-trap test nominally passes, but its error
+and drain assertions alone do not establish that NAPI activated before the
+failure, so that result is not evidence of resolved NAPI-only start admission.

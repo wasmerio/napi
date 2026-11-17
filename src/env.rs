@@ -453,11 +453,6 @@ pub(crate) struct NativeCreation {
 
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 impl NativeCreation {
-    pub(crate) fn install_heap(&mut self, heap: Arc<crate::guest_heap::GuestHeap>) {
-        self.retirement.heap = Some(heap.clone());
-        self.request.heap = Some(heap);
-    }
-
     pub(crate) fn ids(&self) -> NativeEnvIds {
         self.request.ids
     }

@@ -6156,6 +6156,28 @@ fn create_native_provider(
         })
         .flatten()
         .ok_or(1)?;
+        // Fund allocator backing before the isolate ceiling consumes the
+        // remaining quota. Lane admission still precedes any heap funding.
+        if request.heap.is_none() {
+            let memory = memory.ok_or(1)?;
+            let heap = wasmer::Store::with_current(|store| {
+                crate::guest_heap::GuestHeap::get_or_create(store, &memory, budget)
+            })
+            .flatten()
+            .ok_or(1)?;
+            with_creation_env(&frame, |current| {
+                current.data_mut().guest_heap = Some(heap.clone())
+            })
+            .ok_or(1)?;
+            request.heap = Some(heap);
+        }
+        if let (Some(heap), Some(refill)) = (&request.heap, refill) {
+            let _ =
+                wasmer::Store::with_current(|store| heap.refill_leased(store, &*refill, 0, true));
+            if crate::native_frame::current_failed() {
+                return Err(1);
+            }
+        }
         let mut creation = request.reserve(options.requested).map_err(|_| 1)?;
         // A reservation accountant may detach this cell, stop the session or
         // reenter default initialization. Recheck before provider creation.
@@ -6172,26 +6194,6 @@ fn create_native_provider(
         .ok_or(1)??;
         if let Some(env) = existing {
             return Ok(crate::env::NativeEnvIds { env, scope: 0 });
-        }
-        if creation.request.heap.is_none() {
-            let memory = memory.ok_or(1)?;
-            let heap = wasmer::Store::with_current(|store| {
-                crate::guest_heap::GuestHeap::get_or_create(store, &memory, budget)
-            })
-            .flatten()
-            .ok_or(1)?;
-            with_creation_env(&frame, |current| {
-                current.data_mut().guest_heap = Some(heap.clone())
-            })
-            .ok_or(1)?;
-            creation.install_heap(heap);
-        }
-        if let (Some(heap), Some(refill)) = (&creation.request.heap, refill) {
-            let _ =
-                wasmer::Store::with_current(|store| heap.refill_leased(store, &*refill, 0, true));
-            if crate::native_frame::current_failed() {
-                return Err(1);
-            }
         }
         let status = creation.create(
             options.version,

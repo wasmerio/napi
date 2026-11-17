@@ -216,8 +216,8 @@ pub trait NapiMemoryAccountant: Send + Sync {
     fn memory_limit(&self) -> u64;
     fn memory_charged(&self) -> u64;
     fn try_charge(&self, bytes: u64) -> bool;
-    /// Charge bytes whose refusal the provider handles gracefully (V8 turns
-    /// it into a JS `RangeError`). Must deny without side effects such as
+    /// Charge bytes whose refusal is recoverable, such as a V8 `RangeError`
+    /// or an advisory host-memory prefund. Must deny without side effects such as
     /// stopping the application; it may be called from V8 background
     /// threads and must not call back into V8. Embedders whose
     /// [`try_charge`](Self::try_charge) is terminal should override it.
@@ -225,8 +225,8 @@ pub trait NapiMemoryAccountant: Send + Sync {
         self.try_charge(bytes)
     }
     /// [`try_charge_soft`](Self::try_charge_soft) with the N-API pool being
-    /// charged ([`Pool::V8BackingPages`], [`Pool::V8WasmMemory`] or
-    /// [`Pool::V8WasmCode`]), for
+    /// charged ([`Pool::V8BackingPages`], [`Pool::V8WasmMemory`],
+    /// [`Pool::V8WasmCode`] or protected host reservations in [`Pool::WasmLinear`]), for
     /// embedders that label denials. Same contract; defaults to
     /// `try_charge_soft`.
     fn try_charge_soft_for(&self, pool: Pool, bytes: u64) -> bool {
@@ -473,6 +473,27 @@ impl std::fmt::Debug for ResourceBudget {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    static SOFT_HOST_RESERVATION: std::cell::Cell<*const ResourceBudget> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ResourceBudget {
+    // Only the current poll is soft: a pending reservation must not change
+    // accounting for unrelated work on this executor thread.
+    pub(crate) fn with_soft_host_reservation<R>(&self, f: impl FnOnce() -> R) -> R {
+        struct Restore(*const ResourceBudget);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SOFT_HOST_RESERVATION.with(|slot| slot.set(self.0));
+            }
+        }
+        let _restore = Restore(SOFT_HOST_RESERVATION.with(|slot| slot.replace(self)));
+        f()
+    }
+}
+
 impl ResourceBudget {
     /// A budget that tracks charges but never denies one.
     pub fn unlimited() -> Arc<Self> {
@@ -586,13 +607,18 @@ impl ResourceBudget {
     ///
     /// [`uncharge`]: ResourceBudget::uncharge
     pub fn try_charge(&self, pool: Pool, bytes: u64) -> Result<(), OverBudget> {
-        self.charge(pool, bytes, false)
+        #[cfg(not(target_arch = "wasm32"))]
+        let soft = pool == Pool::WasmLinear
+            && SOFT_HOST_RESERVATION.with(|slot| std::ptr::eq(slot.get(), self));
+        #[cfg(target_arch = "wasm32")]
+        let soft = false;
+        self.charge(pool, bytes, soft)
     }
 
     /// Like [`try_charge`](Self::try_charge), but a refusal is reported only
     /// to the caller: an embedder accountant is asked through
     /// [`NapiMemoryAccountant::try_charge_soft`], so the application is not
-    /// stopped. For allocations whose failure V8 handles gracefully.
+    /// stopped. For recoverable allocation failures and advisory host reservations.
     pub fn try_charge_soft(&self, pool: Pool, bytes: u64) -> Result<(), OverBudget> {
         self.charge(pool, bytes, true)
     }
@@ -2504,6 +2530,50 @@ mod external_accountant_tests {
         assert_eq!(budget.snapshot().v8_backing_pages, 80);
         budget.uncharge(Pool::V8BackingPages, 80);
         assert_eq!(budget.snapshot().v8_backing_pages, 0);
+        assert_eq!(budget.memory_charged(), 0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn protected_reservation_denial_is_soft_and_restores_guest_growth() {
+        use wasmer::sys::NativeEngineExt;
+        use wasmer::{Memory, MemoryType, Store};
+        let accountant = Arc::new(SoftAccountant {
+            inner: TestAccountant::new(2 * 65536),
+            terminal_calls: AtomicU64::new(0),
+        });
+        let budget = ResourceBudget::with_accountant(accountant.clone());
+        let mut engine: wasmer::Engine =
+            wasmer::sys::EngineBuilder::new(wasmer::sys::Cranelift::default())
+                .engine()
+                .into();
+        engine.set_tunables(budgeted_tunables(budget.clone()));
+        let mut store = Store::new(engine);
+        let memory = Memory::new(&mut store, MemoryType::new(1, Some(16), false)).unwrap();
+        let initial = accountant.terminal_calls.load(Ordering::Acquire);
+        let pending: std::task::Poll<()> = budget.with_soft_host_reservation(|| {
+            assert!(memory.grow(&mut store, 2).is_err());
+            std::task::Poll::Pending
+        });
+        assert!(pending.is_pending());
+        assert_eq!(accountant.terminal_calls.load(Ordering::Acquire), initial);
+        assert!(memory.grow(&mut store, 2).is_err());
+        assert_eq!(
+            accountant.terminal_calls.load(Ordering::Acquire),
+            initial + 1
+        );
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            budget.with_soft_host_reservation(|| panic!("reservation poll panic"));
+        }));
+        assert!(panic.is_err());
+        assert!(memory.grow(&mut store, 2).is_err());
+        assert_eq!(
+            accountant.terminal_calls.load(Ordering::Acquire),
+            initial + 2
+        );
+        assert_eq!(budget.memory_charged(), 65536);
+        drop(memory);
+        drop(store);
         assert_eq!(budget.memory_charged(), 0);
     }
 

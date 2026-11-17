@@ -167,7 +167,9 @@ unsafe impl<S: LoaderControl + Send + Sync + 'static> NativeGuestRefill for Refi
         };
         if !wasmer::sys::native_host_work_can_suspend() {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                wasixv2_exec::poll_native_host_reservation(&exec, store, bytes)
+                self.budget.with_soft_host_reservation(|| {
+                    wasixv2_exec::poll_native_host_reservation(&exec, store, bytes)
+                })
             }));
             // Refusal, reconciliation and rollback can call the accountant.
             // Release the checked Store borrow before any of those callouts.
@@ -192,6 +194,7 @@ unsafe impl<S: LoaderControl + Send + Sync + 'static> NativeGuestRefill for Refi
         // Install the exact borrowed suffix first. Capture its checked async
         // loan only through a counted temporary; release all T/frame/Store
         // wrappers before the driver can yield this suffix.
+        let budget = self.budget.clone();
         store.parked(|| {
             let env = capture_environment(&exec);
             let Some(env) = env else {
@@ -201,9 +204,12 @@ unsafe impl<S: LoaderControl + Send + Sync + 'static> NativeGuestRefill for Refi
                 let memory = GuestMemory::new(&env);
                 let caller = Caller::new(task, &memory);
                 let reservation = syscalls.loader_reserve_host(&caller, bytes, 65536);
-                let Ok(lease) = ReservationFuture(Charged {
+                let mut reservation = std::pin::pin!(ReservationFuture(Charged {
                     value: Some(reservation),
                     charge,
+                }));
+                let Ok(lease) = std::future::poll_fn(|cx| {
+                    budget.with_soft_host_reservation(|| reservation.as_mut().poll(cx))
                 })
                 .await
                 else {
@@ -241,7 +247,7 @@ struct LeaseCharge {
 #[cfg(not(target_arch = "wasm32"))]
 impl LeaseCharge {
     fn new(budget: Arc<ResourceBudget>, bytes: u32) -> Result<Self, crate::OverBudget> {
-        budget.try_charge(Pool::WasmLinear, u64::from(bytes))?;
+        budget.try_charge_soft(Pool::WasmLinear, u64::from(bytes))?;
         Ok(Self {
             budget,
             bytes: u64::from(bytes),
@@ -251,7 +257,7 @@ impl LeaseCharge {
         let bytes = u64::from(bytes);
         if bytes > self.bytes {
             self.budget
-                .try_charge(Pool::WasmLinear, bytes - self.bytes)?;
+                .try_charge_soft(Pool::WasmLinear, bytes - self.bytes)?;
             self.bytes = bytes;
         } else if bytes < self.bytes {
             let excess = self.bytes - bytes;

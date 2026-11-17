@@ -228,3 +228,95 @@ async fn native_arraybuffer_backing_is_an_exact_protected_kernel_lease() {
         })
         .await;
 }
+
+#[tokio::test]
+async fn protected_heap_prefunds_before_clamped_isolate_ceiling() {
+    use std::sync::atomic::AtomicU64;
+    use wasmer_napi::NapiMemoryAccountant;
+    const MIB: u64 = 1024 * 1024;
+    struct Accountant {
+        charged: AtomicU64,
+        hard_denials: AtomicUsize,
+    }
+    impl NapiMemoryAccountant for Accountant {
+        fn memory_limit(&self) -> u64 {
+            160 * MIB
+        }
+        fn memory_charged(&self) -> u64 {
+            self.charged.load(Ordering::SeqCst)
+        }
+        fn try_charge(&self, bytes: u64) -> bool {
+            let ok = self.try_charge_soft(bytes);
+            if !ok {
+                self.hard_denials.fetch_add(1, Ordering::SeqCst);
+            }
+            ok
+        }
+        fn try_charge_soft(&self, bytes: u64) -> bool {
+            self.charged
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    n.checked_add(bytes).filter(|n| *n <= self.memory_limit())
+                })
+                .is_ok()
+        }
+        fn uncharge(&self, bytes: u64) {
+            self.charged.fetch_sub(bytes, Ordering::SeqCst);
+        }
+    }
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let accountant = Arc::new(Accountant {
+                charged: AtomicU64::new(0),
+                hard_denials: AtomicUsize::new(0),
+            });
+            let context = NapiCtx::builder()
+                .memory_accountant(accountant.clone())
+                .build();
+            let mut engine: Engine = EngineBuilder::new(Cranelift::default()).engine().into();
+            engine.set_tunables(budgeted_tunables(context.budget()));
+            let source = r#"(module
+                (import "env" "memory" (memory 1664 4096 shared))
+                (import "wasixv2" "exit_group" (func $exit (param i32)))
+                (import "napi" "napi_wasm_init_env" (func $init (result i32)))
+                (func (export "_start")
+                    call $init i32.eqz if unreachable end
+                    i32.const 0 call $exit unreachable))"#;
+            let module = wasixv2::load(&engine, &wat::parse_str(source).unwrap()).unwrap();
+            let observation = Arc::new(Observation::default());
+            let machine = Machine::builder()
+                .instantiation_hook(Arc::new(NapiHook::new(context.clone())))
+                .instantiation_hook(Arc::new(ObserverHook(observation.clone())))
+                .build();
+            let status = machine
+                .run_module(
+                    &engine,
+                    &module,
+                    ProcessConfig {
+                        args: vec!["napi-prefund".into()],
+                        env: Vec::new(),
+                        stdio: Stdio::from_fns(|_| {}, |_| {}),
+                    },
+                )
+                .await;
+            machine.shutdown().await;
+            drop(machine);
+            drop(module);
+            drop(engine);
+            assert_eq!(status.unwrap(), 0);
+            assert_eq!(
+                accountant.hard_denials.load(Ordering::SeqCst),
+                0,
+                "prefunding must not terminally exhaust the quota"
+            );
+            assert_eq!(context.active_sessions(), 0);
+            assert_eq!(context.budget().snapshot().live_isolates, 0);
+            let memory = observation.memory.lock().unwrap().take().unwrap();
+            assert!(
+                memory.host_data().unwrap().1 >= 120 * MIB,
+                "the protected heap must hold its 16 MiB prefund before ceiling planning"
+            );
+            drop(memory);
+            assert_eq!(accountant.memory_charged(), 0);
+        })
+        .await;
+}
