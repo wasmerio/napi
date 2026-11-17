@@ -1,4 +1,11 @@
 #include "unofficial_napi.h"
+#ifndef NODE_API_EXPERIMENTAL_HAS_SET_PROTOTYPE
+// js_native_api.h declares it only under NAPI_EXPERIMENTAL, which changes
+// other declarations this file relies on; both providers define it.
+extern "C" napi_status NAPI_CDECL node_api_set_prototype(napi_env env,
+                                                       napi_value object,
+                                                       napi_value value);
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -1037,36 +1044,6 @@ void ThrowTypeErrorWithCode(v8::Local<v8::Context> context,
   napi_v8_throw_unless_terminating(isolate, exception);
 }
 
-v8::Local<v8::Object> CreateBufferObject(v8::Local<v8::Context> context,
-                                         v8::Local<v8::ArrayBuffer> array_buffer,
-                                         size_t offset,
-                                         size_t length) {
-  v8::Isolate* isolate = v8::Isolate::GetCurrent();
-  v8::Local<v8::Object> global = context->Global();
-
-  v8::Local<v8::Value> buffer_ctor_value;
-  if (global->Get(context, OneByteString(isolate, "Buffer")).ToLocal(&buffer_ctor_value) &&
-      buffer_ctor_value->IsObject()) {
-    v8::Local<v8::Object> buffer_ctor = buffer_ctor_value.As<v8::Object>();
-    v8::Local<v8::Value> from_value;
-    if (buffer_ctor->Get(context, OneByteString(isolate, "from")).ToLocal(&from_value) &&
-        from_value->IsFunction()) {
-      v8::Local<v8::Value> argv[3] = {
-          array_buffer,
-          v8::Number::New(isolate, static_cast<double>(offset)),
-          v8::Number::New(isolate, static_cast<double>(length)),
-      };
-      v8::Local<v8::Value> maybe_buffer;
-      if (from_value.As<v8::Function>()->Call(context, buffer_ctor, 3, argv).ToLocal(&maybe_buffer) &&
-          maybe_buffer->IsObject()) {
-        return maybe_buffer.As<v8::Object>();
-      }
-    }
-  }
-
-  return v8::Uint8Array::New(array_buffer, offset, length);
-}
-
 bool ReadArrayBufferViewBytes(v8::Local<v8::Value> value,
                               const uint8_t** data_out,
                               size_t* size_out) {
@@ -1234,7 +1211,9 @@ void SerializerContext::ReleaseBuffer(const v8::FunctionCallbackInfo<v8::Value>&
       return;
     }
     v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(isolate, std::move(backing_store));
-    args.GetReturnValue().Set(CreateBufferObject(context, ab, 0, serialized.second));
+    // A plain Uint8Array: Buffer is the embedder's, which gives it its
+    // prototype where its API promises a Buffer (v8.serialize).
+    args.GetReturnValue().Set(v8::Uint8Array::New(ab, 0, serialized.second));
 }
 
 void SerializerContext::TransferArrayBuffer(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -1909,6 +1888,24 @@ napi_status NAPI_CDECL unofficial_napi_create_guest_backed_typedarray(
   napi_status status = napi_create_arraybuffer(env, length * element_size, data, &arraybuffer);
   if (status != napi_ok) return status;
   return napi_create_typedarray(env, type, length, arraybuffer, 0, result);
+}
+
+napi_status NAPI_CDECL unofficial_napi_create_uint8array(
+    napi_env env, size_t length, napi_value prototype_or_null, void** data,
+    napi_value* result) {
+  if (env == nullptr || data == nullptr || result == nullptr) return napi_invalid_arg;
+  NAPI_V8_RETURN_IF_TERMINATING(env);
+  napi_value array = nullptr;
+  napi_status status = unofficial_napi_create_guest_backed_typedarray(
+      env, napi_uint8_array, length, data, &array);
+  if (status != napi_ok) return status;
+  if (prototype_or_null != nullptr) {
+    // A fresh typed array's [[SetPrototypeOf]] is ordinary: no JS runs.
+    status = node_api_set_prototype(env, array, prototype_or_null);
+    if (status != napi_ok) return status;
+  }
+  *result = array;
+  return napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_attach_env(

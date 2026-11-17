@@ -587,6 +587,19 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_guest_backed_typ
     size_t length,
     void** data,
     napi_value* result);
+// Creates a zero-filled Uint8Array of the current realm over its own
+// ArrayBuffer, with `prototype_or_null` as its prototype when given (an
+// embedder's Buffer.prototype, say). Its memory is placed as
+// unofficial_napi_create_guest_backed_typedarray places it, so on WASIX
+// `*data` is a stable guest pointer. It reads no global and runs no JS, and is
+// refused while the env terminates. It is how an embedder makes a Node Buffer
+// in one call: the provider has no notion of Buffer.
+NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_uint8array(
+    napi_env env,
+    size_t length,
+    napi_value prototype_or_null,
+    void** data,
+    napi_value* result);
 // Creates an ArrayBuffer using the provider's native ownership policy without
 // exposing a raw pointer to Edge. Embedded providers may adopt an uninitialized
 // native allocation; host-JavaScript providers allocate in the host engine and
@@ -1129,7 +1142,10 @@ NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_set_continuation_preser
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_notify_datetime_configuration_change(napi_env env);
 
 // Unofficial helper. Creates the native internalBinding('serdes') object
-// containing Serializer and Deserializer constructors.
+// containing Serializer and Deserializer constructors. Serializer's
+// releaseBuffer returns a plain Uint8Array over its own ArrayBuffer, never a
+// Buffer: an embedder whose API promises one (v8.serialize) gives it its
+// Buffer.prototype.
 NAPI_EXTENSION_WASMER_EXTERN napi_status unofficial_napi_create_serdes_binding(napi_env env,
                                                               napi_value* result_out);
 

@@ -2,6 +2,7 @@
 #undef NAPI_MODULE
 #endif
 #include "node_api.h"
+#include "unofficial_napi.h"
 
 #include "test_env.h"
 #include "upstream_js_test.h"
@@ -802,6 +803,57 @@ TEST_F(Test33TypedArray, SerdesBindingOutlivesTheCallThatMadeIt) {
 // The serdes binding's Serializer copies a view's own bytes: neither what a
 // script redefined on DataView.prototype nor a length-tracking view's length
 // from before its buffer grew.
+// An embedder makes a Node Buffer with one call: a zeroed Uint8Array over its
+// own ArrayBuffer, given its prototype, made without reading a global or
+// running JS. The provider has no notion of Buffer.
+TEST_F(Test33TypedArray, CreateUint8ArrayIsZeroedAndTakesItsPrototype) {
+  EnvScope s(runtime_.get());
+  RunBufferScript(s.env,
+                  "globalThis.bufferReads = 0;"
+                  "Object.defineProperty(globalThis, 'Buffer', { configurable: true,"
+                  "  get() { bufferReads++; throw new Error('Buffer read'); } });"
+                  "globalThis.proto = Object.create(Uint8Array.prototype,"
+                  "  { tag: { value: 'buffer' } });"
+                  "0");
+  napi_value proto = NamedGlobal(s.env, "proto");
+
+  void* data = nullptr;
+  napi_value made = nullptr;
+  ASSERT_EQ(unofficial_napi_create_uint8array(s.env, 16, proto, &data, &made), napi_ok);
+  ASSERT_NE(data, nullptr);
+  auto* bytes = static_cast<uint8_t*>(data);
+  EXPECT_EQ(std::vector<uint8_t>(bytes, bytes + 16), std::vector<uint8_t>(16, 0));
+  bytes[3] = 7;
+  SetGlobal(s.env, "made", made);
+  RunBufferScript(s.env,
+                  "globalThis.ok = Object.getPrototypeOf(made) === proto &&"
+                  " made.tag === 'buffer' && made.length === 16 && made[3] === 7 &&"
+                  " made.byteOffset === 0 && made.buffer.byteLength === 16 ? 1 : 0");
+  EXPECT_EQ(GlobalInt(s.env, "ok"), 1);
+
+  napi_value plain = nullptr;
+  data = nullptr;
+  ASSERT_EQ(unofficial_napi_create_uint8array(s.env, 0, nullptr, &data, &plain), napi_ok);
+  SetGlobal(s.env, "plain", plain);
+  RunBufferScript(s.env,
+                  "globalThis.ok = Object.getPrototypeOf(plain) === Uint8Array.prototype &&"
+                  " plain.length === 0 ? 1 : 0");
+  EXPECT_EQ(GlobalInt(s.env, "ok"), 1);
+  EXPECT_EQ(GlobalInt(s.env, "bufferReads"), 0) << "the provider read the global Buffer";
+
+  EXPECT_EQ(unofficial_napi_create_uint8array(s.env, 4, proto, nullptr, &made), napi_invalid_arg);
+  EXPECT_EQ(unofficial_napi_create_uint8array(s.env, 4, proto, &data, nullptr), napi_invalid_arg);
+
+  ASSERT_EQ(unofficial_napi_terminate_execution(s.env), napi_ok);
+  napi_value refused = nullptr;
+  EXPECT_EQ(unofficial_napi_create_uint8array(s.env, 4, proto, &data, &refused),
+            napi_pending_exception);
+  EXPECT_EQ(refused, nullptr);
+  ASSERT_EQ(unofficial_napi_cancel_terminate_execution(s.env), napi_ok);
+  napi_value pending = nullptr;
+  (void)napi_get_and_clear_last_exception(s.env, &pending);
+}
+
 TEST_F(Test33TypedArray, SerializerWritesAViewsOwnBytes) {
   EnvScope s(runtime_.get());
   napi_value serdes = nullptr;
@@ -828,9 +880,19 @@ TEST_F(Test33TypedArray, SerializerWritesAViewsOwnBytes) {
       "  return serializer.releaseBuffer();"
       "})()");
   ASSERT_NE(released, nullptr);
+  napi_typedarray_type type = napi_int8_array;
   void* data = nullptr;
   size_t length = 0;
-  ASSERT_EQ(napi_get_buffer_info(s.env, released, &data, &length), napi_ok);
+  ASSERT_EQ(napi_get_typedarray_info(s.env, released, &type, &length, &data, nullptr, nullptr),
+            napi_ok);
+  EXPECT_EQ(type, napi_uint8_array);
+  // A plain Uint8Array: Buffer is the embedder's to apply.
+  SetGlobal(s.env, "released", released);
+  RunBufferScript(s.env,
+                  "globalThis.plain = Object.getPrototypeOf(released) === Uint8Array.prototype &&"
+                  " released.byteOffset === 0 && released.buffer.byteLength === released.length"
+                  " ? 1 : 0");
+  EXPECT_EQ(GlobalInt(s.env, "plain"), 1);
   const std::vector<uint8_t> expected = {2, 3, 4, 5, 101, 102, 103, 104, 105, 106, 107};
   const auto* bytes = static_cast<const uint8_t*>(data);
   EXPECT_EQ(std::vector<uint8_t>(bytes, bytes + length), expected);

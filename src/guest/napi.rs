@@ -4678,6 +4678,35 @@ fn guest_unofficial_napi_release_buffer_lease(
     unsafe { snapi_bridge_unofficial_release_buffer_lease(snapi_env(&env, e), lease_id, modified) }
 }
 
+// A zero-filled Uint8Array placed as a guest-backed typed array, given
+// `prototype` (an embedder's Buffer.prototype) when that is not 0: a Node
+// Buffer in one import, without the provider knowing Buffer.
+fn guest_unofficial_napi_create_uint8array(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: u32,
+    length: u32,
+    prototype: u32,
+    data_out: u32,
+    result_out: u32,
+) -> i32 {
+    const NAPI_UINT8_ARRAY: i32 = 1;
+    let status = guest_unofficial_napi_create_guest_backed_typedarray(
+        env.as_mut(),
+        e,
+        NAPI_UINT8_ARRAY,
+        length,
+        data_out,
+        result_out,
+    );
+    if status != 0 || prototype == 0 {
+        return status;
+    }
+    let Some(value) = read_guest_u32(&mut env, result_out) else {
+        return 9;
+    };
+    guest_node_api_set_prototype(env, e, value, prototype)
+}
+
 fn guest_unofficial_napi_create_guest_backed_typedarray(
     mut env: FunctionEnvMut<NapiEnv>,
     e: u32,
@@ -5241,6 +5270,7 @@ pub fn register_napi_imports(
         "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),
         "unofficial_napi_release_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_buffer_lease),
         "unofficial_napi_create_guest_backed_typedarray" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_guest_backed_typedarray),
+        "unofficial_napi_create_uint8array" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uint8array),
         "unofficial_napi_set_prepare_stack_trace_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_prepare_stack_trace_callback),
         "unofficial_napi_get_promise_details" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_promise_details),
         "unofficial_napi_get_proxy_details" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_proxy_details),

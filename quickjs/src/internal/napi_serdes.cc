@@ -273,12 +273,19 @@ namespace quickjs::detail
             return nullptr;
         }
 
-        napi_value buffer = nullptr;
-        const void *data = serializer->bytes.empty() ? nullptr : serializer->bytes.data();
-        if (napi_create_buffer_copy(env, serializer->bytes.size(), data, nullptr, &buffer) != napi_ok)
+        // A plain Uint8Array: Buffer is the embedder's, which gives it its
+        // prototype where its API promises a Buffer (v8.serialize).
+        const size_t size = serializer->bytes.size();
+        void *data = nullptr;
+        napi_value arraybuffer = nullptr;
+        napi_value result = nullptr;
+        if (napi_create_arraybuffer(env, size, &data, &arraybuffer) != napi_ok ||
+            napi_create_typedarray(env, napi_uint8_array, size, arraybuffer, 0, &result) != napi_ok)
             return nullptr;
+        if (size > 0)
+            std::memcpy(data, serializer->bytes.data(), size);
         serializer->bytes.clear();
-        return buffer;
+        return result;
     }
 
     // Brief: napi_serdes__::serializer_transfer_array_buffer belongs to the serdes compatibility layer.

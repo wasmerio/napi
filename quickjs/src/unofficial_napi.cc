@@ -1,4 +1,11 @@
 #include "unofficial_napi.h"
+#ifndef NODE_API_EXPERIMENTAL_HAS_SET_PROTOTYPE
+// js_native_api.h declares it only under NAPI_EXPERIMENTAL, which changes
+// other declarations this file relies on; both providers define it.
+extern "C" napi_status NAPI_CDECL node_api_set_prototype(napi_env env,
+                                                       napi_value object,
+                                                       napi_value value);
+#endif
 
 #include "internal/napi_callsite.h"
 #include "internal/napi_serdes.h"
@@ -242,6 +249,32 @@ extern "C"
         if (status != napi_ok)
             return status;
         return napi_create_typedarray(env, type, length, arraybuffer, 0, result);
+    }
+
+    napi_status NAPI_CDECL unofficial_napi_create_uint8array(
+        napi_env env, size_t length, napi_value prototype_or_null, void **data, napi_value *result)
+    {
+        if (env == nullptr || data == nullptr || result == nullptr)
+            return napi_invalid_arg;
+        if (napi_util__::check_env(env) && env->termination_requested())
+            return napi_util__::fail_if_terminating(env, napi_util__::context(env));
+        napi_value array = nullptr;
+        napi_status status = unofficial_napi_create_guest_backed_typedarray(
+            env, napi_uint8_array, length, data, &array);
+        if (status != napi_ok)
+            return status;
+        // QuickJS's napi_create_arraybuffer leaves the memory uninitialized.
+        if (length > 0 && *data != nullptr)
+            std::memset(*data, 0, length);
+        if (prototype_or_null != nullptr)
+        {
+            // A fresh typed array's [[SetPrototypeOf]] is ordinary: no JS runs.
+            status = node_api_set_prototype(env, array, prototype_or_null);
+            if (status != napi_ok)
+                return status;
+        }
+        *result = array;
+        return napi_ok;
     }
 
     // The env takes the getters of buffer, byteOffset and byteLength on
