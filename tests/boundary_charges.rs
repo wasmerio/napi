@@ -89,8 +89,8 @@ fn guests_cannot_take_another_contexts_messages() {
     assert_eq!(owner.budget().snapshot().serialized_message, 0);
 }
 
-/// A message larger than what the budget has left is refused as a clone
-/// error the guest can catch, and nothing stays charged for it.
+/// Message creation and structured clone both expose the error when
+/// serialization exhausts the budget and return the transient charges.
 #[test]
 fn a_message_over_the_budget_is_a_catchable_clone_error() {
     // Room for the isolate (88 MiB) and the guest's memory with its 40 MiB
@@ -105,6 +105,7 @@ fn a_message_over_the_budget_is_a_catchable_clone_error() {
         budget.snapshot()
     );
     assert_eq!(budget.snapshot().serialized_message, 0);
+    assert_eq!(budget.snapshot().host_transient, 0);
 }
 
 /// The bridge's handle tables are charged: a guest that keeps creating

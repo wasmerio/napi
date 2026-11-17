@@ -2101,6 +2101,21 @@ napi_status DeserializeTransferredClone(
   return result_out->IsEmpty() ? napi_generic_failure : napi_ok;
 }
 
+napi_status WriteCloneValue(napi_env env,
+                            v8::Local<v8::Context> context,
+                            v8::ValueSerializer& serializer,
+                            v8::Local<v8::Value> input) {
+  v8::TryCatch try_catch(env->isolate);
+  serializer.WriteHeader();
+  if (serializer.WriteValue(context, input).IsJust()) return napi_ok;
+  // Ordinary clone errors are retrievable through N-API. Leave a
+  // termination with V8 so it cannot become a catchable JavaScript error.
+  if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
+    napi_v8_set_last_exception(env, try_catch.Exception(), try_catch.Message());
+  }
+  return napi_pending_exception;
+}
+
 napi_status StructuredCloneImpl(
     napi_env env,
     napi_value value,
@@ -2133,10 +2148,8 @@ napi_status StructuredCloneImpl(
     return transfer_status;
   }
 
-  serializer.WriteHeader();
-  if (serializer.WriteValue(context, input).IsNothing()) {
-    return isolate->IsExecutionTerminating() ? napi_pending_exception : napi_pending_exception;
-  }
+  const napi_status write_status = WriteCloneValue(env, context, serializer, input);
+  if (write_status != napi_ok) return write_status;
 
   std::vector<std::shared_ptr<v8::BackingStore>> transferred_array_buffers;
   transfer_status = DetachTransferredArrayBuffers(array_buffers, &transferred_array_buffers);
@@ -3022,7 +3035,8 @@ napi_status NAPI_CDECL unofficial_napi_structured_clone(
 
 namespace {
 
-napi_status ThrowCloneOutOfMemory(napi_env env, v8::TryCatch& try_catch) {
+napi_status ThrowCloneOutOfMemory(napi_env env) {
+  v8::TryCatch try_catch(env->isolate);
   env->isolate->ThrowException(v8::Exception::Error(
       v8::String::NewFromUtf8Literal(env->isolate,
                                      "Data cannot be cloned, out of memory.")));
@@ -3059,24 +3073,15 @@ napi_status NAPI_CDECL unofficial_napi_message_create(
   StructuredCloneSerializerDelegate serializer_delegate(isolate, &charge);
   v8::ValueSerializer serializer(isolate, &serializer_delegate);
 
-  // A clone error (an uncloneable value, or a message the budget refused) is
-  // the env's last exception, as N-API reports exceptions; a termination
-  // stays with V8.
-  v8::TryCatch try_catch(isolate);
-  serializer.WriteHeader();
-  if (serializer.WriteValue(context, input).IsNothing()) {
-    if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
-      napi_v8_set_last_exception(env, try_catch.Exception(), try_catch.Message());
-    }
-    return napi_pending_exception;
-  }
+  const napi_status write_status = WriteCloneValue(env, context, serializer, input);
+  if (write_status != napi_ok) return write_status;
 
   std::pair<uint8_t*, size_t> released = serializer.Release();
   if (released.first == nullptr) return napi_generic_failure;
   std::unique_ptr<uint8_t, FreeDeleter> data(released.first);
   // The serializer already charged the buffer and side tables.
   if (!charge.Grow(sizeof(SerializedClonePayload), /*soft=*/true)) {
-    return ThrowCloneOutOfMemory(env, try_catch);
+    return ThrowCloneOutOfMemory(env);
   }
   auto* payload = new (std::nothrow) SerializedClonePayload();
   if (payload == nullptr) return napi_generic_failure;
