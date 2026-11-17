@@ -26,6 +26,19 @@ extern "C" void napi_host_guest_heap_release(void* ctx) {
   g_last_released_guest_heap_ctx = ctx;
 }
 
+#if defined(NAPI_TEST_ENGINE_V8)
+#include <v8.h>
+
+// Provider-private env creation with the embedder's WebAssembly policy
+// (NapiWebAssemblyPolicy: 0 restricted, 1 unmetered).
+extern "C" napi_status snapi_private_create_env(
+    int32_t module_api_version,
+    const unofficial_napi_env_create_options* options,
+    uint32_t webassembly_policy,
+    napi_env* env_out,
+    unofficial_napi_env_owner* owner_out);
+#endif
+
 class Test21General : public FixtureTestBase {};
 
 namespace {
@@ -142,6 +155,259 @@ TEST_F(Test21General, FullEnvironmentOptionsTransferGuestHeapOwnershipBeforeOutp
   EXPECT_EQ(g_guest_heap_release_calls, 2);
   EXPECT_EQ(g_last_released_guest_heap_ctx, options.guest_heap);
 }
+
+#if defined(NAPI_TEST_ENGINE_V8)
+namespace {
+
+constexpr uint32_t kWebAssemblyRestricted = 0;
+constexpr uint32_t kWebAssemblyAllowUnmetered = 1;
+
+// Compiles (module (func (export "add") (param i32 i32) (result i32)
+// local.get 0 local.get 1 i32.add)) with the JS API, which asks the isolate's
+// AllowWasmCodeGenerationCallback. (V8's C++ WasmModuleObject::Compile does
+// not: it serves ESM integration, and only native embedder code reaches it.)
+constexpr char kCompileAddModule[] =
+    "new WebAssembly.Module(new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, "
+    "0x00, 0x00, 0x00, 0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, "
+    "0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x61, 0x64, 0x64, 0x00, "
+    "0x00, 0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, "
+    "0x0b])) instanceof WebAssembly.Module";
+
+std::string RunToString(napi_env env, const char* script) {
+  napi_value source = nullptr;
+  napi_value result = nullptr;
+  if (napi_create_string_utf8(env, script, NAPI_AUTO_LENGTH, &source) != napi_ok ||
+      napi_run_script(env, source, &result) != napi_ok) {
+    return "<script failed>";
+  }
+  char text[64] = {0};
+  size_t length = 0;
+  if (napi_get_value_string_utf8(env, result, text, sizeof(text), &length) != napi_ok) {
+    return "<not a string>";
+  }
+  return std::string(text, length);
+}
+
+// Whether a wasm module compiles in the isolate's current context. False when
+// the context has no WebAssembly global or refuses wasm code generation.
+bool CompilesWasmInCurrentContext() {
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
+  v8::HandleScope scope(isolate);
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  v8::TryCatch try_catch(isolate);
+  v8::Local<v8::Script> script;
+  v8::Local<v8::Value> result;
+  return v8::Script::Compile(context,
+                             v8::String::NewFromUtf8Literal(isolate, kCompileAddModule))
+             .ToLocal(&script) &&
+         script->Run(context).ToLocal(&result) && result->IsTrue();
+}
+
+// The same in a context the provider did not make, as V8 makes for a
+// ShadowRealm. It has V8's own WebAssembly global, so only the
+// code-generation callback can refuse.
+bool CompilesWasmInForeignContext() {
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
+  v8::HandleScope scope(isolate);
+  v8::Local<v8::Context> foreign = v8::Context::New(isolate);
+  v8::Context::Scope context_scope(foreign);
+  return CompilesWasmInCurrentContext();
+}
+
+}  // namespace
+
+TEST_F(Test21General, UnknownWebAssemblyPolicyIsRefusedAfterTakingTheGuestHeap) {
+  unofficial_napi_env_create_options options{};
+  InitializeTestEnvCreateOptions(&options);
+  int guest_heap_marker = 0;
+  options.guest_heap = reinterpret_cast<unofficial_napi_guest_heap>(&guest_heap_marker);
+
+  g_guest_heap_release_calls = 0;
+  g_last_released_guest_heap_ctx = nullptr;
+  napi_env env = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
+  EXPECT_EQ(snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options,
+                                     kWebAssemblyAllowUnmetered + 1, &env, &owner),
+            napi_invalid_arg);
+  EXPECT_EQ(env, nullptr);
+  EXPECT_EQ(owner, nullptr);
+  EXPECT_EQ(g_guest_heap_release_calls, 1);
+  EXPECT_EQ(g_last_released_guest_heap_ctx, options.guest_heap);
+}
+
+TEST_F(Test21General, WebAssemblyPolicyDecidesWebAssemblyInTheEnv) {
+  struct Case {
+    const char* name;
+    bool use_public_entry;
+    uint32_t policy;
+    bool webassembly_available;
+  };
+  const Case cases[] = {
+      {"public entry", true, kWebAssemblyAllowUnmetered, true},
+      {"restricted", false, kWebAssemblyRestricted, false},
+      {"unmetered", false, kWebAssemblyAllowUnmetered, true},
+      // A restricted isolate does not leak into the next one.
+      {"restricted again", false, kWebAssemblyRestricted, false},
+      {"unmetered again", false, kWebAssemblyAllowUnmetered, true},
+  };
+  for (const Case& test_case : cases) {
+    SCOPED_TRACE(test_case.name);
+    unofficial_napi_env_create_options options{};
+    InitializeTestEnvCreateOptions(&options);
+    napi_env env = nullptr;
+    unofficial_napi_env_owner owner = nullptr;
+    const napi_status status =
+        test_case.use_public_entry
+            ? unofficial_napi_create_env(NAPI_TEST_MODULE_API_VERSION, &options, &env, &owner)
+            : snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options,
+                                       test_case.policy, &env, &owner);
+    ASSERT_EQ(status, napi_ok);
+    ASSERT_NE(env, nullptr);
+
+    EXPECT_EQ(RunToString(env, "typeof WebAssembly"),
+              test_case.webassembly_available ? "object" : "undefined");
+    EXPECT_EQ(CompilesWasmInCurrentContext(), test_case.webassembly_available);
+    EXPECT_EQ(CompilesWasmInForeignContext(), test_case.webassembly_available);
+
+    // A realm that allows wasm code generation gets no more than its env.
+    unofficial_napi_realm realm = nullptr;
+    napi_value global = nullptr;
+    ASSERT_EQ(unofficial_napi_create_realm(env, nullptr, &realm, &global), napi_ok);
+    unofficial_napi_realm_scope realm_scope = 0;
+    ASSERT_EQ(unofficial_napi_enter_realm(env, realm, &realm_scope), napi_ok);
+    EXPECT_EQ(CompilesWasmInCurrentContext(), test_case.webassembly_available);
+    ASSERT_EQ(unofficial_napi_leave_realm(env, realm_scope), napi_ok);
+
+    // A realm that refuses it compiles nothing, whatever the policy.
+    unofficial_napi_realm_options realm_options;
+    unofficial_napi_realm_options_init(&realm_options);
+    realm_options.allow_code_gen_wasm = false;
+    ASSERT_EQ(unofficial_napi_create_realm(env, &realm_options, &realm, &global), napi_ok);
+    ASSERT_EQ(unofficial_napi_enter_realm(env, realm, &realm_scope), napi_ok);
+    EXPECT_FALSE(CompilesWasmInCurrentContext());
+    ASSERT_EQ(unofficial_napi_leave_realm(env, realm_scope), napi_ok);
+
+    ASSERT_EQ(unofficial_napi_release_env(owner, nullptr), napi_ok);
+  }
+}
+
+namespace {
+
+// Makes a message of `script`'s value in a fresh env with `policy`, then
+// releases that env: the message outlives its sender, as one a worker posts.
+unofficial_napi_message MessageFrom(uint32_t policy, const char* script) {
+  napi_env env = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
+  unofficial_napi_env_create_options options{};
+  InitializeTestEnvCreateOptions(&options);
+  EXPECT_EQ(snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options, policy, &env,
+                                     &owner),
+            napi_ok);
+  if (env == nullptr) return nullptr;
+  napi_value source = nullptr;
+  napi_value value = nullptr;
+  unofficial_napi_message message = nullptr;
+  EXPECT_EQ(napi_create_string_utf8(env, script, NAPI_AUTO_LENGTH, &source), napi_ok);
+  EXPECT_EQ(napi_run_script(env, source, &value), napi_ok);
+  EXPECT_EQ(unofficial_napi_message_create(env, value, &message), napi_ok);
+  EXPECT_EQ(unofficial_napi_release_env(owner, nullptr), napi_ok);
+  return message;
+}
+
+// Takes `message` in a fresh env with `policy`: "refused" when the take
+// throws, else each received property's [[Class]].
+std::string TakeIn(uint32_t policy, unofficial_napi_message message) {
+  if (message == nullptr) return "<no message>";
+  napi_env env = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
+  unofficial_napi_env_create_options options{};
+  InitializeTestEnvCreateOptions(&options);
+  EXPECT_EQ(snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options, policy, &env,
+                                     &owner),
+            napi_ok);
+  if (env == nullptr) return "<no env>";
+  std::string described;
+  napi_value value = nullptr;
+  const napi_status status = unofficial_napi_message_take(env, message, &value);
+  if (status == napi_pending_exception) {
+    napi_value exception = nullptr;
+    EXPECT_EQ(napi_get_and_clear_last_exception(env, &exception), napi_ok);
+    described = "refused";
+  } else if (status != napi_ok) {
+    described = "status " + std::to_string(status);
+  } else {
+    napi_value global = nullptr;
+    EXPECT_EQ(napi_get_global(env, &global), napi_ok);
+    EXPECT_EQ(napi_set_named_property(env, global, "__received", value), napi_ok);
+    described = RunToString(
+        env,
+        "Object.keys(__received).map(function (key) { return key + ':' + "
+        "Object.prototype.toString.call(__received[key]); }).join()");
+  }
+  EXPECT_EQ(unofficial_napi_release_env(owner, nullptr), napi_ok);
+  return described;
+}
+
+constexpr char kModuleMessage[] =
+    "({ module: new WebAssembly.Module(new Uint8Array([0x00, 0x61, 0x73, "
+    "0x6d, 0x01, 0x00, 0x00, 0x00])) })";
+constexpr char kSharedMemoryMessage[] =
+    "({ memory: new WebAssembly.Memory({ initial: 1, maximum: 2, shared: true }) })";
+constexpr char kSharedBufferMessage[] = "({ buffer: new SharedArrayBuffer(8) })";
+
+}  // namespace
+
+// V8 restores modules and shared memories without asking the code-generation
+// callback, so a restricted env checks a message before it is read.
+TEST_F(Test21General, RestrictedEnvironmentsRefuseWebAssemblyMessages) {
+  const uint32_t restricted = kWebAssemblyRestricted;
+  const uint32_t unmetered = kWebAssemblyAllowUnmetered;
+
+  EXPECT_EQ(TakeIn(restricted, MessageFrom(unmetered, kModuleMessage)), "refused");
+  EXPECT_EQ(TakeIn(unmetered, MessageFrom(unmetered, kModuleMessage)),
+            "module:[object WebAssembly.Module]");
+
+  EXPECT_EQ(TakeIn(restricted, MessageFrom(unmetered, kSharedMemoryMessage)), "refused");
+  EXPECT_EQ(TakeIn(unmetered, MessageFrom(unmetered, kSharedMemoryMessage)),
+            "memory:[object WebAssembly.Memory]");
+
+  // A shared buffer from an env with WebAssembly may back a memory.
+  EXPECT_EQ(TakeIn(restricted, MessageFrom(unmetered, kSharedBufferMessage)), "refused");
+  EXPECT_EQ(TakeIn(unmetered, MessageFrom(unmetered, kSharedBufferMessage)),
+            "buffer:[object SharedArrayBuffer]");
+  // Between restricted envs, as between all envs of one context, shared
+  // memory still crosses.
+  EXPECT_EQ(TakeIn(restricted, MessageFrom(restricted, kSharedBufferMessage)),
+            "buffer:[object SharedArrayBuffer]");
+}
+
+// A refused message must not replace a pending termination with an ordinary
+// error, which would stay pending once the termination is cancelled.
+TEST_F(Test21General, RefusedMessageKeepsTheTermination) {
+  unofficial_napi_message message =
+      MessageFrom(kWebAssemblyAllowUnmetered, kModuleMessage);
+  ASSERT_NE(message, nullptr);
+  napi_env env = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
+  unofficial_napi_env_create_options options{};
+  InitializeTestEnvCreateOptions(&options);
+  ASSERT_EQ(snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options,
+                                     kWebAssemblyRestricted, &env, &owner),
+            napi_ok);
+
+  ASSERT_EQ(unofficial_napi_terminate_execution(env), napi_ok);
+  napi_value value = nullptr;
+  EXPECT_EQ(unofficial_napi_message_take(env, message, &value), napi_pending_exception);
+  EXPECT_EQ(value, nullptr);
+
+  ASSERT_EQ(unofficial_napi_cancel_terminate_execution(env), napi_ok);
+  bool pending = true;
+  ASSERT_EQ(napi_is_exception_pending(env, &pending), napi_ok);
+  EXPECT_FALSE(pending);
+  EXPECT_EQ(RunToString(env, "'resumed'"), "resumed");
+  ASSERT_EQ(unofficial_napi_release_env(owner, nullptr), napi_ok);
+}
+#endif
 
 TEST_F(Test21General, EnvironmentHooksAttachAtomicallyOnce) {
   napi_env env = nullptr;

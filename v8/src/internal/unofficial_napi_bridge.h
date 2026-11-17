@@ -13,6 +13,11 @@ bool NapiV8LookupForegroundTaskTarget(v8::Isolate* isolate,
                                       napi_env* env_out,
                                       unofficial_napi_enqueue_foreground_task_callback* callback_out);
 bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context);
+// The AllowWasmCodeGenerationCallback of the isolates the provider creates:
+// false in every context of a restricted agent, else a realm's
+// allow_code_gen_wasm, and true in other contexts.
+bool NapiV8AllowWasmCodeGeneration(v8::Local<v8::Context> context,
+                                   v8::Local<v8::String> source);
 void NapiV8ApplyPromiseHooksToContext(napi_env env, v8::Local<v8::Context> context);
 void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env);
 // Frees the records of collected realms, unassigning their context tokens.

@@ -35,3 +35,15 @@ CLI module caches are separated into `cranelift` and `llvm` subdirectories
 under `WASMER_NAPI_CACHE_DIR` (by default, the temporary directory's
 `wasmer-napi-cache`). Use a fresh cache root when comparing different Wasmer
 source revisions, and warm each guest before measuring steady-state throughput.
+
+## WebAssembly in the guest
+
+Guest JavaScript has V8's `WebAssembly` by default (`WasmPolicy::EnabledUnmetered`):
+wasm memories and compiled code are not charged to any N-API limit. Pass
+`--restricted-webassembly` to take it away (`WasmPolicy::Restricted`). The
+`WebAssembly` global is then absent from the guest's realms, and V8 refuses to
+compile wasm in all of them. Options follow the module path:
+
+```sh
+./target/release/napi_wasmer guest.wasm --restricted-webassembly
+```

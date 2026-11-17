@@ -46,6 +46,9 @@ struct napi_agent__ {
   std::shared_ptr<v8::ArrayBuffer::Allocator> allocator;
   // Provider-generated seed; zero means "ask the isolate".
   uint64_t hash_seed = 0;
+  // NapiWebAssemblyPolicy::kRestricted: no context of the isolate has the
+  // WebAssembly global or compiles wasm. Fixed once the agent is set up.
+  bool webassembly_restricted = false;
 
   // Isolate-wide keys for wraps, buffer records and type tags.
   v8::Global<v8::Private> wrap_private_key;

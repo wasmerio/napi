@@ -32,6 +32,7 @@
 
 #include "internal/napi_v8_env.h"
 #include "internal/napi_module_wrap_record.h"
+#include "internal/napi_wasm_policy.h"
 #include "internal/unofficial_napi_bridge.h"
 #include "napi_compat.h"
 #include "node_api.h"
@@ -1743,6 +1744,16 @@ bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context) {
   return realm != nullptr && realm->env == env;
 }
 
+bool NapiV8AllowWasmCodeGeneration(v8::Local<v8::Context> context,
+                                   v8::Local<v8::String> /*source*/) {
+  napi_agent__* agent = napi_agent__::From(v8::Isolate::GetCurrent());
+  // Installed only on isolates whose agent the provider made; fail closed if
+  // that is ever not so.
+  if (agent == nullptr || agent->webassembly_restricted) return false;
+  unofficial_napi_realm realm = RealmForContext(context);
+  return realm == nullptr || realm->allow_code_gen_wasm;
+}
+
 void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return;
   for (const auto& realm : env->realms) {
@@ -1855,11 +1866,16 @@ napi_status NAPI_CDECL unofficial_napi_create_realm(
                        v8::DeserializeInternalFieldsCallback(),
                        realm->own_microtask_queue.Get());
   if (context.IsEmpty()) return napi_pending_exception;
+  // Before the sandbox's own properties come back, so none of them is lost.
+  if (env->agent != nullptr && env->agent->webassembly_restricted &&
+      !RemoveWebAssemblyGlobal(context)) {
+    return napi_generic_failure;
+  }
 
   context->SetSecurityToken(current->GetSecurityToken());
-  // allow_code_gen_wasm is ignored: honoring it per realm needs an isolate
-  // AllowWasmCodeGenerationCallback, which this provider does not install.
-  // name and origin are ignored too.
+  // NapiV8AllowWasmCodeGeneration reads allow_code_gen_wasm from the realm
+  // record. name and origin are ignored.
+  realm->allow_code_gen_wasm = options.allow_code_gen_wasm;
   context->AllowCodeGenerationFromStrings(options.allow_code_gen_strings);
   // The realm slot can be beyond the context's initial embedder data.
   UNOFFICIAL_NAPI_SUPPRESS_DEPRECATED_BEGIN
