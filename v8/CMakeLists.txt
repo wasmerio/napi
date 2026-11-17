@@ -59,6 +59,15 @@ add_library(napi_v8 STATIC
   src/edge_v8_platform.cc
 )
 
+# Deprecated: napi's node_api.h Buffer, env cleanup hook and fatal calls.
+# An embedder that defines them itself (Edge.js) turns this off; see
+# docs/node-api.md.
+option(NAPI_PROVIDE_NODE_API
+  "Define node_api.h's Buffer, env cleanup hook and fatal calls (deprecated)" ON)
+if(NAPI_PROVIDE_NODE_API)
+  target_sources(napi_v8 PRIVATE src/node_api_v8.cc)
+endif()
+
 target_include_directories(napi_v8
   PUBLIC
     "${NAPI_INCLUDE_ROOT}"

@@ -1279,7 +1279,7 @@ void napi_v8_finalize_buffer_records(napi_env env) {
 
 extern "C" {
 
-void NAPI_CDECL napi_fatal_error(const char* location,
+void NAPI_CDECL napi_v8_fatal_error(const char* location,
                                  size_t location_len,
                                  const char* message,
                                  size_t message_len) {
@@ -3606,7 +3606,7 @@ napi_status NAPI_CDECL napi_run_script(napi_env env,
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
-napi_status NAPI_CDECL napi_fatal_exception(napi_env env, napi_value err) {
+napi_status NAPI_CDECL napi_v8_fatal_exception(napi_env env, napi_value err) {
   // As Node's NAPI_PREAMBLE: throwing while V8 terminates would replace the
   // termination with a catchable exception.
   NAPI_V8_RETURN_IF_TERMINATING(env);
@@ -3616,7 +3616,7 @@ napi_status NAPI_CDECL napi_fatal_exception(napi_env env, napi_value err) {
   return napi_ok;
 }
 
-napi_status NAPI_CDECL napi_add_env_cleanup_hook(node_api_basic_env env,
+napi_status NAPI_CDECL napi_v8_add_env_cleanup_hook(node_api_basic_env env,
                                                  napi_cleanup_hook fun,
                                                  void* arg) {
   auto* napiEnv = const_cast<napi_env>(env);
@@ -3630,7 +3630,7 @@ napi_status NAPI_CDECL napi_add_env_cleanup_hook(node_api_basic_env env,
   return napi_ok;
 }
 
-napi_status NAPI_CDECL napi_remove_env_cleanup_hook(node_api_basic_env env,
+napi_status NAPI_CDECL napi_v8_remove_env_cleanup_hook(node_api_basic_env env,
                                                     napi_cleanup_hook fun,
                                                     void* arg) {
   auto* napiEnv = const_cast<napi_env>(env);
@@ -3647,7 +3647,7 @@ napi_status NAPI_CDECL napi_remove_env_cleanup_hook(node_api_basic_env env,
   return napi_invalid_arg;
 }
 
-napi_status NAPI_CDECL napi_create_buffer(napi_env env,
+napi_status NAPI_CDECL napi_v8_create_buffer(napi_env env,
                                           size_t length,
                                           void** data,
                                           napi_value* result) {
@@ -3678,13 +3678,13 @@ napi_status NAPI_CDECL napi_create_buffer(napi_env env,
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
-napi_status NAPI_CDECL napi_create_buffer_copy(napi_env env,
+napi_status NAPI_CDECL napi_v8_create_buffer_copy(napi_env env,
                                                size_t length,
                                                const void* data,
                                                void** result_data,
                                                napi_value* result) {
   void* out = nullptr;
-  napi_status status = napi_create_buffer(env, length, &out, result);
+  napi_status status = napi_v8_create_buffer(env, length, &out, result);
   if (status != napi_ok) return status;
   if (length > 0 && data != nullptr) {
     std::memcpy(out, data, length);
@@ -3693,7 +3693,7 @@ napi_status NAPI_CDECL napi_create_buffer_copy(napi_env env,
   return napi_ok;
 }
 
-napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
+napi_status NAPI_CDECL napi_v8_create_external_buffer(napi_env env,
                                                    size_t length,
                                                    void* data,
                                                    node_api_basic_finalize finalize_cb,
@@ -3702,14 +3702,14 @@ napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
   return CreateExternalBuffer(env, length, data, finalize_cb, nullptr, finalize_hint, result);
 }
 
-napi_status NAPI_CDECL napi_is_buffer(napi_env env, napi_value value, bool* result) {
+napi_status NAPI_CDECL napi_v8_is_buffer(napi_env env, napi_value value, bool* result) {
   if (!CheckEnv(env) || value == nullptr || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
   *result = raw->IsArrayBufferView();
   return napi_ok;
 }
 
-napi_status NAPI_CDECL napi_get_buffer_info(napi_env env,
+napi_status NAPI_CDECL napi_v8_get_buffer_info(napi_env env,
                                             napi_value value,
                                             void** data,
                                             size_t* length) {
@@ -3720,7 +3720,7 @@ napi_status NAPI_CDECL napi_get_buffer_info(napi_env env,
   return napi_ok;
 }
 
-napi_status NAPI_CDECL node_api_create_buffer_from_arraybuffer(
+napi_status NAPI_CDECL napi_v8_create_buffer_from_arraybuffer(
     napi_env env,
     napi_value arraybuffer,
     size_t byte_offset,

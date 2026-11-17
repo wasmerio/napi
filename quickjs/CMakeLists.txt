@@ -90,6 +90,15 @@ if(NAPI_ENABLE_LIFETIME_TRACKER)
   target_sources(napi_quickjs PRIVATE src/internal/napi_lifetime_tracker.cc)
 endif()
 
+# Deprecated: napi's node_api.h Buffer, env cleanup hook and fatal calls.
+# An embedder that defines them itself (Edge.js) turns this off; see
+# docs/node-api.md.
+option(NAPI_PROVIDE_NODE_API
+  "Define node_api.h's Buffer, env cleanup hook and fatal calls (deprecated)" ON)
+if(NAPI_PROVIDE_NODE_API)
+  target_sources(napi_quickjs PRIVATE src/node_api_quickjs.cc)
+endif()
+
 target_include_directories(napi_quickjs
   PUBLIC
     "${NAPI_INCLUDE_ROOT}"

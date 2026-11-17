@@ -1,3 +1,4 @@
+#include "internal/napi_node_api.h"
 #include "internal/napi_env.h"
 #include "internal/napi_external.h"
 #include "internal/napi_external_backing_store_hint.h"
@@ -3074,7 +3075,7 @@ extern "C"
     return napi_pending_exception;
   }
 
-  napi_status NAPI_CDECL napi_fatal_exception(napi_env env, napi_value err)
+  napi_status NAPI_CDECL napi_quickjs_fatal_exception(napi_env env, napi_value err)
   {
     if (!napi_util__::check_env(env) || err == nullptr)
       return napi_invalid_arg;
@@ -3223,14 +3224,14 @@ extern "C"
     return (*result == nullptr) ? napi_generic_failure : napi_ok;
   }
 
-  napi_status NAPI_CDECL node_api_create_buffer_from_arraybuffer(
+  napi_status NAPI_CDECL napi_quickjs_create_buffer_from_arraybuffer(
       napi_env env,
       napi_value arraybuffer,
       size_t byte_offset,
       size_t byte_length,
       napi_value *result);
 
-  napi_status NAPI_CDECL napi_add_env_cleanup_hook(node_api_basic_env basic_env,
+  napi_status NAPI_CDECL napi_quickjs_add_env_cleanup_hook(node_api_basic_env basic_env,
                                                    napi_cleanup_hook fun,
                                                    void *arg)
   {
@@ -3241,7 +3242,7 @@ extern "C"
     return env->add_cleanup_hook(fun, arg);
   }
 
-  napi_status NAPI_CDECL napi_remove_env_cleanup_hook(node_api_basic_env basic_env,
+  napi_status NAPI_CDECL napi_quickjs_remove_env_cleanup_hook(node_api_basic_env basic_env,
                                                       napi_cleanup_hook fun,
                                                       void *arg)
   {
@@ -3252,7 +3253,7 @@ extern "C"
     return env->remove_cleanup_hook(fun, arg);
   }
 
-  napi_status NAPI_CDECL napi_create_buffer(napi_env env,
+  napi_status NAPI_CDECL napi_quickjs_create_buffer(napi_env env,
                                             size_t length,
                                             void **data,
                                             napi_value *result)
@@ -3267,11 +3268,11 @@ extern "C"
     if (status != napi_ok)
       return status;
 
-    status = node_api_create_buffer_from_arraybuffer(env, arraybuffer, 0, length, result);
+    status = napi_quickjs_create_buffer_from_arraybuffer(env, arraybuffer, 0, length, result);
     return status;
   }
 
-  napi_status NAPI_CDECL napi_create_buffer_copy(napi_env env,
+  napi_status NAPI_CDECL napi_quickjs_create_buffer_copy(napi_env env,
                                                  size_t length,
                                                  const void *data,
                                                  void **result_data,
@@ -3281,7 +3282,7 @@ extern "C"
       return napi_util__::invalid_arg(env);
 
     void *out = nullptr;
-    napi_status status = napi_create_buffer(env, length, &out, result);
+    napi_status status = napi_quickjs_create_buffer(env, length, &out, result);
     if (status != napi_ok)
       return status;
 
@@ -3292,7 +3293,7 @@ extern "C"
     return napi_ok;
   }
 
-  napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
+  napi_status NAPI_CDECL napi_quickjs_create_external_buffer(napi_env env,
                                                      size_t length,
                                                      void *data,
                                                      node_api_basic_finalize finalize_cb,
@@ -3310,10 +3311,10 @@ extern "C"
     if (status != napi_ok)
       return status;
 
-    return node_api_create_buffer_from_arraybuffer(env, arraybuffer, 0, length, result);
+    return napi_quickjs_create_buffer_from_arraybuffer(env, arraybuffer, 0, length, result);
   }
 
-  napi_status NAPI_CDECL napi_is_buffer(napi_env env, napi_value value, bool *result)
+  napi_status NAPI_CDECL napi_quickjs_is_buffer(napi_env env, napi_value value, bool *result)
   {
     if (!napi_util__::check_value(env, value) || result == nullptr)
       return napi_util__::invalid_arg(env);
@@ -3321,7 +3322,7 @@ extern "C"
     return napi_quickjs_clear_last_error(env);
   }
 
-  napi_status NAPI_CDECL napi_get_buffer_info(napi_env env,
+  napi_status NAPI_CDECL napi_quickjs_get_buffer_info(napi_env env,
                                               napi_value value,
                                               void **data,
                                               size_t *length)
@@ -3331,7 +3332,7 @@ extern "C"
     return env->buffers().get_buffer_info(napi_quickjs_value_inner(env, value), data, length);
   }
 
-  napi_status NAPI_CDECL node_api_create_buffer_from_arraybuffer(
+  napi_status NAPI_CDECL napi_quickjs_create_buffer_from_arraybuffer(
       napi_env env,
       napi_value arraybuffer,
       size_t byte_offset,

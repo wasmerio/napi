@@ -832,7 +832,7 @@ void EnsureModuleWrapCleanupHook(napi_env env) {
     std::lock_guard<std::mutex> lock(g_module_wrap_mu);
     if (!g_module_wrap_cleanup_hooks.emplace(env).second) return;
   }
-  if (napi_add_env_cleanup_hook(env, CleanupModuleWrapState, env) != napi_ok) {
+  if (napi_v8_add_env_cleanup_hook(env, CleanupModuleWrapState, env) != napi_ok) {
     std::lock_guard<std::mutex> lock(g_module_wrap_mu);
     g_module_wrap_cleanup_hooks.erase(env);
   }
