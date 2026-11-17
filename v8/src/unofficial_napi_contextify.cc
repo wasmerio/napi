@@ -722,6 +722,12 @@ bool ReadArrayBufferViewBytes(v8::Local<v8::Value> value,
   return true;
 }
 
+// A Buffer over a copy of `data`, made as Node's Buffer::Copy makes it: its
+// own ArrayBuffer with Buffer.prototype. It never calls Buffer.from, which
+// copies anything under Buffer.poolSize / 2 into Buffer's shared pool (so the
+// result would be a slice of the pool, exposing its other bytes through
+// .buffer), and which a program may replace. Only reading the env's Buffer and
+// Buffer.prototype can run JS, when a script made either an accessor.
 bool CreateNodeBufferFromBytes(napi_env env, const uint8_t* data, size_t size, napi_value* out) {
   if (out == nullptr) return false;
   *out = nullptr;
@@ -731,10 +737,7 @@ bool CreateNodeBufferFromBytes(napi_env env, const uint8_t* data, size_t size, n
   }
 
   v8::Isolate* isolate = env->isolate;
-  // Buffer is the env's: read and call it in the env's realm, never in the
-  // current one, whose global its scripts control.
-  v8::Local<v8::Context> context = env->main_context();
-  v8::Context::Scope context_scope(context);
+  v8::Context::Scope context_scope(env->main_context());
   v8::TryCatch caught(isolate);
 
   std::unique_ptr<v8::BackingStore> store = v8::ArrayBuffer::NewBackingStore(isolate, size);
@@ -744,35 +747,17 @@ bool CreateNodeBufferFromBytes(napi_env env, const uint8_t* data, size_t size, n
   }
 
   v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(isolate, std::move(store));
-  v8::Local<v8::Uint8Array> view = v8::Uint8Array::New(ab, 0, size);
+  v8::Local<v8::Object> buffer = napi_v8_create_buffer_view(env, ab, 0, size);
 
-  v8::Local<v8::Object> global = context->Global();
-  v8::Local<v8::Value> buffer_ctor_value;
-  if (global->Get(context, OneByteString(isolate, "Buffer")).ToLocal(&buffer_ctor_value) &&
-      buffer_ctor_value->IsFunction()) {
-    v8::Local<v8::Object> buffer_ctor_obj = buffer_ctor_value.As<v8::Object>();
-    v8::Local<v8::Value> from_value;
-    if (buffer_ctor_obj->Get(context, OneByteString(isolate, "from")).ToLocal(&from_value) &&
-        from_value->IsFunction()) {
-      v8::Local<v8::Value> argv[1] = {view};
-      v8::Local<v8::Value> buffer_out;
-      if (from_value.As<v8::Function>()->Call(context, buffer_ctor_value, 1, argv).ToLocal(&buffer_out)) {
-        if (napi_v8_terminating(env)) {
-          napi_v8_fail_terminating(env);
-          return false;
-        }
-        *out = napi_v8_wrap_value(env, buffer_out);
-        return *out != nullptr;
-      }
-    }
-  }
-
-  if (caught.HasCaught() || napi_v8_terminating(env)) {
-    if (napi_v8_terminating(env)) napi_v8_fail_terminating(env);
-    else ThrowTryCatchException(env, caught);
+  if (napi_v8_terminating(env)) {
+    napi_v8_fail_terminating(env);
     return false;
   }
-  *out = napi_v8_wrap_value(env, view);
+  if (caught.HasCaught()) {
+    ThrowTryCatchException(env, caught);
+    return false;
+  }
+  *out = napi_v8_wrap_value(env, buffer);
   return *out != nullptr;
 }
 

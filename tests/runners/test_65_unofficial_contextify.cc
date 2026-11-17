@@ -450,6 +450,67 @@ TEST_F(Test65UnofficialContextify, CompileFunctionAndCachedData) {
   ASSERT_EQ(unofficial_napi_bytecode_release(s.env, open_result.bytecode), napi_ok);
 }
 
+#if defined(NAPI_TEST_ENGINE_V8)
+// vm.Script#createCachedData() returns this. As Node's Buffer::Copy, it is a
+// Buffer over its own ArrayBuffer, never a slice of Buffer's shared pool, and
+// the provider never calls Buffer.from for it (wasmerio/napi#146).
+TEST_F(Test65UnofficialContextify, BytecodeSerializeMakesUnpooledBuffersWithoutBufferFrom) {
+  EnvScope s(runtime_.get());
+  auto run = [&](const char* source) {
+    napi_value result = nullptr;
+    napi_value text = nullptr;
+    char out[64] = {};
+    size_t length = 0;
+    if (napi_run_script(s.env, Str(s.env, source), &result) != napi_ok ||
+        napi_coerce_to_string(s.env, result, &text) != napi_ok ||
+        napi_get_value_string_utf8(s.env, text, out, sizeof(out), &length) != napi_ok) {
+      return std::string("<threw>");
+    }
+    return std::string(out, length);
+  };
+  ASSERT_EQ(run("globalThis.fromCalls = 0;"
+                "globalThis.Buffer = class Buffer extends Uint8Array {"
+                "  static from() { fromCalls++; throw Error('Buffer.from called'); }"
+                "}; 'ok'"),
+            "ok");
+  napi_value global = nullptr;
+  napi_value undef = nullptr;
+  ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+  ASSERT_EQ(napi_get_undefined(s.env, &undef), napi_ok);
+
+  unofficial_napi_bytecode_open_options open_options{};
+  open_options.size = sizeof(open_options);
+  open_options.version = UNOFFICIAL_NAPI_BYTECODE_OPEN_OPTIONS_VERSION;
+  open_options.filename = Str(s.env, "pool.js");
+  open_options.shape = unofficial_napi_bytecode_shape_script;
+  open_options.params_or_undefined = undef;
+  open_options.host_defined_option_id = Sym(s.env, "hdo");
+  for (int i = 0; i < 50; ++i) {
+    // Small scripts, whose cache Buffer.from would put in the pool.
+    const std::string source =
+        "(function f" + std::to_string(i) + "(a) { return a + " + std::to_string(i) + "; })";
+    open_options.source_text = Str(s.env, source.c_str());
+    unofficial_napi_bytecode_open_result open_result{};
+    ASSERT_EQ(unofficial_napi_bytecode_open(s.env, &open_options, &open_result), napi_ok);
+    ASSERT_NE(open_result.bytecode, nullptr);
+    napi_value cached_data = nullptr;
+    ASSERT_EQ(unofficial_napi_bytecode_serialize(s.env, open_result.bytecode, &cached_data),
+              napi_ok);
+    ASSERT_EQ(unofficial_napi_bytecode_release(s.env, open_result.bytecode), napi_ok);
+    ASSERT_EQ(napi_set_named_property(s.env, global, "cache", cached_data), napi_ok);
+    ASSERT_EQ(run("Object.getPrototypeOf(cache) === Buffer.prototype && cache.byteLength > 0 &&"
+                  " cache.byteLength < 4096 && cache.byteOffset === 0 &&"
+                  " cache.buffer.byteLength === cache.byteLength"),
+              "true")
+        << "iteration " << i;
+  }
+  EXPECT_EQ(run("fromCalls"), "0");
+  bool pending = true;
+  ASSERT_EQ(napi_is_exception_pending(s.env, &pending), napi_ok);
+  EXPECT_FALSE(pending);
+}
+#endif
+
 TEST_F(Test65UnofficialContextify, ModuleStateIsOneAtomicSnapshot) {
   EnvScope s(runtime_.get());
 

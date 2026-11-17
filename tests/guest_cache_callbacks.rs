@@ -1,5 +1,8 @@
-//! Cache serialization can call the guest's Buffer.from. Exercise both
-//! imports through real Wasmer dispatch, including exception and exit paths.
+//! Cache serialization reads the env's Buffer to give its result
+//! Buffer.prototype, and that read runs a getter when a script made Buffer an
+//! accessor: on WASIX, a guest-native one. Exercise both imports through real
+//! Wasmer dispatch, including exception and exit paths. (The provider no
+//! longer calls Buffer.from here: wasmerio/napi#146.)
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -167,7 +170,8 @@ impl Guest {
             .typed::<(), ()>("create")
             .call(&mut guest.store)
             .unwrap();
-        let source = "globalThis.Buffer = function Buffer() {}; Buffer.from = from;";
+        let source = "Object.defineProperty(globalThis, 'Buffer', \
+                      { get: from, configurable: true });";
         guest
             .memory
             .view(&guest.store)
@@ -216,7 +220,7 @@ impl Guest {
 }
 
 #[test]
-fn cache_imports_reenter_guest_buffer_from() {
+fn cache_imports_reenter_a_guest_buffer_getter() {
     let mut guest = Guest::new();
     for (index, export) in EXPORTS.iter().enumerate() {
         assert_eq!(guest.cache(export, 0).unwrap(), 0, "{export}");

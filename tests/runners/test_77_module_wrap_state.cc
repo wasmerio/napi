@@ -1344,10 +1344,36 @@ TEST_F(Test77ModuleWrapState, CancelledModuleErrorIsCatchableAndCheckpointExcept
 }
 
 #if defined(NAPI_TEST_ENGINE_V8)
+// As Node's Buffer::Copy, cached data is a Buffer over its own ArrayBuffer.
+// Buffer.from would copy it into Buffer's shared pool, and calling it from
+// the provider broke that pool under WASIX (wasmerio/napi#146).
+TEST_F(Test77ModuleWrapState, CachedDataIsAnUnpooledBufferMadeWithoutBufferFrom) {
+  EnvScope s(runtime_.get());
+  auto module = CreateSourceTextModule(s.env, "export default 1;");
+  ASSERT_EQ(RunText(s.env,
+      "globalThis.fromCalls = 0;"
+      "globalThis.Buffer = class Buffer extends Uint8Array {"
+      "  static from() { fromCalls++; throw Error('Buffer.from called'); }"
+      "}; 'ok'"), "ok");
+  napi_value global = nullptr;
+  ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+  for (int i = 0; i < 50; ++i) {
+    napi_value cache = nullptr;
+    ASSERT_EQ(unofficial_napi_module_wrap_create_cached_data(s.env, module, &cache), napi_ok);
+    ASSERT_EQ(napi_set_named_property(s.env, global, "cache", cache), napi_ok);
+    ASSERT_EQ(RunText(s.env,
+        "Object.getPrototypeOf(cache) === Buffer.prototype && cache.byteLength > 0 &&"
+        " cache.byteOffset === 0 && cache.buffer.byteLength === cache.byteLength"),
+        "true") << "iteration " << i;
+  }
+  EXPECT_EQ(RunText(s.env, "fromCalls"), "0");
+  EXPECT_FALSE(ExceptionPending(s.env));
+}
+
 TEST_F(Test77ModuleWrapState, CachedDataPropagatesBufferExceptionsAndRefusesTermination) {
   EnvScope s(runtime_.get());
   auto module = CreateSourceTextModule(s.env, "export default 1;");
-  ASSERT_EQ(RunText(s.env, "globalThis.Buffer = function Buffer() {}; Buffer.from = () => {throw Error('buffer failure');}; 'ok'"), "ok");
+  ASSERT_EQ(RunText(s.env, "Object.defineProperty(globalThis, 'Buffer', {get() {throw Error('buffer failure');}, configurable: true}); 'ok'"), "ok");
   napi_value cache = nullptr;
   EXPECT_EQ(unofficial_napi_module_wrap_create_cached_data(s.env, module, &cache), napi_pending_exception);
   EXPECT_EQ(TakePendingMessage(s.env), "buffer failure");
