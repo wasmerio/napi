@@ -2557,6 +2557,10 @@ napi_status NAPI_CDECL unofficial_napi_message_take(
     return napi_invalid_arg;
   }
   *result_out = nullptr;
+  // The message is consumed either way. A terminating env keeps its
+  // termination: a refused message or a deserializer error must not replace
+  // it with an ordinary exception.
+  NAPI_V8_RETURN_IF_TERMINATING(env);
 
   v8::Isolate* isolate = env->isolate;
   v8::EscapableHandleScope handle_scope(isolate);

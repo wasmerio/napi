@@ -379,6 +379,33 @@ TEST_F(Test21General, RestrictedEnvironmentsRefuseWebAssemblyMessages) {
   EXPECT_EQ(TakeIn(restricted, MessageFrom(restricted, kSharedBufferMessage)),
             "buffer:[object SharedArrayBuffer]");
 }
+
+// A refused message must not replace a pending termination with an ordinary
+// error, which would stay pending once the termination is cancelled.
+TEST_F(Test21General, RefusedMessageKeepsTheTermination) {
+  unofficial_napi_message message =
+      MessageFrom(kWebAssemblyAllowUnmetered, kModuleMessage);
+  ASSERT_NE(message, nullptr);
+  napi_env env = nullptr;
+  unofficial_napi_env_owner owner = nullptr;
+  unofficial_napi_env_create_options options{};
+  InitializeTestEnvCreateOptions(&options);
+  ASSERT_EQ(snapi_private_create_env(NAPI_TEST_MODULE_API_VERSION, &options,
+                                     kWebAssemblyRestricted, &env, &owner),
+            napi_ok);
+
+  ASSERT_EQ(unofficial_napi_terminate_execution(env), napi_ok);
+  napi_value value = nullptr;
+  EXPECT_EQ(unofficial_napi_message_take(env, message, &value), napi_pending_exception);
+  EXPECT_EQ(value, nullptr);
+
+  ASSERT_EQ(unofficial_napi_cancel_terminate_execution(env), napi_ok);
+  bool pending = true;
+  ASSERT_EQ(napi_is_exception_pending(env, &pending), napi_ok);
+  EXPECT_FALSE(pending);
+  EXPECT_EQ(RunToString(env, "'resumed'"), "resumed");
+  ASSERT_EQ(unofficial_napi_release_env(owner, nullptr), napi_ok);
+}
 #endif
 
 TEST_F(Test21General, EnvironmentHooksAttachAtomicallyOnce) {
