@@ -349,7 +349,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -805,7 +805,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2092,7 +2092,7 @@ dependencies = [
  "bitflags",
  "libc",
  "mach2",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2179,7 +2179,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2544,7 +2544,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2829,7 +2829,7 @@ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 [[package]]
 name = "wasixv2"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "async-trait",
  "serde",
@@ -2867,12 +2867,12 @@ dependencies = [
 [[package]]
 name = "wasixv2-abi"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 
 [[package]]
 name = "wasixv2-checkpoint"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "wasixv2-kernel",
 ]
@@ -2880,7 +2880,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-dylink"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "thiserror",
  "tracing",
@@ -2897,7 +2897,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-exec"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "js-sys",
  "libc",
@@ -2917,7 +2917,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-host"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
@@ -2931,7 +2931,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-kernel"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -2948,7 +2948,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-pages"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "libc",
 ]
@@ -2956,7 +2956,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-policy"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "wasixv2-syscalls",
 ]
@@ -2964,7 +2964,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-record"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "wasixv2-syscalls",
 ]
@@ -2972,7 +2972,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-syscalls"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "wasixv2-abi",
  "wasixv2-pages",
@@ -2982,7 +2982,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-trace"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "tracing",
  "wasixv2-syscalls",
@@ -2991,7 +2991,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-vfs"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3003,7 +3003,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-vfs-host"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "async-trait",
  "libc",
@@ -3015,7 +3015,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-vfs-mem"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "async-trait",
  "wasixv2-abi",
@@ -3026,7 +3026,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-vfs-overlay"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "async-trait",
  "futures",
@@ -3037,7 +3037,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-vfs-package"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "async-trait",
  "shared-buffer",
@@ -3050,7 +3050,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-vnet"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "bincode",
  "serde",
@@ -3063,7 +3063,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-vnet-host"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "libc",
  "mio",
@@ -3077,7 +3077,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-vnet-switch"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "wasixv2-abi",
  "wasixv2-vnet",
@@ -3087,7 +3087,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-wait"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "wasixv2-abi",
 ]
@@ -3095,7 +3095,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-wasix1"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "serde",
  "serde_json",
@@ -3265,7 +3265,7 @@ dependencies = [
 [[package]]
 name = "wasmer-c-api-imports"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "anyhow",
  "wasixv2-exec",
@@ -3275,7 +3275,7 @@ dependencies = [
 [[package]]
 name = "wasmer-cache"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#a49d8ddce79278d944c3214e31241e8a9dbcadf7"
+source = "git+https://github.com/wasmerio/wasmer-next.git?branch=main#b0b887e87e6d88c7a7cf685ba986e0fc622626f9"
 dependencies = [
  "blake3",
  "hex",
@@ -3557,7 +3557,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
