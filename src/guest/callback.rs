@@ -1,4 +1,4 @@
-use std::ffi::c_void;
+use std::{ffi::c_void, sync::Arc};
 
 use wasmer::{AsStoreMut, FunctionEnv, FunctionEnvMut, Store, StoreMut, Table, Value};
 use wasmer_wasix::WasiError;
@@ -76,17 +76,19 @@ impl CallbackInvocationCtx {
 }
 
 /// Gives the env `env_id` just created its callback context. The env's agent
-/// keeps it until its release, and `NapiEnv` frees it after that.
+/// keeps a pointer to it until its release, and `NapiEnv` frees it after that.
+/// The context is shared, never borrowed mutably, so the agent's pointer stays
+/// valid however `NapiEnv` moves its handle around.
 pub(crate) fn install_callback_ctx(
     env: &mut FunctionEnvMut<NapiEnv>,
     env_id: u32,
     snapi_env: SnapiEnv,
 ) {
-    let mut ctx = Box::new(CallbackInvocationCtx {
+    let ctx = Arc::new(CallbackInvocationCtx {
         func_env: env.as_ref(),
         store_id: env.objects_mut().id().as_raw().get(),
     });
-    let ctx_ptr = (&mut *ctx as *mut CallbackInvocationCtx).cast::<c_void>();
+    let ctx_ptr = Arc::as_ptr(&ctx).cast_mut().cast::<c_void>();
     env.data_mut().native_callback_contexts.insert(env_id, ctx);
     unsafe {
         crate::snapi::snapi_bridge_swap_active_callback_ctx(snapi_env, ctx_ptr);

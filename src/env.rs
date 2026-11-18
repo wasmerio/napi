@@ -211,7 +211,7 @@ pub(crate) struct NapiEnv {
     /// (see `install_callback_ctx`) until its release. Freed after a release;
     /// for an env whose release was refused, kept for good when this goes.
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    pub(crate) native_callback_contexts: IdHashMap<u32, Box<CallbackInvocationCtx>>,
+    pub(crate) native_callback_contexts: IdHashMap<u32, Arc<CallbackInvocationCtx>>,
 }
 
 impl NapiEnv {
@@ -759,7 +759,7 @@ impl Drop for NapiEnv {
         // names a store that is gone, which the trampolines refuse.
         #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
         for (_, ctx) in self.native_callback_contexts.drain() {
-            Box::leak(ctx);
+            std::mem::forget(ctx);
         }
         // Release any external memory the guest declared but did not take back.
         if self.external_declared > 0 {

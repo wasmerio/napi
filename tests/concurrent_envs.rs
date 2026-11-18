@@ -339,11 +339,17 @@ fn envs_on_one_thread_take_turns() {
     const ENVS: usize = 3;
     let (engine, module) = compile();
     let ctx = NapiCtx::default();
+    // Each guest signals its own index.
     let (signal_tx, signal_rx) = mpsc::channel();
+    let signals = || signal_rx.try_iter().collect::<Vec<usize>>();
     for order in [[0, 1, 2], [2, 1, 0], [1, 2, 0]] {
         let mut guests: Vec<Option<Guest>> = (0..ENVS)
-            .map(|_| {
-                let mut guest = Guest::new(&ctx, &engine, &module, signal_tx.clone());
+            .map(|index| {
+                let signal_tx = signal_tx.clone();
+                let mut guest = Guest::with_signal_hook(&ctx, &engine, &module, move || {
+                    let _ = signal_tx.send(index);
+                    Ok(())
+                });
                 guest.create();
                 Some(guest)
             })
@@ -353,9 +359,9 @@ fn envs_on_one_thread_take_turns() {
                 let value = (10 * index + round) as i32;
                 let guest = guest.as_mut().unwrap();
                 assert_eq!(guest.number(&format!("signal(); {value}")), value);
+                assert_eq!(signals(), [index]);
             }
         }
-        assert_eq!(signal_rx.try_iter().count(), 3 * ENVS);
 
         for index in order {
             let mut guest = guests[index].take().unwrap();
@@ -364,18 +370,58 @@ fn envs_on_one_thread_take_turns() {
             guest.set_finalizer_script("0");
             assert_eq!(guest.arm_spinning_finalizer(), 0);
             // Another env runs last, so its isolate is the entered one.
-            let other = guests.iter_mut().flatten().next();
-            let others = usize::from(other.is_some());
-            if let Some(other) = other {
+            let mut expected = Vec::new();
+            if let Some((other_index, other)) = guests
+                .iter_mut()
+                .enumerate()
+                .find_map(|(other_index, other)| Some((other_index, other.as_mut()?)))
+            {
                 assert_eq!(other.number("signal(); 7"), 7);
+                expected.push(other_index);
             }
             assert_eq!(guest.release(), 0);
-            assert_eq!(signal_rx.try_iter().count(), others + 1);
+            expected.push(index);
+            assert_eq!(signals(), expected);
             for guest in guests.iter_mut().flatten() {
                 assert_eq!(guest.number("6 * 7"), 42);
             }
         }
     }
+}
+
+/// A host may create an env of its own (`unofficial_napi_create_env`) on a
+/// thread where a guest's env ran, and drop the guest's store while that env
+/// still exists. The host's env keeps its isolate entered, so the guest's
+/// isolate must not have stayed entered below it: the store's release must
+/// still dispose it.
+#[test]
+fn a_host_env_on_the_thread_leaves_a_guest_env_releasable() {
+    let (engine, module) = compile();
+    let ctx = NapiCtx::default();
+    let (signal_tx, _signal_rx) = mpsc::channel();
+    let mut guest = Guest::new(&ctx, &engine, &module, signal_tx);
+    guest.create();
+    assert_eq!(guest.number("6 * 7"), 42);
+
+    let mut host_env = std::ptr::null_mut();
+    let mut host_owner = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { unofficial_napi_create_env(8, std::ptr::null(), &mut host_env, &mut host_owner) },
+        0
+    );
+    // The guest still works while the host's isolate is the entered one.
+    assert_eq!(guest.number("6 * 7"), 42);
+    assert_eq!(ctx.budget().snapshot().live_isolates, 1);
+    drop(guest);
+    assert_eq!(
+        ctx.budget().snapshot().live_isolates,
+        0,
+        "the guest's isolate was not released"
+    );
+    assert_eq!(
+        unsafe { unofficial_napi_release_env(host_owner, std::ptr::null_mut()) },
+        0
+    );
 }
 
 /// One queued message, two environments racing to take it: the narrower
@@ -431,6 +477,13 @@ unsafe extern "C" {
         env_out: *mut *mut c_void,
     ) -> i32;
     fn snapi_bridge_unofficial_release_env(env: *mut c_void) -> i32;
+    fn unofficial_napi_create_env(
+        module_api_version: i32,
+        options: *const c_void,
+        env_out: *mut *mut c_void,
+        owner_out: *mut *mut c_void,
+    ) -> i32;
+    fn unofficial_napi_release_env(owner: *mut c_void, uv_loop: *mut c_void) -> i32;
     fn snapi_bridge_get_global(env: *mut c_void, out_id: *mut u32) -> i32;
     fn snapi_bridge_alloc_cb_reg_id(env: *mut c_void) -> u32;
     fn snapi_bridge_unofficial_terminate_execution(env: *mut c_void) -> i32;

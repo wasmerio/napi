@@ -842,21 +842,37 @@ thread_local v8::Isolate* t_resident_isolate = nullptr;
 thread_local uint32_t t_bridge_depth = 0;
 
 // True when `isolate` is this thread's resident isolate but another isolate
-// is entered above it, so it cannot be left yet. Only a nested bridge call
-// enters another isolate above it, and that call comes from guest code the
-// isolate's agent called into, whose guest_calls refuse the release anyway.
+// is entered above it, so it cannot be left yet. A nested bridge call enters
+// another isolate above it only for its own duration, from guest code the
+// isolate's agent called into, whose guest_calls refuse the release anyway;
+// the provider leaves an idle resident isolate before it creates an env. So
+// only an isolate the host entered itself with V8's API can bury it.
 bool ResidentIsolateBuried(v8::Isolate* isolate) {
   return isolate != nullptr && t_resident_isolate == isolate &&
          v8::Isolate::TryGetCurrent() != isolate;
 }
 
-// Leaves `isolate` if it is this thread's resident isolate. Not when it is
-// buried (see ResidentIsolateBuried), which the caller rules out.
+// Leaves `isolate` if it is this thread's resident isolate and the current
+// one. A buried resident isolate stays entered (see ResidentIsolateBuried).
 void LeaveResidentIsolate(v8::Isolate* isolate) {
-  if (t_resident_isolate != isolate) return;
+  if (isolate == nullptr || t_resident_isolate != isolate ||
+      v8::Isolate::TryGetCurrent() != isolate) {
+    return;
+  }
   t_resident_isolate = nullptr;
-  if (v8::Isolate::TryGetCurrent() == isolate) isolate->Exit();
+  isolate->Exit();
 }
+
+// The provider calls this before it enters a new env's isolate, which stays
+// entered (NapiV8SetIsolateEntryHook): a host may create an env on a thread
+// where a bridge env ran. With no bridge call on the stack, nothing uses the
+// resident isolate, so leave it; a later bridge call enters it again.
+void LeaveIdleResidentIsolate() {
+  if (t_bridge_depth == 0) LeaveResidentIsolate(t_resident_isolate);
+}
+
+[[maybe_unused]] const bool g_isolate_entry_hook_installed =
+    (NapiV8SetIsolateEntryHook(&LeaveIdleResidentIsolate), true);
 
 class BridgeEnvScope {
  public:
