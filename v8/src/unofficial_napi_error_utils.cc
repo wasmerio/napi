@@ -1,6 +1,5 @@
 #include "unofficial_napi_error_utils.h"
 
-#include <algorithm>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -281,27 +280,34 @@ std::string BuildSyntaxArrowMessage(v8::Isolate* isolate,
   if (!source_line_maybe.ToLocal(&source_line_v8)) return {};
 
   const std::string source_line = V8ValueToUtf8(isolate, source_line_v8);
-  if (source_line.empty()) return {};
 
-  int start = message->GetStartColumn(context).FromMaybe(0);
-  int end = message->GetEndColumn(context).FromMaybe(start + 1);
+  int64_t start = message->GetStartColumn(context).FromMaybe(0);
+  int64_t end = message->GetEndColumn(context).FromMaybe(0);
   v8::ScriptOrigin origin = message->GetScriptOrigin();
   const int script_start =
-      (line_number - origin.LineOffset()) == 1 ? origin.ColumnOffset() : 0;
+      (static_cast<int64_t>(line_number) - origin.LineOffset()) == 1 ? origin.ColumnOffset() : 0;
   if (start >= script_start) {
     end -= script_start;
     start -= script_start;
   }
-  if (end <= start) end = start + 1;
-  if (start < 0) start = 0;
-  if (end < 0) end = 0;
+  const std::string arrow = filename + ":" + std::to_string(line_number) + "\n" +
+                            source_line.c_str() + "\n";
+  if (start < 0 || start > end || static_cast<size_t>(end) > source_line.size()) {
+    return arrow;
+  }
 
-  std::string underline(static_cast<size_t>(start), ' ');
-  underline.append(static_cast<size_t>(std::max(1, end - start)), '^');
-
-  return filename + ":" + std::to_string(line_number) + "\n" +
-         source_line + "\n" +
-         underline + "\n\n";
+  // Node's GetErrorSource limits the underline to 1020 bytes.
+  constexpr size_t kMaxUnderline = 1020;
+  std::string underline;
+  for (int64_t i = 0; i < start; ++i) {
+    if (underline.size() == kMaxUnderline || source_line[i] == '\0') break;
+    underline += source_line[i] == '\t' ? '\t' : ' ';
+  }
+  for (int64_t i = start; i < end; ++i) {
+    if (underline.size() == kMaxUnderline || source_line[i] == '\0') break;
+    underline += '^';
+  }
+  return arrow + underline + '\n';
 }
 
 void AttachSyntaxArrowMessage(v8::Isolate* isolate,
@@ -331,8 +337,10 @@ void AttachSyntaxArrowMessage(v8::Isolate* isolate,
     return;
   }
 
+  v8::Local<v8::String> prefix =
+      v8::String::Concat(isolate, existing_arrow.As<v8::String>(), OneByteString(isolate, "\n"));
   v8::Local<v8::String> decorated_stack =
-      v8::String::Concat(isolate, existing_arrow.As<v8::String>(), stack_value.As<v8::String>());
+      v8::String::Concat(isolate, prefix, stack_value.As<v8::String>());
   if (!err_obj->Set(context, OneByteString(isolate, "stack"), decorated_stack).FromMaybe(false)) {
     return;
   }

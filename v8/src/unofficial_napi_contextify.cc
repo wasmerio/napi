@@ -2757,7 +2757,7 @@ static napi_status CreateSourceTextModule(
                                            v8::ScriptCompiler::NoCacheReason::kNoCacheNoReason)
              .ToLocal(&module)) {
       if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
-        unofficial_napi_internal::AttachSyntaxArrowMessage(
+        unofficial_napi_internal::SetArrowMessage(
             isolate, context, try_catch.Exception(), try_catch.Message());
         return ThrowTryCatchException(env, try_catch);
       }
@@ -3085,9 +3085,12 @@ static napi_status InstantiateModuleRecord(napi_env env, ModuleWrapRecord* recor
   InstantiationScope instantiating(env);
   auto maybe = module->InstantiateModule(context, ModuleResolveCallback, ModuleResolveSourceCallback);
   if (maybe.IsNothing()) {
-    // A termination too: it stays, and is what the call fails with.
-    if (try_catch.HasCaught()) return ThrowTryCatchException(env, try_catch);
-    return napi_generic_failure;
+    if (!try_catch.HasCaught()) return napi_generic_failure;
+    if (!try_catch.HasTerminated()) {
+      unofficial_napi_internal::SetArrowMessage(
+          isolate, context, try_catch.Exception(), try_catch.Message());
+    }
+    return ThrowTryCatchException(env, try_catch);
   }
   return napi_ok;
 }
@@ -3194,6 +3197,18 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
   return napi_ok;
 }
 
+static void PrintStalledTopLevelAwaitMessages(v8::Isolate* isolate,
+                                              v8::Local<v8::Context> context,
+                                              const v8::LocalVector<v8::Message>& messages,
+                                              const char* prefix) {
+  for (const auto& message : messages) {
+    const std::string arrow = unofficial_napi_internal::BuildSyntaxArrowMessage(isolate, context, message);
+    // Node's FormatErrorMessage adds a separator and an empty reason line,
+    // then ModuleWrap prints the result with a final newline.
+    std::fprintf(stderr, "%s%s\n\n\n", prefix, arrow.c_str());
+  }
+}
+
 napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
     napi_env env,
     unofficial_napi_module module_handle,
@@ -3243,10 +3258,8 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
 
   if (module->IsGraphAsync()) {
     auto stalled_messages = std::get<1>(module->GetStalledTopLevelAwaitMessages(isolate));
-    for (const auto& message : stalled_messages) {
-      const std::string info = unofficial_napi_internal::BuildSyntaxArrowMessage(isolate, context, message);
-      std::fprintf(stderr, "Error: unexpected top-level await at %s\n", info.c_str());
-    }
+    PrintStalledTopLevelAwaitMessages(isolate, context, stalled_messages,
+                                     "Error: unexpected top-level await at ");
     ThrowCodeError(env,
                    "ERR_REQUIRE_ASYNC_MODULE",
                    RequireAsyncModuleMessage(
@@ -3345,10 +3358,8 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_check_unsettled_top_level_awa
   *settled_out = false;
   if (!warnings) return napi_ok;
 
-  for (const auto& message : stalled_messages) {
-    const std::string info = unofficial_napi_internal::BuildSyntaxArrowMessage(isolate, context, message);
-    std::fprintf(stderr, "Warning: Detected unsettled top-level await at %s\n", info.c_str());
-  }
+  PrintStalledTopLevelAwaitMessages(isolate, context, stalled_messages,
+                                   "Warning: Detected unsettled top-level await at ");
   return napi_ok;
 }
 

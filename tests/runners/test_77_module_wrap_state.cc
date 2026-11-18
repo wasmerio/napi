@@ -150,6 +150,107 @@ std::string PromiseOutcome(napi_env env, napi_value promise) {
 
 }  // namespace
 
+#if defined(NAPI_TEST_ENGINE_V8)
+namespace {
+
+void ExpectSyntaxError(napi_env env, napi_value error, const char* expected_arrow,
+                       const char* stack_prefix) {
+  napi_value key = nullptr;
+  napi_value arrow = nullptr;
+  napi_value stack = nullptr;
+  ASSERT_EQ(unofficial_napi_create_private_symbol(env, "node:arrowMessage", NAPI_AUTO_LENGTH, &key),
+            napi_ok);
+  ASSERT_EQ(napi_get_property(env, error, key, &arrow), napi_ok);
+  EXPECT_EQ(ValueText(env, arrow), expected_arrow);
+  ASSERT_EQ(napi_get_named_property(env, error, "stack", &stack), napi_ok);
+  EXPECT_EQ(ValueText(env, stack).find(stack_prefix), 0u);
+}
+
+}  // namespace
+
+TEST_F(Test77ModuleWrapState, ModuleParseErrorsKeepTheArrowSeparateFromTheStack) {
+  EnvScope s(runtime_.get());
+  unofficial_napi_module_create_options options{};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_MODULE_CREATE_OPTIONS_VERSION;
+  options.kind = unofficial_napi_module_source_text;
+  ASSERT_EQ(napi_create_object(s.env, &options.wrapper), napi_ok);
+  options.url = Str(s.env, "bad.mjs");
+  const char* cases[][2] = {{"/*\nabc", "bad.mjs:1\n/*\n"},
+                            {"export const x =\n", "bad.mjs:2\n\n\n"}};
+  for (const auto& [text, arrow] : cases) {
+    SCOPED_TRACE(text);
+    auto source = unofficial_napi_js_source_from_text(Str(s.env, text));
+    options.payload.source_text.source = &source;
+    unofficial_napi_module_create_result result{};
+    ASSERT_EQ(unofficial_napi_module_wrap_create(s.env, &options, &result), napi_pending_exception);
+    napi_value error = nullptr;
+    ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &error), napi_ok);
+    ExpectSyntaxError(s.env, error, arrow, "SyntaxError:");
+  }
+}
+
+TEST_F(Test77ModuleWrapState, MissingExportHasAnArrowAtTheImport) {
+  EnvScope s(runtime_.get());
+  auto importer = CreateSourceTextModule(s.env, "\timport { nope } from './a.mjs';");
+  auto dependency = CreateSourceTextModule(s.env, "export default 1;");
+  ASSERT_EQ(unofficial_napi_module_wrap_link(s.env, importer, 1, &dependency), napi_ok);
+  // Catch in JavaScript, before napi_get_and_clear_last_exception can add a fallback arrow.
+  auto instantiate = [](napi_env env, napi_callback_info info) -> napi_value {
+    void* data = nullptr;
+    EXPECT_EQ(napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &data), napi_ok);
+    EXPECT_EQ(unofficial_napi_module_wrap_instantiate(env, static_cast<unofficial_napi_module>(data)),
+              napi_pending_exception);
+    return nullptr;
+  };
+  napi_value fn = nullptr;
+  napi_value global = nullptr;
+  napi_value error = nullptr;
+  ASSERT_EQ(napi_create_function(s.env, "instantiate", NAPI_AUTO_LENGTH, instantiate, importer, &fn),
+            napi_ok);
+  ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, global, "instantiate", fn), napi_ok);
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env, "try { instantiate(); } catch (e) { e }"), &error),
+            napi_ok);
+  ExpectSyntaxError(s.env, error, "state.mjs:1\n\timport { nope } from './a.mjs';\n\t         ^^^^\n",
+                    "SyntaxError:");
+  ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, importer), napi_ok);
+  ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, dependency), napi_ok);
+}
+
+TEST_F(Test77ModuleWrapState, DisplayErrorsAddsABlankLineBeforeTheStack) {
+  EnvScope s(runtime_.get());
+  auto source = unofficial_napi_js_source_from_text(Str(s.env, "const = 1;"));
+  napi_value result = nullptr;
+  ASSERT_EQ(unofficial_napi_run_script(s.env, nullptr, &source, Str(s.env, "bad.js"), 0, 0, -1,
+                                       true, false, false, nullptr, &result), napi_pending_exception);
+  napi_value error = nullptr;
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &error), napi_ok);
+  ExpectSyntaxError(s.env, error, "bad.js:1\nconst = 1;\n      ^\n",
+                    "bad.js:1\nconst = 1;\n      ^\n\nSyntaxError:");
+}
+
+TEST_F(Test77ModuleWrapState, UnsettledTopLevelAwaitDiagnosticsMatchNode) {
+  EnvScope s(runtime_.get());
+  auto module = CreateSourceTextModule(s.env, "await new Promise(() => {});");
+  ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, module), napi_ok);
+  const std::string source = "state.mjs:1\nawait new Promise(() => {});\n^\n\n\n\n";
+  napi_value result = nullptr;
+  testing::internal::CaptureStderr();
+  auto status = unofficial_napi_module_wrap_evaluate_sync(s.env, module, nullptr, nullptr, &result);
+  EXPECT_EQ(testing::internal::GetCapturedStderr(), "Error: unexpected top-level await at " + source);
+  ASSERT_EQ(status, napi_pending_exception);
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &result), napi_ok);
+  bool settled = true;
+  testing::internal::CaptureStderr();
+  status = unofficial_napi_module_wrap_check_unsettled_top_level_await(s.env, module, true, &settled);
+  EXPECT_EQ(testing::internal::GetCapturedStderr(), "Warning: Detected unsettled top-level await at " + source);
+  EXPECT_EQ(status, napi_ok);
+  EXPECT_FALSE(settled);
+  ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
+}
+#endif
+
 // A module that is not instantiated has no top-level await under way: the
 // check reports it settled, as QuickJS does and as Node's check (made at exit
 // on the entry module) would. V8's IsGraphAsync takes an instantiated module
