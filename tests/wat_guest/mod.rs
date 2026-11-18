@@ -16,6 +16,7 @@ use wasmer::{
     SharedMemory, Store, TypedFunction, WasmTypeList,
 };
 use wasmer_napi::NapiCtx;
+use wasmer_wasix::WasiError;
 
 /// `napi_invalid_arg`.
 pub const NAPI_INVALID_ARG: i32 = 1;
@@ -49,6 +50,11 @@ const WAT: &str = r#"(module
     (func $memory_pressure (param i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_create_serdes_binding"
     (func $create_serdes (param i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_structured_clone"
+    (func $clone (param i32 i32 i32 i32) (result i32)))
+  (import "napi" "napi_create_array_with_length"
+    (func $array (param i32 i32 i32) (result i32)))
+  (import "napi" "napi_set_element" (func $set_element (param i32 i32 i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_message_create"
     (func $message_create (param i32 i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_message_take"
@@ -94,7 +100,7 @@ const WAT: &str = r#"(module
   ;; 64..76 finalizer scratch, 128..168 module create options,
   ;; 168..177 module create result.
   (memory (export "memory") 2)
-  (table (export "__indirect_function_table") 8 funcref)
+  (table (export "__indirect_function_table") 9 funcref)
   (global $env (mut i32) (i32.const 0))
   (global $scope (mut i32) (i32.const 0))
   (global $interrupted (mut i32) (i32.const 0))
@@ -107,6 +113,7 @@ const WAT: &str = r#"(module
   (data (i32.const 280) "release_self\00")
   (data (i32.const 296) "attach\00")
   (data (i32.const 304) "serdes\00")
+  (data (i32.const 312) "post\00")
 
   (func $string (param $ptr i32) (param $len i32) (result i32)
     (if (call $create_string (global.get $env) (local.get $ptr) (local.get $len) (i32.const 28))
@@ -211,6 +218,29 @@ const WAT: &str = r#"(module
       (then unreachable))
     (i32.load (i32.const 44)))
 
+  ;; Clone the last eval result; optionally transfer that buffer. install publishes the result.
+  (func (export "clone_buffer") (param $transfer i32) (result i32)
+    (local $list i32)
+    (if (local.get $transfer) (then
+      (if (call $array (global.get $env) (i32.const 1) (i32.const 324)) (then unreachable))
+      (local.set $list (i32.load (i32.const 324)))
+      (if (call $set_element (global.get $env) (local.get $list) (i32.const 0)
+            (i32.load (i32.const 32))) (then unreachable))))
+    (call $clone (global.get $env) (i32.load (i32.const 32)) (local.get $list) (i32.const 40)))
+  ;; post(value) creates a second message while the outer message is being serialized.
+  (func (export "install_post") (result i32)
+    (if (call $create_function (global.get $env) (i32.const 312) (i32.const 4)
+          (i32.const 8) (i32.const 0) (i32.const 52)) (then unreachable))
+    (call $set_named_property (global.get $env) (i32.load (i32.const 48))
+      (i32.const 312) (i32.load (i32.const 52))))
+  (func $on_post (param $env i32) (param $info i32) (result i32)
+    (i32.store (i32.const 328) (i32.const 1))
+    (if (call $get_cb_info (local.get $env) (local.get $info) (i32.const 328)
+          (i32.const 332) (i32.const 0) (i32.const 0)) (then unreachable))
+    (if (call $message_create (local.get $env) (i32.load (i32.const 332)) (i32.const 336))
+      (then unreachable))
+    (i32.const 0))
+  (func (export "nested_token") (result i32) (i32.load (i32.const 336)))
   (func (export "message") (result i32)
     (call $message_create (global.get $env) (i32.load (i32.const 32)) (i32.const 36)))
   (func (export "token") (result i32) (i32.load (i32.const 36)))
@@ -281,7 +311,7 @@ const WAT: &str = r#"(module
   (func $on_finalize_release (param $env i32) (param $data i32) (param $hint i32)
     (global.set $release_status (call $release_env (global.get $scope) (i32.const 0))))
   (elem (i32.const 1) $on_interrupt $on_signal $on_finalize $on_release_self $on_interrupt_release
-    $on_finalize_release $on_attach)
+    $on_finalize_release $on_attach $on_post)
 
   ;; Attaches the spinning finalizer to an object that lives until the env is
   ;; released, so the finalizer runs during release.
@@ -325,6 +355,19 @@ impl Guest {
     /// Instantiates the guest in a new store. `signal` receives a message
     /// whenever a script running in this guest calls `signal()`.
     pub fn new(ctx: &NapiCtx, engine: &Engine, module: &Module, signal: Sender<()>) -> Self {
+        Self::with_signal_hook(ctx, engine, module, move || {
+            let _ = signal.send(());
+            Ok(())
+        })
+    }
+
+    /// Runs the supplied host action when the guest-native signal callback fires.
+    pub fn with_signal_hook(
+        ctx: &NapiCtx,
+        engine: &Engine,
+        module: &Module,
+        signal: impl Fn() -> Result<(), WasiError> + Send + Sync + 'static,
+    ) -> Self {
         Self::instantiate(ctx, engine, module, signal, None)
     }
 
@@ -337,7 +380,16 @@ impl Guest {
         signal: Sender<()>,
         memory: Option<SharedMemory>,
     ) -> Self {
-        Self::instantiate(ctx, engine, module, signal, Some(memory))
+        Self::instantiate(
+            ctx,
+            engine,
+            module,
+            move || {
+                let _ = signal.send(());
+                Ok(())
+            },
+            Some(memory),
+        )
     }
 
     /// This guest's memory, to attach to another store
@@ -352,7 +404,7 @@ impl Guest {
         ctx: &NapiCtx,
         engine: &Engine,
         module: &Module,
-        signal: Sender<()>,
+        signal: impl Fn() -> Result<(), WasiError> + Send + Sync + 'static,
         shared: Option<Option<SharedMemory>>,
     ) -> Self {
         let mut store = Store::new(engine.clone());
@@ -369,9 +421,7 @@ impl Guest {
         let state = hooks
             .add_imports(module, &mut store.as_store_mut(), &mut imports)
             .expect("failed to create N-API imports");
-        let signal = Function::new_typed(&mut store, move || {
-            let _ = signal.send(());
-        });
+        let signal = Function::new_typed(&mut store, signal);
         imports.define("test", "signal", signal);
         let instance =
             Instance::new(&mut store, module, &imports).expect("failed to instantiate guest");
@@ -508,6 +558,22 @@ impl Guest {
         self.call0("integer")
     }
 
+    pub fn clone_buffer(&mut self, transfer: bool) -> i32 {
+        self.call1("clone_buffer", i32::from(transfer))
+    }
+
+    pub fn install_post(&mut self) -> i32 {
+        self.call0("install_post")
+    }
+
+    pub fn nested_token(&mut self) -> i32 {
+        self.call0("nested_token")
+    }
+
+    pub fn try_message(&mut self) -> Result<i32, wasmer::RuntimeError> {
+        self.function::<(), i32>("message").call(&mut self.store)
+    }
+
     /// Serializes the last script result into a message; returns the status.
     pub fn message(&mut self) -> i32 {
         self.call0("message")
@@ -523,7 +589,7 @@ impl Guest {
         self.call1("take", token)
     }
 
-    /// Stores the last taken value as `globalThis.shared`.
+    /// Stores the last taken or cloned value as `globalThis.shared`.
     pub fn install(&mut self) -> i32 {
         self.call0("install")
     }

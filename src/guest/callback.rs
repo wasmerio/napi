@@ -178,7 +178,8 @@ pub fn with_callback_state<R>(
         }
     }
     let _guard = CallbackStateGuard { snapi_env, prev };
-    // Only bridges explicitly wrapped in this invocation guard lend the store.
+    // Wrap bridge calls that may invoke guest code or allocate through V8's
+    // array-buffer allocator, so foreground allocations can grow guest memory.
     // Ordinary N-API imports keep their store local and pass it directly to
     // guest-heap allocation instead of publishing it through runtime TLS.
     env.as_store_mut().parked(f)
@@ -276,4 +277,42 @@ pub extern "C" fn snapi_host_invoke_wasm_finalizer(
         result
     })
     .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasmer::{Function, TableType, Type};
+
+    #[test]
+    fn a_lent_store_respects_the_callback_depth_limit() {
+        let mut store = Store::default();
+        let mut env = NapiEnv::new(
+            crate::budget::ResourceBudget::unlimited(),
+            None,
+            Default::default(),
+            Default::default(),
+        );
+        let getter = Function::new_typed(&mut store, |_: u32, _: u32| 17u32);
+        env.table = Some(
+            Table::new(
+                &mut store,
+                TableType::new(Type::FuncRef, 1, Some(1)),
+                Value::FuncRef(Some(getter)),
+            )
+            .unwrap(),
+        );
+        // Simulate the active outer callbacks without building a deep native stack.
+        for _ in 0..crate::guest::MAX_CALLBACK_DEPTH {
+            assert!(env.enter_callback());
+        }
+        let func_env = FunctionEnv::new(&mut store, env);
+        let mut ctx = CallbackInvocationCtx {
+            func_env: func_env.clone(),
+        };
+        let mut invoke = || snapi_host_invoke_wasm_callback((&raw mut ctx).cast(), 0, 0, 0);
+        assert_eq!(store.as_store_mut().parked(&mut invoke), 0);
+        func_env.as_mut(&mut store).leave_callback();
+        assert_eq!(store.as_store_mut().parked(invoke), 17);
+    }
 }

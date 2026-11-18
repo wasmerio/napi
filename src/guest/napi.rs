@@ -95,8 +95,8 @@ fn guest_heap_alloc_ctx(env: &FunctionEnvMut<NapiEnv>) -> *const std::ffi::c_voi
         .unwrap_or(std::ptr::null())
 }
 
-/// Run a bridge call that may re-enter the guest via host V8 callbacks, then
-/// re-raise any guest instance exit that trapped out of one of those callbacks.
+/// Lend the store to bridge calls that may invoke guest callbacks or use V8's
+/// array-buffer allocator. Re-raise any guest exit trapped in a callback.
 ///
 /// A guest `_exit`/`proc_exit` during a nested callback cannot unwind through the
 /// intervening host V8 (C++) frames, so the callback trampoline stashes it (see

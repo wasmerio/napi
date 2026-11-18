@@ -1,11 +1,9 @@
 #![cfg(not(target_arch = "wasm32"))]
 
-//! A `SharedArrayBuffer` V8 allocates for a guest lives in that guest's
-//! memory, and a message that carries one points into it. Only an
-//! environment on the same memory may receive it: another memory's guest
-//! could not address the bytes, and the sender's store owns the mapping. The
-//! queue leases a shared memory while the message waits, so the bytes stay
-//! mapped after the sender's store is gone.
+//! Copying an ArrayBuffer can grow the guest heap. A transfer detaches its
+//! source, and a queued message owns its serialized bytes until delivery or
+//! drop. SharedArrayBuffers additionally lease the sender's memory and can
+//! only be received by a guest that can address that memory.
 
 use std::sync::mpsc;
 
@@ -14,36 +12,152 @@ use wasmer_napi::NapiCtx;
 mod wat_guest;
 use wat_guest::{Guest, NAPI_INVALID_ARG, NAPI_PENDING_EXCEPTION, compile, compile_shared};
 
+// Even a completely unused arena cannot hold a buffer larger than the guest's
+// entire current linear memory. Keep the payload at least as large as in #156.
+fn buffer_size(guest: &Guest) -> i32 {
+    i32::try_from(guest.memory_size() + 1)
+        .unwrap()
+        .max(32 << 20)
+}
+
+fn make_buffer(guest: &mut Guest, size: i32) {
+    assert_eq!(
+        guest.eval(&format!(
+            "const bytes = new Uint8Array({size});
+         bytes[0] = 17;
+         bytes[bytes.length - 1] = 83;
+         bytes.buffer"
+        )),
+        0
+    );
+}
+
+fn check_buffer(guest: &mut Guest, size: i32) {
+    assert_eq!(guest.install(), 0);
+    assert_eq!(guest.number("shared.byteLength"), size);
+    assert_eq!(guest.number("new Uint8Array(shared)[0]"), 17);
+    assert_eq!(guest.number("new Uint8Array(shared).at(-1)"), 83);
+}
+
 #[test]
 fn taking_a_copied_arraybuffer_grows_the_receivers_memory() {
+    deliver_buffer(false);
+}
+
+#[test]
+fn taking_a_transferred_arraybuffer_grows_the_receivers_memory() {
+    deliver_buffer(true);
+}
+
+fn deliver_buffer(transfer: bool) {
     let (engine, module) = compile();
     let ctx = NapiCtx::default();
     let (signal_tx, _signal_rx) = mpsc::channel();
     let mut sender = Guest::new(&ctx, &engine, &module, signal_tx.clone());
-    sender.create();
-    // A fresh receiver's prefunded arena is 16 MiB.
-    assert_eq!(
-        sender.eval(
-            "const bytes = new Uint8Array(32 << 20);
-             bytes[0] = 17;
-             bytes[bytes.length - 1] = 83;
-             bytes.buffer"
-        ),
-        0
-    );
-    assert_eq!(sender.message(), 0);
-
     let mut receiver = Guest::new(&ctx, &engine, &module, signal_tx);
+    sender.create();
     receiver.create();
+    let size = buffer_size(&receiver);
+    make_buffer(&mut sender, size);
+    if transfer {
+        // Edge.js applies the transfer list before it creates the queue message.
+        assert_eq!(sender.clone_buffer(true), 0);
+        assert_eq!(sender.install(), 0);
+        assert_eq!(sender.number("bytes.byteLength"), 0);
+        assert_eq!(sender.eval("shared"), 0);
+    }
+    assert_eq!(sender.message(), 0);
     let before = receiver.memory_size();
     assert_eq!(receiver.take(sender.token()), 0);
     assert!(receiver.memory_size() > before);
-    assert_eq!(receiver.install(), 0);
-    assert_eq!(receiver.number("shared.byteLength"), 32 << 20);
-    assert_eq!(receiver.number("new Uint8Array(shared)[0]"), 17);
-    assert_eq!(receiver.number("new Uint8Array(shared).at(-1)"), 83);
+    check_buffer(&mut receiver, size);
     assert_eq!(receiver.release(), 0);
     assert_eq!(sender.release(), 0);
+}
+
+#[test]
+fn structured_clone_can_grow_the_guest_heap() {
+    let (engine, module) = compile();
+    let (signal, _) = mpsc::channel();
+    let mut guest = Guest::new(&NapiCtx::default(), &engine, &module, signal);
+    guest.create();
+    let size = buffer_size(&guest);
+    make_buffer(&mut guest, size);
+    let before = guest.memory_size();
+    assert_eq!(guest.clone_buffer(false), 0);
+    assert!(guest.memory_size() > before);
+    check_buffer(&mut guest, size);
+    assert_eq!(guest.number("bytes[0] = 0; new Uint8Array(shared)[0]"), 17);
+    assert_eq!(guest.release(), 0);
+}
+
+#[test]
+fn a_serialization_getter_can_queue_a_second_message() {
+    let (engine, module) = compile();
+    let (signal, _) = mpsc::channel();
+    let mut guest = Guest::new(&NapiCtx::default(), &engine, &module, signal);
+    guest.create();
+    assert_eq!(guest.install_post(), 0);
+    assert_eq!(guest.eval("({get answer() { post(17); return 83; }})"), 0);
+    assert_eq!(guest.message(), 0);
+    let outer = guest.token();
+    let inner = guest.nested_token();
+    assert_eq!(guest.take(inner), 0);
+    assert_eq!(guest.install(), 0);
+    assert_eq!(guest.number("shared"), 17);
+    assert_eq!(guest.take(outer), 0);
+    assert_eq!(guest.install(), 0);
+    assert_eq!(guest.number("shared.answer"), 83);
+    assert_eq!(guest.release(), 0);
+}
+
+#[test]
+fn a_guest_exit_in_a_getter_releases_the_unqueued_message() {
+    use wasmer_wasix::{WasiError, wasmer_wasix_types::wasi::ExitCode};
+
+    let (engine, module) = compile();
+    let ctx = NapiCtx::builder().total_memory_bytes(1 << 30).build();
+    let mut guest = Guest::with_signal_hook(&ctx, &engine, &module, || {
+        Err(WasiError::Exit(ExitCode::from(7u16)))
+    });
+    guest.create();
+    // An ordinary getter with the same result establishes that serialization
+    // creates a charged handle and can finish when signal() returns undefined.
+    assert_eq!(guest.eval("({get answer() { return undefined; }})"), 0);
+    assert_eq!(guest.message(), 0);
+    let token = guest.token();
+    assert!(ctx.budget().snapshot().serialized_message > 0);
+    guest.drop_message(token);
+    assert_eq!(ctx.budget().snapshot().serialized_message, 0);
+
+    assert_eq!(guest.eval("({get answer() { return signal(); }})"), 0);
+    let exit = guest.try_message().unwrap_err();
+    assert!(
+        matches!(exit.downcast_ref::<WasiError>(), Some(WasiError::Exit(code)) if code.raw() == 7)
+    );
+    assert_eq!(ctx.budget().snapshot().serialized_message, 0);
+    assert_eq!(guest.release(), 0);
+}
+
+#[test]
+fn stopping_the_context_in_a_getter_releases_queued_messages() {
+    let (engine, module) = compile();
+    let ctx = NapiCtx::builder().total_memory_bytes(1 << 30).build();
+    let control = ctx.runtime_control();
+    let mut guest = Guest::with_signal_hook(&ctx, &engine, &module, move || {
+        control.terminate_all();
+        Ok(())
+    });
+    guest.create();
+    assert_eq!(guest.eval("17"), 0);
+    assert_eq!(guest.message(), 0);
+    let token = guest.token();
+    assert!(ctx.budget().snapshot().serialized_message > 0);
+    assert_eq!(guest.eval("({get answer() { signal(); return 83; }})"), 0);
+    assert_ne!(guest.message(), 0);
+    assert_eq!(ctx.budget().snapshot().serialized_message, 0);
+    assert_eq!(guest.take(token), NAPI_INVALID_ARG);
+    assert_eq!(guest.release(), 0);
 }
 
 /// A guest on another memory cannot take it; the refusal consumes it.
