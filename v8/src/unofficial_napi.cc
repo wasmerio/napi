@@ -165,6 +165,9 @@ bool IsGuestDefaultV8Flags(const char* flags, size_t length) {
 
 class TrackingArrayBufferAllocator;
 
+// See NapiV8SetIsolateEntryHook.
+std::atomic<NapiV8IsolateEntryHook> g_isolate_entry_hook{nullptr};
+
 // The owner handle (unofficial_napi_env_owner): the isolate, its agent and
 // the scopes that keep the principal context entered.
 struct UnofficialEnvScope {
@@ -185,6 +188,9 @@ struct UnofficialEnvScope {
       v8::Isolate* isolate_in,
       std::shared_ptr<TrackingArrayBufferAllocator> allocator_in)
       : isolate(isolate_in), allocator(std::move(allocator_in)) {
+    if (NapiV8IsolateEntryHook hook = g_isolate_entry_hook.load(std::memory_order_acquire)) {
+      hook();
+    }
     isolate_scope.emplace(isolate_in);
     handle_scope.emplace(isolate_in);
   }
@@ -2276,6 +2282,10 @@ void ForgetEnvState(napi_env env) {
 
 void NapiV8DetachEnvOwner(unofficial_napi_env_owner owner) {
   reinterpret_cast<UnofficialEnvScope*>(owner)->isolate_scope.reset();
+}
+
+void NapiV8SetIsolateEntryHook(NapiV8IsolateEntryHook hook) {
+  g_isolate_entry_hook.store(hook, std::memory_order_release);
 }
 
 napi_status NapiV8MessageSharesRange(unofficial_napi_message message,

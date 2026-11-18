@@ -1,4 +1,4 @@
-use std::ffi::c_void;
+use std::{ffi::c_void, sync::Arc};
 
 use wasmer::{AsStoreMut, FunctionEnv, FunctionEnvMut, Store, StoreMut, Table, Value};
 use wasmer_wasix::WasiError;
@@ -50,14 +50,49 @@ pub(crate) fn take_pending_guest_exit() -> Option<ExitCode> {
     PENDING_GUEST_EXIT.with(|slot| slot.take())
 }
 
-/// What a V8 callback needs to reach the guest: a handle to the N-API env of
-/// the import that installed it. The handle is store-free, so this holds
-/// nothing that points into the installer's stack frame — the store itself is
-/// picked back up from the thread, which the installer lends by parking its
-/// own borrow (see [`with_callback_state`]). C++ only ever passes this back as
-/// an opaque pointer.
-struct CallbackInvocationCtx {
+/// What a V8 callback needs to reach the guest: a handle to the guest
+/// instance's N-API env and the id of its store. Neither changes for the
+/// life of a bridge env, so [`install_callback_ctx`] gives each env one when
+/// it is created and imports never swap it. The handle is store-free; the
+/// store itself is picked back up from the thread, which an import lends by
+/// parking its own borrow (see [`with_callback_state`]). C++ only ever passes
+/// this back as an opaque pointer.
+pub(crate) struct CallbackInvocationCtx {
     func_env: FunctionEnv<NapiEnv>,
+    /// The store `func_env` lives in. A callback only runs with that store
+    /// lent: no store may be lent (JavaScript outside an import that lends
+    /// it), or another store's, when stores share the thread.
+    store_id: usize,
+}
+
+impl CallbackInvocationCtx {
+    /// The lent store, if it is the one this context's env lives in.
+    fn with_store<R>(&self, f: impl FnOnce(&mut StoreMut<'_>) -> R) -> Option<R> {
+        Store::with_current(|store| {
+            (store.objects_mut().id().as_raw().get() == self.store_id).then(|| f(store))
+        })
+        .flatten()
+    }
+}
+
+/// Gives the env `env_id` just created its callback context. The env's agent
+/// keeps a pointer to it until its release, and `NapiEnv` frees it after that.
+/// The context is shared, never borrowed mutably, so the agent's pointer stays
+/// valid however `NapiEnv` moves its handle around.
+pub(crate) fn install_callback_ctx(
+    env: &mut FunctionEnvMut<NapiEnv>,
+    env_id: u32,
+    snapi_env: SnapiEnv,
+) {
+    let ctx = Arc::new(CallbackInvocationCtx {
+        func_env: env.as_ref(),
+        store_id: env.objects_mut().id().as_raw().get(),
+    });
+    let ctx_ptr = Arc::as_ptr(&ctx).cast_mut().cast::<c_void>();
+    env.data_mut().native_callback_contexts.insert(env_id, ctx);
+    unsafe {
+        crate::snapi::snapi_bridge_swap_active_callback_ctx(snapi_env, ctx_ptr);
+    }
 }
 
 fn call_guest_callback(
@@ -142,42 +177,21 @@ fn call_guest_callback2(
     }
 }
 
-/// Install a callback-invocation context for the duration of `f`, so host V8
-/// callbacks fired inside the bridge call can be dispatched into the wasm
-/// guest (see [`snapi_host_invoke_wasm_callback`]).
+/// Lend the store for the duration of `f`, so host V8 callbacks fired inside
+/// the bridge call can be dispatched into the wasm guest through the env's
+/// callback context (see [`snapi_host_invoke_wasm_callback`]).
 pub fn with_callback_state<R>(
     env: &mut FunctionEnvMut<NapiEnv>,
     snapi_env: SnapiEnv,
     f: impl FnOnce() -> R,
 ) -> R {
     if snapi_env.is_null() {
-        // There is no guest callback context to install. Keep this path out of
+        // No env, so no guest callback can fire. Keep this path out of
         // Wasmer's store-lending TLS; callers that allocate guest memory pass
         // their store explicitly.
         return f();
     }
 
-    let mut ctx = CallbackInvocationCtx {
-        func_env: env.as_ref(),
-    };
-    let prev = unsafe {
-        crate::snapi::snapi_bridge_swap_active_callback_ctx(
-            snapi_env,
-            (&mut ctx as *mut CallbackInvocationCtx).cast::<c_void>(),
-        )
-    };
-    struct CallbackStateGuard {
-        snapi_env: SnapiEnv,
-        prev: *mut c_void,
-    }
-    impl Drop for CallbackStateGuard {
-        fn drop(&mut self) {
-            unsafe {
-                crate::snapi::snapi_bridge_swap_active_callback_ctx(self.snapi_env, self.prev);
-            }
-        }
-    }
-    let _guard = CallbackStateGuard { snapi_env, prev };
     // Wrap bridge calls that may invoke guest code or allocate through V8's
     // array-buffer allocator, so foreground allocations can grow guest memory.
     // Ordinary N-API imports keep their store local and pass it directly to
@@ -198,12 +212,12 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
         eprintln!("[callback trampoline] no active callback scope available");
         return 0;
     }
-    // SAFETY: `callback_ctx` is the context `with_callback_state` installed,
-    // which outlives the bridge call this fired inside.
+    // SAFETY: `callback_ctx` is the context `install_callback_ctx` gave the
+    // env, which lives at least as long as the env's agent points to it.
     let ctx = unsafe { &*(callback_ctx as *const CallbackInvocationCtx) };
     let func_env = ctx.func_env.clone();
 
-    let dispatched = Store::with_current(|store| {
+    let dispatched = ctx.with_store(|store| {
         let Some(table) = func_env.as_ref(store).table.clone() else {
             return 0;
         };
@@ -232,9 +246,9 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
     match dispatched {
         Some(result) => result,
         None => {
-            // The import that entered V8 did not lend its store, so there is
-            // no way back into the guest from here.
-            eprintln!("[callback trampoline] no store lent to this thread");
+            // No import of this guest lent its store to the code that entered
+            // V8, so there is no way back into the guest from here.
+            eprintln!("[callback trampoline] the guest's store is not lent to this thread");
             0
         }
     }
@@ -261,7 +275,7 @@ pub extern "C" fn snapi_host_invoke_wasm_finalizer(
     let ctx = unsafe { &*(callback_ctx as *const CallbackInvocationCtx) };
     let func_env = ctx.func_env.clone();
 
-    Store::with_current(|store| {
+    ctx.with_store(|store| {
         let Some(table) = func_env.as_ref(store).table.clone() else {
             return 0;
         };
@@ -309,10 +323,42 @@ mod tests {
         let func_env = FunctionEnv::new(&mut store, env);
         let mut ctx = CallbackInvocationCtx {
             func_env: func_env.clone(),
+            store_id: store.objects_mut().id().as_raw().get(),
         };
         let mut invoke = || snapi_host_invoke_wasm_callback((&raw mut ctx).cast(), 0, 0, 0);
         assert_eq!(store.as_store_mut().parked(&mut invoke), 0);
         func_env.as_mut(&mut store).leave_callback();
+        assert_eq!(store.as_store_mut().parked(invoke), 17);
+    }
+
+    #[test]
+    fn a_callback_context_only_runs_with_its_own_store_lent() {
+        let mut store = Store::default();
+        let mut env = NapiEnv::new(
+            crate::budget::ResourceBudget::unlimited(),
+            None,
+            Default::default(),
+            Default::default(),
+        );
+        let getter = Function::new_typed(&mut store, |_: u32, _: u32| 17u32);
+        env.table = Some(
+            Table::new(
+                &mut store,
+                TableType::new(Type::FuncRef, 1, Some(1)),
+                Value::FuncRef(Some(getter)),
+            )
+            .unwrap(),
+        );
+        let func_env = FunctionEnv::new(&mut store, env);
+        let mut ctx = CallbackInvocationCtx {
+            func_env,
+            store_id: store.objects_mut().id().as_raw().get(),
+        };
+        let mut invoke = || snapi_host_invoke_wasm_callback((&raw mut ctx).cast(), 0, 0, 0);
+        // No store lent, then another store lent: the guest is out of reach.
+        assert_eq!(invoke(), 0);
+        let mut other = Store::default();
+        assert_eq!(other.as_store_mut().parked(&mut invoke), 0);
         assert_eq!(store.as_store_mut().parked(invoke), 17);
     }
 }

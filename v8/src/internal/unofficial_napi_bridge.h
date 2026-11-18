@@ -9,6 +9,15 @@
 // bridge enters its isolate separately for each call.
 void NapiV8DetachEnvOwner(unofficial_napi_env_owner owner);
 
+// The WASM bridge may keep an isolate entered on a thread between its calls
+// (its resident isolate). An env the provider creates stays entered, so
+// before the provider enters a new env's isolate it calls the hook the bridge
+// installed here, which leaves the resident isolate unless a bridge call is
+// on the thread's stack. Otherwise the resident isolate would be left entered
+// below the new one, where it could not be disposed.
+using NapiV8IsolateEntryHook = void (*)();
+void NapiV8SetIsolateEntryHook(NapiV8IsolateEntryHook hook);
+
 bool NapiV8LookupForegroundTaskTarget(v8::Isolate* isolate,
                                       napi_env* env_out,
                                       unofficial_napi_enqueue_foreground_task_callback* callback_out);
