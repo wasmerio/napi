@@ -248,6 +248,7 @@ NAPI_V8_SOURCES=(
   "$NAPI_LIB_SRC/napi_text.cc"
   "$NAPI_LIB_SRC/napi_typedarray_metadata.cc"
   "$NAPI_V8_SRC/js_native_api_v8.cc"
+  "$NAPI_V8_SRC/node_api_v8.cc"
   "$NAPI_V8_SRC/internal/napi_escapable_handle_scope_wrapper.cc"
   "$NAPI_V8_SRC/internal/napi_external_wrapper.cc"
   "$NAPI_V8_SRC/internal/napi_function_callback_info.cc"

@@ -14,7 +14,7 @@ rest in its own `src/node_api.cc`. The calls napi still defines are
 | Call | Why it is the embedder's |
 |---|---|
 | `napi_create_buffer`, `napi_create_buffer_copy`, `napi_create_external_buffer`, `node_api_create_buffer_from_arraybuffer`, `napi_is_buffer`, `napi_get_buffer_info` | A Buffer is a Uint8Array with `Buffer.prototype`, which Node's `lib/` makes. Only the embedder that runs `lib/` has it; napi could only look it up on the global, which a script controls. |
-| `napi_add_env_cleanup_hook`, `napi_remove_env_cleanup_hook` | Node runs them when its Environment is cleaned up, which is the embedder's teardown. The embedder keeps them; what must run at the env's release, interleaved with its finalizers (a hook a finalizer adds then), it runs from the `env_cleanup_callback` of `unofficial_napi_env_hooks`. |
+| `napi_add_env_cleanup_hook`, `napi_remove_env_cleanup_hook` | Node runs them when its Environment is cleaned up, which is the embedder's teardown. The embedder keeps them; what must run at the env's release, interleaved with its finalizers (a hook a finalizer adds then), it runs from the callback it sets with `unofficial_napi_set_env_cleanup_callback` (see [Env cleanup hooks](#env-cleanup-hooks)). |
 | `napi_fatal_exception` | Node reports it as an uncaught exception (`process.on('uncaughtException')`), which is the embedder's. napi only throws it. |
 | `napi_fatal_error` | Kept with the others so an embedder takes over all of `node_api.h`. |
 
