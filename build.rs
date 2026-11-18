@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const PREBUILT_V8_VERSION: &str = "15.9.111.1";
+const PREBUILT_V8_VERSION: &str = "15.9.111.2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum V8Method {
