@@ -3558,18 +3558,19 @@ napi_status NAPI_CDECL napi_get_and_clear_last_exception(napi_env env,
       message = env->last_exception_message.Get(env->isolate);
     }
     if (!message.IsEmpty()) {
-      const std::string source_line =
-          unofficial_napi_internal::GetErrorSourceLineForStderrImpl(env, message);
+      const auto source = unofficial_napi_internal::GetErrorSource(env, message);
       // That can run the source-map callback, JS that V8 may terminate. The
       // V8 calls formatting makes would then drop the termination, as
       // NAPI_V8_RETURN_IF_TERMINATING says entering V8 does.
       if (!TerminatedOrTerminating(env)) {
-        unofficial_napi_internal::SetArrowMessageFromString(
-            env->isolate, env->context(), ex, source_line);
+        if (source.attach_arrow) {
+          unofficial_napi_internal::SetArrowMessageFromString(
+              env->isolate, env->context(), ex, source.text);
+        }
         unofficial_napi_internal::PreserveErrorFormatting(
             env,
             ex,
-            source_line,
+            source.text,
             unofficial_napi_internal::GetThrownAtString(env->isolate, message));
       }
     } else {
