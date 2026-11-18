@@ -335,9 +335,12 @@ struct SnapiAgentState {
   // handle-scope closure and retain their JavaScript values until released.
   HandleTable buffer_lease_handles;
 
-  // Current guest invocation driving this agent. This is only valid while the
-  // driving host import remains on the stack.
-  std::atomic<void*> active_callback_ctx{nullptr};
+  // How engine callbacks reach the guest: the callback context the host
+  // installs once when the env is created (snapi_bridge_swap_active_callback_ctx).
+  // It names the guest instance and its store, and the host checks that this
+  // store is the one lent to the thread before it re-enters the guest.
+  // Owner thread only; cleared when the agent is released.
+  void* active_callback_ctx = nullptr;
   // Guest callbacks in progress, innermost last. Callbacks nest, so entries
   // are added and removed in LIFO order and lookups hit the last few.
   std::vector<CallbackInvocation> callback_invocations;
@@ -820,28 +823,69 @@ class AgentLaneScope {
   void* previous_;
 };
 
-// Several stores can share an OS thread. V8 consults the current isolate
-// even in APIs that take a context, so enter the isolate of the requested env
-// for each bridge call and restore the caller's isolate on return. The call
-// also binds the env's instance lane.
 void ReconcileHeapLease(SnapiAgentState& agent, napi_env env);
+
+// Several stores can share an OS thread. V8 consults the current isolate even
+// in APIs that take a context, so each bridge call runs with its env's
+// isolate entered (and binds the env's instance lane).
+//
+// Entering an isolate is not cheap: V8 takes a lock and allocates an entry
+// record, and with the prebuilt V8's malloc that allocation contends across
+// threads. So the outermost bridge call on a thread leaves its isolate
+// entered when it returns, as this thread's resident isolate, and the next
+// call for the same isolate finds it current. A call for another isolate
+// switches the resident one when nothing of this thread still runs in it
+// (no bridge call is on the stack); a nested call for another isolate enters
+// it for its own duration only. DisposeBridgeState leaves the resident
+// isolate before the isolate goes.
+thread_local v8::Isolate* t_resident_isolate = nullptr;
+thread_local uint32_t t_bridge_depth = 0;
+
+// True when `isolate` is this thread's resident isolate but another isolate
+// is entered above it, so it cannot be left yet. Only a nested bridge call
+// enters another isolate above it, and that call comes from guest code the
+// isolate's agent called into, whose guest_calls refuse the release anyway.
+bool ResidentIsolateBuried(v8::Isolate* isolate) {
+  return isolate != nullptr && t_resident_isolate == isolate &&
+         v8::Isolate::TryGetCurrent() != isolate;
+}
+
+// Leaves `isolate` if it is this thread's resident isolate. Not when it is
+// buried (see ResidentIsolateBuried), which the caller rules out.
+void LeaveResidentIsolate(v8::Isolate* isolate) {
+  if (t_resident_isolate != isolate) return;
+  t_resident_isolate = nullptr;
+  if (v8::Isolate::TryGetCurrent() == isolate) isolate->Exit();
+}
 
 class BridgeEnvScope {
  public:
   explicit BridgeEnvScope(SnapiEnvState* state) : state_(LookupEnvState(state)) {
     if (state_ == nullptr) return;
+    ++t_bridge_depth;
     // A WASIX thread can predate the platform's JIT key.
     EdgeV8AllowJitKeyReads();
     lane_scope_.emplace(state_->agent);
-    if (v8::Isolate::TryGetCurrent() != state_->env->isolate) {
-      isolate_scope_.emplace(state_->env->isolate);
+    v8::Isolate* isolate = state_->env->isolate;
+    v8::Isolate* current = v8::Isolate::TryGetCurrent();
+    if (current == isolate) return;
+    if (t_bridge_depth == 1 && (current == nullptr || current == t_resident_isolate)) {
+      // Nothing of this thread runs in the resident isolate: switch it.
+      if (current != nullptr) current->Exit();
+      isolate->Enter();
+      t_resident_isolate = isolate;
+      return;
     }
+    // A nested call for another isolate, or one someone else entered.
+    isolate_scope_.emplace(isolate);
   }
   // The call's allocations are done: a heap lease V8 needed for one of them
   // is reconciled now, also for calls that run no JavaScript (where the
   // lease's interrupt would wait for the next one).
   ~BridgeEnvScope() {
-    if (state_ != nullptr && state_->agent != nullptr && state_->agent->heap_lease_pending &&
+    if (state_ == nullptr) return;
+    --t_bridge_depth;
+    if (state_->agent != nullptr && state_->agent->heap_lease_pending &&
         state_->env != nullptr) {
       ReconcileHeapLease(*state_->agent, state_->env);
     }
@@ -866,6 +910,9 @@ napi_status DisposeBridgeState(SnapiEnvState* state) {
   // Guest code an env of this agent called into is running: the engine still
   // uses the isolate once that code returns.
   if (agent->guest_calls != 0) return napi_invalid_arg;
+  // Neither while another isolate is entered above this one (V8 could not
+  // dispose it).
+  if (ResidentIsolateBuried(state->env->isolate)) return napi_invalid_arg;
   {
     std::lock_guard<std::mutex> lock(g_mu);
     if (agent->closing) return napi_invalid_arg;
@@ -917,6 +964,9 @@ napi_status DisposeBridgeState(SnapiEnvState* state) {
   }
   napi_status s = napi_ok;
   if (agent->owner != nullptr) {
+    // V8 refuses to dispose an isolate a thread still has entered, and the
+    // scope above may have left this one entered as the resident isolate.
+    LeaveResidentIsolate(state->env->isolate);
     // Disposing the isolate runs finalizers and V8's own teardown work.
     AgentLaneScope lane_scope(agent);
     s = unofficial_napi_release_env(agent->owner, nullptr);
@@ -925,7 +975,7 @@ napi_status DisposeBridgeState(SnapiEnvState* state) {
   // JS functions can still call their bindings while finalizers run above
   // (with no registry entry they return undefined), so free them only now.
   for (SnapiEnvState* env_state : agent->envs) env_state->callback_bindings.clear();
-  agent->active_callback_ctx.store(nullptr, std::memory_order_release);
+  agent->active_callback_ctx = nullptr;
   std::unordered_set<WasmInterruptRequest*> unserviced;
   {
     std::lock_guard<std::mutex> lock(g_mu);
@@ -2072,7 +2122,7 @@ void GuestFinalizerTrampoline(node_api_basic_env /*env*/, void* /*data*/,
   GuestCallScope guest_call(bridge_state);
   void* callback_ctx =
       bridge_state != nullptr && guest_call.allowed()
-          ? bridge_state->agent->active_callback_ctx.load(std::memory_order_acquire)
+          ? bridge_state->agent->active_callback_ctx
           : nullptr;
   if (callback_ctx != nullptr) {
     // Own any value ids the guest mints while running its finalizer; there is
@@ -3373,8 +3423,9 @@ extern "C" int snapi_bridge_define_class(SnapiEnvState* env_state,
 extern "C" void* snapi_bridge_swap_active_callback_ctx(SnapiEnvState* env_state, void* callback_ctx) {
   auto* bridge_state = LookupEnvState(env_state);
   if (bridge_state == nullptr) return nullptr;
-  return bridge_state->agent->active_callback_ctx.exchange(callback_ctx,
-                                                           std::memory_order_acq_rel);
+  void* prev = bridge_state->agent->active_callback_ctx;
+  bridge_state->agent->active_callback_ctx = callback_ctx;
+  return prev;
 }
 
 extern "C" int snapi_bridge_get_cb_info(SnapiEnvState* env_state, uint32_t cbinfo_id,
@@ -3472,7 +3523,7 @@ void WasmInterruptCallback(napi_env env, void* raw) {
   GuestCallScope guest_call(bridge_state);
   void* callback_ctx =
       bridge_state != nullptr
-          ? bridge_state->agent->active_callback_ctx.load(std::memory_order_acquire)
+          ? bridge_state->agent->active_callback_ctx
           : nullptr;
   if (callback_ctx != nullptr) {
     // Own the ids the guest mints while servicing the interrupt (no return
@@ -3523,8 +3574,7 @@ static napi_value generic_wasm_callback(napi_env env, napi_callback_info info) {
   SnapiAgentState& agent = *bridge_state->agent;
   GuestCallScope guest_call(bridge_state);
   void* callback_ctx =
-      guest_call.allowed() ? agent.active_callback_ctx.load(std::memory_order_acquire)
-                           : nullptr;
+      guest_call.allowed() ? agent.active_callback_ctx : nullptr;
   if (callback_ctx == nullptr) {
     napi_value undef;
     napi_get_undefined(env, &undef);
@@ -4138,7 +4188,8 @@ extern "C" int snapi_bridge_unofficial_env_release_refused(SnapiEnvState* env_st
   if (env_state == nullptr) return 0;
   if (!OwnedByThisThread(env_state)) return 1;
   const SnapiAgentState& agent = *env_state->agent;
-  return agent.closing || agent.guest_calls != 0 ? 1 : 0;
+  v8::Isolate* isolate = env_state->env != nullptr ? env_state->env->isolate : nullptr;
+  return agent.closing || agent.guest_calls != 0 || ResidentIsolateBuried(isolate) ? 1 : 0;
 }
 
 extern "C" int snapi_bridge_unofficial_terminate_execution(SnapiEnvState* env_state) {

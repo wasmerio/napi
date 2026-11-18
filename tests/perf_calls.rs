@@ -4,7 +4,7 @@
 //! `./cargo-standalone.sh test --release --test perf_calls -- --ignored --nocapture`.
 //!
 //! `PERF_ROUNDS` (default 5) sets the rounds per case, of which the median is
-//! printed. `PERF_CASE` (0-3) runs one case, `PERF_THREADS` (e.g. `1,4`)
+//! printed. `PERF_CASE` (0-5) runs one case, `PERF_THREADS` (e.g. `1,4`)
 //! picks the thread counts and `PERF_SCALE` multiplies the calls per round,
 //! for example to keep a profiler attached long enough.
 
@@ -41,6 +41,13 @@ const WAT: &str = r#"(module
     (func $create_function (param i32 i32 i32 i32 i32 i32) (result i32)))
   (import "napi" "napi_get_cb_info"
     (func $get_cb_info (param i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "napi" "napi_create_object" (func $create_object (param i32 i32) (result i32)))
+  (import "napi" "napi_get_named_property"
+    (func $get_named (param i32 i32 i32 i32) (result i32)))
+  (import "napi" "napi_call_function"
+    (func $call_function (param i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "napi" "napi_open_handle_scope" (func $open_scope (param i32 i32) (result i32)))
+  (import "napi" "napi_close_handle_scope" (func $close_scope (param i32 i32) (result i32)))
 
   ;; 8 env, 12 scope, 28 string, 32 script result, 44 int handle, 48 global,
   ;; 52 function, 56 callback result, 60 argc, 64 argv, 68 this, 72 int out.
@@ -69,7 +76,48 @@ const WAT: &str = r#"(module
     (if (call $create_int32 (global.get $env) (i32.const 42) (i32.const 44))
       (then unreachable))
     (call $define (i32.const 100) (i32.const 1))
-    (call $define (i32.const 104) (i32.const 2)))
+    (call $define (i32.const 104) (i32.const 2))
+    ;; A plain object { f: 42 } at 80 for the property case.
+    (if (call $create_object (global.get $env) (i32.const 80)) (then unreachable))
+    (if (call $set_named_property (global.get $env) (i32.load (i32.const 80))
+          (i32.const 100) (i32.load (i32.const 44)))
+      (then unreachable)))
+
+  ;; n x napi_get_named_property (an import that may run JavaScript), 256 per
+  ;; handle scope so the minted ids don't pile up.
+  (func (export "loop_get_named") (param $n i32)
+    (local $i i32)
+    (loop $outer
+      (if (call $open_scope (global.get $env) (i32.const 76)) (then unreachable))
+      (local.set $i (i32.const 256))
+      (loop $inner
+        (if (call $get_named (global.get $env) (i32.load (i32.const 80)) (i32.const 100)
+              (i32.const 84))
+          (then unreachable))
+        (local.set $n (i32.sub (local.get $n) (i32.const 1)))
+        (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+        (br_if $inner (i32.and (i32.ne (local.get $i) (i32.const 0))
+                               (i32.gt_s (local.get $n) (i32.const 0)))))
+      (if (call $close_scope (global.get $env) (i32.load (i32.const 76))) (then unreachable))
+      (br_if $outer (i32.gt_s (local.get $n) (i32.const 0)))))
+
+  ;; n x napi_call_function of the JS function $fn with no arguments.
+  (func (export "loop_call_js") (param $n i32) (param $fn i32)
+    (local $i i32)
+    (if (call $get_undefined (global.get $env) (i32.const 88)) (then unreachable))
+    (loop $outer
+      (if (call $open_scope (global.get $env) (i32.const 76)) (then unreachable))
+      (local.set $i (i32.const 256))
+      (loop $inner
+        (if (call $call_function (global.get $env) (i32.load (i32.const 88)) (local.get $fn)
+              (i32.const 0) (i32.const 0) (i32.const 84))
+          (then unreachable))
+        (local.set $n (i32.sub (local.get $n) (i32.const 1)))
+        (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+        (br_if $inner (i32.and (i32.ne (local.get $i) (i32.const 0))
+                               (i32.gt_s (local.get $n) (i32.const 0)))))
+      (if (call $close_scope (global.get $env) (i32.load (i32.const 76))) (then unreachable))
+      (br_if $outer (i32.gt_s (local.get $n) (i32.const 0)))))
 
   (func (export "release") (result i32)
     (call $release_env (global.get $scope) (i32.const 0)))
@@ -229,6 +277,20 @@ fn loop_get_undefined(guest: &mut Guest, n: u32) {
     f.call(&mut guest.store, n as i32).unwrap();
 }
 
+fn loop_get_named(guest: &mut Guest, n: u32) {
+    let f: TypedFunction<i32, ()> = guest.typed("loop_get_named");
+    f.call(&mut guest.store, n as i32).unwrap();
+}
+
+fn loop_call_js(guest: &mut Guest, n: u32) {
+    assert_eq!(guest.eval("(function () {})"), 0);
+    let mut id = [0u8; 4];
+    guest.memory.view(&guest.store).read(32, &mut id).unwrap();
+    let f: TypedFunction<(i32, i32), ()> = guest.typed("loop_call_js");
+    f.call(&mut guest.store, n as i32, i32::from_le_bytes(id))
+        .unwrap();
+}
+
 fn js_calls_f(guest: &mut Guest, n: u32) {
     // In a function, so the warm-up and the measured run can both declare `s`.
     let script =
@@ -249,11 +311,13 @@ fn guest_call_costs() {
     let engine = store.engine().clone();
     let ctx = NapiCtx::default();
     let rounds: usize = setting("PERF_ROUNDS").unwrap_or(5);
-    let cases: [(&str, u32, Work); 4] = [
+    let cases: [(&str, u32, Work); 6] = [
         ("import napi_get_value_int32", 4_000_000, loop_get_int32),
         ("import napi_get_undefined", 4_000_000, loop_get_undefined),
         ("js->guest g() empty", 1_000_000, js_calls_g),
         ("js->guest f(x) cb_info+get+create", 1_000_000, js_calls_f),
+        ("import napi_get_named_property", 4_000_000, loop_get_named),
+        ("import napi_call_function js noop", 2_000_000, loop_call_js),
     ];
     let only: Option<usize> = setting("PERF_CASE");
     let scale: u32 = setting("PERF_SCALE").unwrap_or(1);

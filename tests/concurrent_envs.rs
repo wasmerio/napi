@@ -329,6 +329,55 @@ fn envs_on_several_threads_come_and_go_while_loading_modules() {
     }
 }
 
+/// Envs on one thread take turns. A bridge call leaves its env's isolate
+/// entered for the next call, so the next call for another env switches
+/// isolates, and a release must leave its isolate whichever env ran last.
+/// JavaScript must keep reaching its own guest through `signal()`, and a
+/// guest finalizer must still run while its env is released.
+#[test]
+fn envs_on_one_thread_take_turns() {
+    const ENVS: usize = 3;
+    let (engine, module) = compile();
+    let ctx = NapiCtx::default();
+    let (signal_tx, signal_rx) = mpsc::channel();
+    for order in [[0, 1, 2], [2, 1, 0], [1, 2, 0]] {
+        let mut guests: Vec<Option<Guest>> = (0..ENVS)
+            .map(|_| {
+                let mut guest = Guest::new(&ctx, &engine, &module, signal_tx.clone());
+                guest.create();
+                Some(guest)
+            })
+            .collect();
+        for round in 0..3 {
+            for (index, guest) in guests.iter_mut().enumerate() {
+                let value = (10 * index + round) as i32;
+                let guest = guest.as_mut().unwrap();
+                assert_eq!(guest.number(&format!("signal(); {value}")), value);
+            }
+        }
+        assert_eq!(signal_rx.try_iter().count(), 3 * ENVS);
+
+        for index in order {
+            let mut guest = guests[index].take().unwrap();
+            // The release unregisters `signal()` before finalizers run, so
+            // only the finalizer itself reaches the guest.
+            guest.set_finalizer_script("0");
+            assert_eq!(guest.arm_spinning_finalizer(), 0);
+            // Another env runs last, so its isolate is the entered one.
+            let other = guests.iter_mut().flatten().next();
+            let others = usize::from(other.is_some());
+            if let Some(other) = other {
+                assert_eq!(other.number("signal(); 7"), 7);
+            }
+            assert_eq!(guest.release(), 0);
+            assert_eq!(signal_rx.try_iter().count(), others + 1);
+            for guest in guests.iter_mut().flatten() {
+                assert_eq!(guest.number("6 * 7"), 42);
+            }
+        }
+    }
+}
+
 /// One queued message, two environments racing to take it: the narrower
 /// registry lock must still hand it to exactly one of them.
 #[test]

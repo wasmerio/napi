@@ -81,6 +81,7 @@ fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
     else {
         return 0;
     };
+    super::callback::install_callback_ctx(&mut env, env_id, snapi_env_state);
     env.data_mut().default_napi_env_id = Some(env_id);
     env_id as i32
 }
@@ -118,7 +119,7 @@ fn with_cb_context<R>(
         // collection examined; settle it before the guest goes on (see
         // `napi_host_near_heap_limit_grant`). The check is not free, so the
         // tracker decides, lock-free, whether this return is due.
-        if env.data().heap_tracker_for(snapi_env).is_some() {
+        if env.data().heap_tracker_for(guest_env).is_some() {
             unsafe { snapi_bridge_unofficial_settle_heap(snapi_env) };
         }
     }
@@ -323,6 +324,7 @@ fn guest_unofficial_napi_create_env(
         Ok(ids) => ids,
         Err(status) => return status,
     };
+    super::callback::install_callback_ctx(&mut env, env_id, snapi_env_state);
     if env_out_ptr != 0 {
         write_guest_u32(&mut env, env_out_ptr, env_id);
     }

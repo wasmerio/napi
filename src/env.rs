@@ -32,7 +32,6 @@ use crate::snapi::{
 /// status means the env was torn down.
 pub(crate) const RELEASE_REFUSED: i32 = 1;
 
-#[cfg(all(target_arch = "wasm32", feature = "js"))]
 use crate::guest::callback::CallbackInvocationCtx;
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -136,7 +135,7 @@ pub(crate) struct NapiEnv {
     pub(crate) messages: Arc<crate::message::PendingMessages>,
     /// Heap charge per live V8 env, keyed by guest env id, so teardown releases
     /// exactly what creation charged plus what the callback later granted.
-    env_heap_charges: HashMap<u32, EnvHeapChargeHandle>,
+    env_heap_charges: IdHashMap<u32, EnvHeapChargeHandle>,
     /// External memory the guest has declared via `napi_adjust_external_memory`,
     /// charged to [`Pool::V8External`]. Tracked so a negative adjustment can
     /// only release what this env actually declared, never more, and so
@@ -208,6 +207,11 @@ pub(crate) struct NapiEnv {
     pub(crate) envs_awaiting_async_owner: Vec<u32>,
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) native_buffer_leases: HashMap<(u32, u32), NativeBufferLease>,
+    /// Each env's callback context, which its agent points to from creation
+    /// (see `install_callback_ctx`) until its release. Freed after a release;
+    /// for an env whose release was refused, kept for good when this goes.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) native_callback_contexts: IdHashMap<u32, Box<CallbackInvocationCtx>>,
 }
 
 impl NapiEnv {
@@ -228,7 +232,7 @@ impl NapiEnv {
             env_registry,
             host_stopped,
             messages: crate::message::PendingMessages::new(),
-            env_heap_charges: HashMap::new(),
+            env_heap_charges: IdHashMap::default(),
             external_declared: 0,
             callback_depth: 0,
             memory: None,
@@ -274,6 +278,8 @@ impl NapiEnv {
             envs_awaiting_async_owner: Vec::new(),
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
             native_buffer_leases: HashMap::new(),
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            native_callback_contexts: IdHashMap::default(),
         }
     }
 
@@ -454,11 +460,12 @@ impl NapiEnv {
         Ok((env_id, scope_id))
     }
 
-    /// The heap tracker of a live budgeted env, or `None` for an env under
-    /// an unlimited budget (which has no heap limit to settle).
-    pub(crate) fn heap_tracker_for(&self, env: SnapiEnv) -> Option<&EnvHeapCharge> {
-        let env_id = self.napi_state_to_guest_env.get(&(env as usize))?;
-        let tracker = self.env_heap_charges.get(env_id)?.tracker;
+    /// The heap tracker of the live budgeted env `env_id`, or `None` for an
+    /// env under an unlimited budget (which has no heap limit to settle).
+    /// Every import that can run JavaScript asks, so it takes the guest's env
+    /// id rather than the bridge pointer, which would need a second lookup.
+    pub(crate) fn heap_tracker_for(&self, env_id: u32) -> Option<&EnvHeapCharge> {
+        let tracker = self.env_heap_charges.get(&env_id)?.tracker;
         if tracker == 0 {
             return None;
         }
@@ -691,6 +698,9 @@ impl NapiEnv {
             self.budget.release_env(handle.ceiling);
         }
         self.napi_envs.remove(&env_id);
+        // The release cleared the agent's pointer to it.
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        self.native_callback_contexts.remove(&env_id);
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
         {
             // The host env has already been freed. Its address is only a
@@ -743,6 +753,13 @@ impl Drop for NapiEnv {
         #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
         if env_kept && let Some(lane) = self.managed_lane.take() {
             std::mem::forget(lane);
+        }
+        // A kept env's agent still points at its callback context, and its
+        // owner may yet release it and run finalizers. Keep the context: it
+        // names a store that is gone, which the trampolines refuse.
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        for (_, ctx) in self.native_callback_contexts.drain() {
+            Box::leak(ctx);
         }
         // Release any external memory the guest declared but did not take back.
         if self.external_declared > 0 {
