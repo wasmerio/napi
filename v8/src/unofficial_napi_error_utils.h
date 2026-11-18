@@ -8,26 +8,29 @@
 
 namespace unofficial_napi_internal {
 
-std::string BuildSyntaxArrowMessage(v8::Isolate* isolate,
-                                    v8::Local<v8::Context> context,
-                                    v8::Local<v8::Message> message);
+struct ErrorSource {
+  std::string text;
+  // A source line carrying Node's opt-out marker is printed verbatim on
+  // stderr, but must not be attached to the exception as an arrow.
+  bool attach_arrow = false;
+};
+
+ErrorSource GetErrorSource(napi_env env, v8::Local<v8::Message> message);
 
 void SetArrowMessageFromString(v8::Isolate* isolate,
                                v8::Local<v8::Context> context,
                                v8::Local<v8::Value> exception,
                                const std::string& arrow);
 
-void SetArrowMessage(v8::Isolate* isolate,
-                     v8::Local<v8::Context> context,
-                     v8::Local<v8::Value> exception,
-                     v8::Local<v8::Message> message);
+void SetModuleErrorArrow(napi_env env,
+                         v8::Local<v8::Context> context,
+                         v8::Local<v8::Value> exception,
+                         v8::Local<v8::Message> message);
 
 void AttachSyntaxArrowMessage(v8::Isolate* isolate,
                               v8::Local<v8::Context> context,
                               v8::Local<v8::Value> exception,
                               v8::Local<v8::Message> message);
-std::string GetErrorSourceLineForStderrImpl(napi_env env,
-                                            v8::Local<v8::Message> message);
 std::string GetThrownAtString(v8::Isolate* isolate,
                               v8::Local<v8::Message> message);
 void PreserveErrorFormatting(napi_env env,

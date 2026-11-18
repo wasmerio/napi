@@ -117,6 +117,26 @@ TEST_F(Test14Exception, SetLastExceptionStoresArrowMessageOnThrownError) {
   EXPECT_NE(GetArrowMessage(s.env, exception).find("throw new Error('boom')"), std::string::npos);
 }
 
+#if defined(NAPI_TEST_ENGINE_V8)
+TEST_F(Test14Exception, NativeErrorWithoutSourcePositionHasNoArrowOrStderrLine) {
+  EnvScope s(runtime_.get());
+  ASSERT_EQ(napi_throw_error(s.env, nullptr, "native boom"), napi_pending_exception);
+  napi_value error = nullptr;
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &error), napi_ok);
+  napi_value key = nullptr;
+  ASSERT_EQ(unofficial_napi_create_private_symbol(s.env, "node:arrowMessage", NAPI_AUTO_LENGTH, &key),
+            napi_ok);
+  bool has_arrow = true;
+  ASSERT_EQ(napi_has_own_property(s.env, error, key, &has_arrow), napi_ok);
+  EXPECT_FALSE(has_arrow);
+
+  unofficial_napi_error_metadata metadata{};
+  ASSERT_EQ(unofficial_napi_get_error_metadata(s.env, error, unofficial_napi_error_metadata_take_preserved,
+                                              &metadata), napi_ok);
+  EXPECT_EQ(metadata.stderr_line, nullptr);
+}
+#endif
+
 TEST_F(Test14Exception, ErrorMetadataSnapshotConsumesPreservedStateAtomically) {
   EnvScope s(runtime_.get());
 

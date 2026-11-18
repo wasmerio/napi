@@ -105,56 +105,6 @@ std::string CallGetSourceMapErrorSource(v8::Isolate* isolate,
   return V8ValueToUtf8(isolate, result);
 }
 
-std::string GetErrorSourceLineForStderrImpl(napi_env env, v8::Local<v8::Message> message) {
-  if (env == nullptr || env->isolate == nullptr || message.IsEmpty()) return {};
-
-  v8::Isolate* isolate = env->isolate;
-  v8::HandleScope scope(isolate);
-  v8::Local<v8::Context> context = env->context();
-
-  v8::Local<v8::String> source_line;
-  if (!message->GetSourceLine(context).ToLocal(&source_line)) {
-    return {};
-  }
-  const std::string source_line_utf8 = V8ValueToUtf8(isolate, source_line);
-  if (source_line_utf8.find("node-do-not-add-exception-line") != std::string::npos) {
-    return source_line_utf8;
-  }
-
-  ErrorFormattingState state;
-  {
-    std::lock_guard<std::mutex> lock(g_error_formatting_mu);
-    auto it = g_error_formatting_states.find(env);
-    if (it != g_error_formatting_states.end()) {
-      state.source_maps_enabled = it->second.source_maps_enabled;
-      if (!it->second.get_source_map_error_source.IsEmpty()) {
-        state.get_source_map_error_source.Reset(
-            isolate, it->second.get_source_map_error_source.Get(isolate));
-      }
-    }
-  }
-
-  if (state.source_maps_enabled && !state.get_source_map_error_source.IsEmpty()) {
-    v8::Local<v8::Value> script_resource_name = message->GetScriptResourceName();
-    if (!script_resource_name.IsEmpty() && !script_resource_name->IsUndefined()) {
-      const int line_number = message->GetLineNumber(context).FromMaybe(0);
-      const int column_number = message->GetStartColumn(context).FromMaybe(0);
-      const std::string mapped = CallGetSourceMapErrorSource(
-          isolate,
-          context,
-          state.get_source_map_error_source.Get(isolate),
-          script_resource_name,
-          line_number,
-          column_number);
-      if (!mapped.empty()) {
-        return mapped;
-      }
-    }
-  }
-
-  return unofficial_napi_internal::BuildSyntaxArrowMessage(isolate, context, message);
-}
-
 void ClearPreservedErrorFormatting(ErrorFormattingState* state) {
   if (state == nullptr) return;
   state->preserved_exception.Reset();
@@ -238,11 +188,6 @@ napi_status WrapUtf8String(napi_env env,
 
 namespace unofficial_napi_internal {
 
-std::string GetErrorSourceLineForStderrImpl(napi_env env,
-                                            v8::Local<v8::Message> message) {
-  return ::GetErrorSourceLineForStderrImpl(env, message);
-}
-
 std::string GetThrownAtString(v8::Isolate* isolate,
                               v8::Local<v8::Message> message) {
   return ::GetThrownAtString(isolate, message);
@@ -262,10 +207,10 @@ void PreserveErrorFormatting(napi_env env,
   state.preserved_thrown_at = thrown_at;
 }
 
-std::string BuildSyntaxArrowMessage(v8::Isolate* isolate,
-                                    v8::Local<v8::Context> context,
-                                    v8::Local<v8::Message> message) {
-  if (message.IsEmpty()) return {};
+static std::string BuildSyntaxArrowMessage(v8::Isolate* isolate,
+                                           v8::Local<v8::Context> context,
+                                           v8::Local<v8::Message> message) {
+  if (message.IsEmpty() || message->GetStartPosition() < 0) return {};
 
   std::string filename = "<anonymous_script>";
   v8::Local<v8::Value> script_resource_name = message->GetScriptResourceName();
@@ -310,6 +255,60 @@ std::string BuildSyntaxArrowMessage(v8::Isolate* isolate,
   return arrow + underline + '\n';
 }
 
+ErrorSource GetErrorSource(napi_env env, v8::Local<v8::Message> message) {
+  if (env == nullptr || env->isolate == nullptr || message.IsEmpty() ||
+      message->GetStartPosition() < 0) {
+    return {};
+  }
+
+  v8::Isolate* isolate = env->isolate;
+  v8::HandleScope scope(isolate);
+  v8::Local<v8::Context> context = env->context();
+
+  v8::Local<v8::String> source_line;
+  if (!message->GetSourceLine(context).ToLocal(&source_line)) {
+    return {};
+  }
+  const std::string source_line_utf8 = V8ValueToUtf8(isolate, source_line);
+  if (source_line_utf8.find("node-do-not-add-exception-line") != std::string::npos) {
+    return {source_line_utf8, false};
+  }
+
+  ErrorFormattingState state;
+  {
+    std::lock_guard<std::mutex> lock(g_error_formatting_mu);
+    auto it = g_error_formatting_states.find(env);
+    if (it != g_error_formatting_states.end()) {
+      state.source_maps_enabled = it->second.source_maps_enabled;
+      if (!it->second.get_source_map_error_source.IsEmpty()) {
+        state.get_source_map_error_source.Reset(
+            isolate, it->second.get_source_map_error_source.Get(isolate));
+      }
+    }
+  }
+
+  if (state.source_maps_enabled && !state.get_source_map_error_source.IsEmpty()) {
+    v8::Local<v8::Value> script_resource_name = message->GetScriptResourceName();
+    if (!script_resource_name.IsEmpty() && !script_resource_name->IsUndefined()) {
+      const int line_number = message->GetLineNumber(context).FromMaybe(0);
+      const int column_number = message->GetStartColumn(context).FromMaybe(0);
+      const std::string mapped = CallGetSourceMapErrorSource(
+          isolate,
+          context,
+          state.get_source_map_error_source.Get(isolate),
+          script_resource_name,
+          line_number,
+          column_number);
+      if (napi_v8_terminating(env)) return {};
+      if (!mapped.empty()) {
+        return {mapped, true};
+      }
+    }
+  }
+
+  return {BuildSyntaxArrowMessage(isolate, context, message), true};
+}
+
 void AttachSyntaxArrowMessage(v8::Isolate* isolate,
                               v8::Local<v8::Context> context,
                               v8::Local<v8::Value> exception,
@@ -320,7 +319,8 @@ void AttachSyntaxArrowMessage(v8::Isolate* isolate,
   v8::Local<v8::Private> arrow_key = ApiPrivate(isolate, "node:arrowMessage");
   v8::Local<v8::Private> decorated_key = ApiPrivate(isolate, "node:decorated");
 
-  SetArrowMessage(isolate, context, exception, message);
+  SetArrowMessageFromString(
+      isolate, context, exception, BuildSyntaxArrowMessage(isolate, context, message));
 
   v8::Local<v8::Value> decorated;
   const bool already_decorated =
@@ -372,14 +372,15 @@ void SetArrowMessageFromString(v8::Isolate* isolate,
   (void)err_obj->SetPrivate(context, arrow_key, arrow_v8);
 }
 
-void SetArrowMessage(v8::Isolate* isolate,
-                     v8::Local<v8::Context> context,
-                     v8::Local<v8::Value> exception,
-                     v8::Local<v8::Message> message) {
+void SetModuleErrorArrow(napi_env env,
+                         v8::Local<v8::Context> context,
+                         v8::Local<v8::Value> exception,
+                         v8::Local<v8::Message> message) {
   if (exception.IsEmpty() || !exception->IsObject() || message.IsEmpty()) return;
-
-  SetArrowMessageFromString(
-      isolate, context, exception, BuildSyntaxArrowMessage(isolate, context, message));
+  const ErrorSource source = GetErrorSource(env, message);
+  if (source.attach_arrow) {
+    SetArrowMessageFromString(env->isolate, context, exception, source.text);
+  }
 }
 
 napi_status ConfigureSourceMaps(napi_env env,
@@ -415,12 +416,13 @@ napi_status PreserveErrorSourceMessage(napi_env env, napi_value error) {
   v8::Local<v8::Message> message = v8::Exception::CreateMessage(isolate, raw);
   if (message.IsEmpty()) return napi_generic_failure;
 
-  const std::string source_line = GetErrorSourceLineForStderrImpl(env, message);
-  SetArrowMessageFromString(isolate, context, raw, source_line);
+  const ErrorSource source = GetErrorSource(env, message);
+  NAPI_V8_RETURN_IF_TERMINATING(env);
+  if (source.attach_arrow) SetArrowMessageFromString(isolate, context, raw, source.text);
 
   PreserveErrorFormatting(env,
                           raw,
-                          source_line,
+                          source.text,
                           GetThrownAtString(isolate, message));
   return napi_ok;
 }
@@ -480,8 +482,9 @@ napi_status GetErrorMetadata(napi_env env,
 
     if (mode == unofficial_napi_error_metadata_positions_only) return napi_ok;
 
-    napi_status status = WrapUtf8String(
-        env, GetErrorSourceLineForStderrImpl(env, message), &out->stderr_line);
+    const ErrorSource source = GetErrorSource(env, message);
+    NAPI_V8_RETURN_IF_TERMINATING(env);
+    napi_status status = WrapUtf8String(env, source.text, &out->stderr_line);
     if (status != napi_ok) return status;
   }
 

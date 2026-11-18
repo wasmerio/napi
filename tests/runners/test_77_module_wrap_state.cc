@@ -153,6 +153,13 @@ std::string PromiseOutcome(napi_env env, napi_value promise) {
 #if defined(NAPI_TEST_ENGINE_V8)
 namespace {
 
+void EnableTestSourceMaps(napi_env env) {
+  napi_value callback = nullptr;
+  ASSERT_EQ(napi_run_script(env, Str(env, "(url, line, col) => 'original.ts:' + line + ':' + col + '\\n'"),
+                            &callback), napi_ok);
+  ASSERT_EQ(unofficial_napi_configure_source_maps(env, true, callback), napi_ok);
+}
+
 void ExpectSyntaxError(napi_env env, napi_value error, const char* expected_arrow,
                        const char* stack_prefix) {
   napi_value key = nullptr;
@@ -176,10 +183,19 @@ TEST_F(Test77ModuleWrapState, ModuleParseErrorsKeepTheArrowSeparateFromTheStack)
   options.kind = unofficial_napi_module_source_text;
   ASSERT_EQ(napi_create_object(s.env, &options.wrapper), napi_ok);
   options.url = Str(s.env, "bad.mjs");
-  const char* cases[][2] = {{"/*\nabc", "bad.mjs:1\n/*\n"},
-                            {"export const x =\n", "bad.mjs:2\n\n\n"}};
-  for (const auto& [text, arrow] : cases) {
+  const struct {
+    const char* text;
+    bool mapped;
+    const char* arrow;
+  } cases[] = {
+      {"/*\nabc", false, "bad.mjs:1\n/*\n"},
+      {"export const x =\n", false, "bad.mjs:2\n\n\n"},
+      {"const = 1;", true, "original.ts:1:6\n"},
+      {"const = 1; // node-do-not-add-exception-line", true, "undefined"},
+  };
+  for (const auto& [text, mapped, arrow] : cases) {
     SCOPED_TRACE(text);
+    if (mapped) EnableTestSourceMaps(s.env);
     auto source = unofficial_napi_js_source_from_text(Str(s.env, text));
     options.payload.source_text.source = &source;
     unofficial_napi_module_create_result result{};
@@ -214,6 +230,10 @@ TEST_F(Test77ModuleWrapState, MissingExportHasAnArrowAtTheImport) {
             napi_ok);
   ExpectSyntaxError(s.env, error, "state.mjs:1\n\timport { nope } from './a.mjs';\n\t         ^^^^\n",
                     "SyntaxError:");
+  EnableTestSourceMaps(s.env);
+  ASSERT_EQ(napi_run_script(s.env, Str(s.env, "try { instantiate(); } catch (e) { e }"), &error),
+            napi_ok);
+  ExpectSyntaxError(s.env, error, "original.ts:1:10\n", "SyntaxError:");
   ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, importer), napi_ok);
   ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, dependency), napi_ok);
 }
@@ -232,22 +252,39 @@ TEST_F(Test77ModuleWrapState, DisplayErrorsAddsABlankLineBeforeTheStack) {
 
 TEST_F(Test77ModuleWrapState, UnsettledTopLevelAwaitDiagnosticsMatchNode) {
   EnvScope s(runtime_.get());
-  auto module = CreateSourceTextModule(s.env, "await new Promise(() => {});");
-  ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, module), napi_ok);
-  const std::string source = "state.mjs:1\nawait new Promise(() => {});\n^\n\n\n\n";
-  napi_value result = nullptr;
-  testing::internal::CaptureStderr();
-  auto status = unofficial_napi_module_wrap_evaluate_sync(s.env, module, nullptr, nullptr, &result);
-  EXPECT_EQ(testing::internal::GetCapturedStderr(), "Error: unexpected top-level await at " + source);
-  ASSERT_EQ(status, napi_pending_exception);
-  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &result), napi_ok);
-  bool settled = true;
-  testing::internal::CaptureStderr();
-  status = unofficial_napi_module_wrap_check_unsettled_top_level_await(s.env, module, true, &settled);
-  EXPECT_EQ(testing::internal::GetCapturedStderr(), "Warning: Detected unsettled top-level await at " + source);
-  EXPECT_EQ(status, napi_ok);
-  EXPECT_FALSE(settled);
-  ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
+  const char* code = "await new Promise(() => {});";
+  const char* marked = "await new Promise(() => {}); // node-do-not-add-exception-line";
+  const struct {
+    const char* text;
+    bool mapped;
+    const char* source;
+  } cases[] = {
+      {code, false, "state.mjs:1\nawait new Promise(() => {});\n^\n"},
+      {code, true, "original.ts:1:0\n"},
+      {marked, true, marked},
+  };
+  for (const auto& [text, mapped, source] : cases) {
+    SCOPED_TRACE(source);
+    if (mapped) EnableTestSourceMaps(s.env);
+    auto module = CreateSourceTextModule(s.env, text);
+    ASSERT_EQ(unofficial_napi_module_wrap_instantiate(s.env, module), napi_ok);
+    const std::string diagnostic = std::string(source) + "\n\n\n";
+
+    napi_value result = nullptr;
+    testing::internal::CaptureStderr();
+    auto status = unofficial_napi_module_wrap_evaluate_sync(s.env, module, nullptr, nullptr, &result);
+    EXPECT_EQ(testing::internal::GetCapturedStderr(), "Error: unexpected top-level await at " + diagnostic);
+    ASSERT_EQ(status, napi_pending_exception);
+    ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &result), napi_ok);
+
+    bool settled = true;
+    testing::internal::CaptureStderr();
+    status = unofficial_napi_module_wrap_check_unsettled_top_level_await(s.env, module, true, &settled);
+    EXPECT_EQ(testing::internal::GetCapturedStderr(), "Warning: Detected unsettled top-level await at " + diagnostic);
+    EXPECT_EQ(status, napi_ok);
+    EXPECT_FALSE(settled);
+    ASSERT_EQ(unofficial_napi_module_wrap_destroy(s.env, module), napi_ok);
+  }
 }
 #endif
 
