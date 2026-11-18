@@ -95,8 +95,8 @@ fn guest_heap_alloc_ctx(env: &FunctionEnvMut<NapiEnv>) -> *const std::ffi::c_voi
         .unwrap_or(std::ptr::null())
 }
 
-/// Run a bridge call that may re-enter the guest via host V8 callbacks, then
-/// re-raise any guest instance exit that trapped out of one of those callbacks.
+/// Lend the store to bridge calls that may invoke guest callbacks or use V8's
+/// array-buffer allocator. Re-raise any guest exit trapped in a callback.
 ///
 /// A guest `_exit`/`proc_exit` during a nested callback cannot unwind through the
 /// intervening host V8 (C++) frames, so the callback trampoline stashes it (see
@@ -723,34 +723,34 @@ fn guest_unofficial_napi_request_interrupt(
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_structured_clone(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     value: u32,
     transfer_list: u32,
     result_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let env_handle = snapi_env(&env, napi_env);
-    let value_id = value;
-    let transfer_list_id = transfer_list;
     let mut out = 0u32;
-    let status = unsafe {
-        snapi_bridge_unofficial_structured_clone(env_handle, value_id, transfer_list_id, &mut out)
-    };
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_structured_clone(env_handle, value, transfer_list, &mut out)
+    })?;
     if status == 0 && result_ptr != 0 {
         write_guest_u32(&mut env, result_ptr, out);
     }
-    status
+    Ok(status)
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_message_create(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     value: u32,
     payload_out_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     if payload_out_ptr == 0 {
-        return 1;
+        return Ok(1);
     }
     let env_handle = snapi_env(&env, napi_env);
     // The provider charges the message to the budget before it allocates it;
@@ -764,7 +764,7 @@ fn guest_unofficial_napi_message_create(
     });
     let mut message = 0u32;
     let mut in_range = 0i32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_message_create(
             env_handle,
             value,
@@ -773,9 +773,16 @@ fn guest_unofficial_napi_message_create(
             &mut message,
             &mut in_range,
         )
-    };
+    })
+    .inspect_err(|_| {
+        // A getter can exit the guest even if serialization produced a message.
+        // The queue does not own the handle yet.
+        if message != 0 {
+            unsafe { snapi_bridge_unofficial_message_drop(message) };
+        }
+    })?;
     if status != 0 {
-        return status;
+        return Ok(status);
     }
     let memory = match heap.filter(|_| in_range != 0) {
         None => None,
@@ -791,19 +798,19 @@ fn guest_unofficial_napi_message_create(
                             .as_ptr(),
                     );
                 }
-                return 10; // napi_pending_exception
+                return Ok(10); // napi_pending_exception
             }
         },
     };
     let queued = crate::message::QueuedMessage::in_memory(memory);
     if !env.data().messages.insert(message, queued) {
-        return 9; // the context stopped meanwhile
+        return Ok(9); // the context stopped meanwhile
     }
     if !write_guest_u32(&mut env, payload_out_ptr, message) {
         guest_unofficial_napi_message_drop(env, message);
-        return 1; // napi_invalid_arg
+        return Ok(1); // napi_invalid_arg
     }
-    0
+    Ok(0)
 }
 
 /// The lease a queued message holds on `heap`, this store's guest heap, which
@@ -827,20 +834,21 @@ fn message_memory(
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_message_take(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     payload: u32,
     result_out_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     // Only a message of this context. The entry, which may lease the memory
     // the message points into, outlives the provider call below.
     let Some(queued) = env.data().messages.remove(payload) else {
-        return 1;
+        return Ok(1);
     };
     if result_out_ptr == 0 {
         unsafe { snapi_bridge_unofficial_message_drop(payload) };
-        return 1;
+        return Ok(1);
     }
     let env_handle = snapi_env(&env, napi_env);
     if !queued.readable_by(env.data().guest_heap.as_ref()) {
@@ -854,14 +862,16 @@ fn guest_unofficial_napi_message_take(
                 c"This message's SharedArrayBuffer belongs to another instance's memory.".as_ptr(),
             );
         }
-        return 10; // napi_pending_exception
+        return Ok(10); // napi_pending_exception
     }
     let mut value = 0u32;
-    let status = unsafe { snapi_bridge_unofficial_message_take(env_handle, payload, &mut value) };
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_message_take(env_handle, payload, &mut value)
+    })?;
     if status == 0 {
         write_guest_u32(&mut env, result_out_ptr, value);
     }
-    status
+    Ok(status)
 }
 
 fn guest_unofficial_napi_message_drop(env: FunctionEnvMut<NapiEnv>, payload: u32) {

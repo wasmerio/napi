@@ -38,8 +38,8 @@
 //!
 //! Growing a wasm memory needs the store that owns it. Ordinary import handlers
 //! pass their store explicitly. V8 array-buffer allocation arrives from inside
-//! C++ frames, so only bridge operations that may synchronously invoke guest
-//! code install an invocation guard and lend their store
+//! C++ frames. Bridge calls that may invoke guest code or allocate through V8's
+//! array-buffer allocator must install an invocation guard and lend their store
 //! ([`crate::guest::callback`]). A foreground allocation inside such a guarded
 //! call can recover that store; a background allocator thread has no lent store
 //! and remains arena-only. Growth is always the ordinary `Memory::grow`.
