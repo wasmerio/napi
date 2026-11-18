@@ -14,6 +14,38 @@ use wasmer_napi::NapiCtx;
 mod wat_guest;
 use wat_guest::{Guest, NAPI_INVALID_ARG, NAPI_PENDING_EXCEPTION, compile, compile_shared};
 
+#[test]
+fn taking_a_copied_arraybuffer_grows_the_receivers_memory() {
+    let (engine, module) = compile();
+    let ctx = NapiCtx::default();
+    let (signal_tx, _signal_rx) = mpsc::channel();
+    let mut sender = Guest::new(&ctx, &engine, &module, signal_tx.clone());
+    sender.create();
+    // A fresh receiver's prefunded arena is 16 MiB.
+    assert_eq!(
+        sender.eval(
+            "const bytes = new Uint8Array(32 << 20);
+             bytes[0] = 17;
+             bytes[bytes.length - 1] = 83;
+             bytes.buffer"
+        ),
+        0
+    );
+    assert_eq!(sender.message(), 0);
+
+    let mut receiver = Guest::new(&ctx, &engine, &module, signal_tx);
+    receiver.create();
+    let before = receiver.memory_size();
+    assert_eq!(receiver.take(sender.token()), 0);
+    assert!(receiver.memory_size() > before);
+    assert_eq!(receiver.install(), 0);
+    assert_eq!(receiver.number("shared.byteLength"), 32 << 20);
+    assert_eq!(receiver.number("new Uint8Array(shared)[0]"), 17);
+    assert_eq!(receiver.number("new Uint8Array(shared).at(-1)"), 83);
+    assert_eq!(receiver.release(), 0);
+    assert_eq!(sender.release(), 0);
+}
+
 /// A guest on another memory cannot take it; the refusal consumes it.
 #[test]
 fn a_shared_buffer_in_another_memory_is_refused() {

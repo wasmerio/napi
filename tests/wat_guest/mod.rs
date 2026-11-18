@@ -434,6 +434,10 @@ impl Guest {
         self.call0("create")
     }
 
+    pub fn memory_size(&self) -> u64 {
+        self.memory.view(&self.store).data_size()
+    }
+
     /// The owner scope id that [`Self::release_scope`] takes.
     pub fn scope(&mut self) -> i32 {
         self.call0("scope")
