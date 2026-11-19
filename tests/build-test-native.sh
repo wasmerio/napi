@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Keep in step with PREBUILT_V8_VERSION in build.rs and NAPI_V8_PREBUILT_VERSION
 # in the Makefile: this script links the V8 that build.rs downloaded.
-PREBUILT_V8_VERSION="15.9.111.1"
+PREBUILT_V8_VERSION="15.9.111.2"
 
 if [[ $# -ne 1 ]]; then
   echo "usage: $0 <test-name>" >&2

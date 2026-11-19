@@ -9,8 +9,16 @@ on:
 
 jobs:
   v8-native-linux:
-    name: v8-native-linux
-    runs-on: ubuntu-latest
+    name: v8-native-linux (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     env:
       SCCACHE_GHA_ENABLED: "true"
       CC: clang
