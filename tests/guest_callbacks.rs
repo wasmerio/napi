@@ -1,8 +1,8 @@
 //! JavaScript calling guest functions through real Wasmer dispatch, the
 //! bridge and V8: nested callbacks, scopes a callback leaves open, return
 //! values created in them, argument counts, missing arguments, settling a
-//! deferred, Proxy traps and promise hooks run by an import, and envs created
-//! one after another on one thread.
+//! deferred, Proxy traps and promise hooks run by an import, a call that
+//! cannot reach the guest, and envs created one after another on one thread.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -51,6 +51,7 @@ const WAT: &str = r#"(module
   (import "napi_extension_wasmer_v0" "unofficial_napi_set_promise_reject_callback"
     (func $set_reject_callback (param i32 i32) (result i32)))
   (import "napi" "napi_get_undefined" (func $get_undefined (param i32 i32) (result i32)))
+  (import "napi" "napi_create_error" (func $create_error (param i32 i32 i32 i32) (result i32)))
   (import "napi" "napi_get_prototype" (func $get_prototype (param i32 i32 i32) (result i32)))
   (import "napi" "node_api_set_prototype"
     (func $set_prototype (param i32 i32 i32) (result i32)))
@@ -175,6 +176,13 @@ const WAT: &str = r#"(module
               (local.get $value)))
       (else (call $resolve_deferred (global.get $env) (i32.load (i32.const 440))
               (local.get $value)))))
+
+  ;; Creates an error whose code and message are both "p".
+  (func (export "create_error") (result i32)
+    (if (call $create_string (global.get $env) (i32.const 592) (i32.const 1) (i32.const 448))
+      (then (return (i32.const -1))))
+    (call $create_error (global.get $env) (i32.load (i32.const 448))
+      (i32.load (i32.const 448)) (i32.const 440)))
 
   ;; Makes the global `initHook` the env's promise init hook.
   (func (export "watch_promises") (result i32)
@@ -689,6 +697,34 @@ fn the_promise_init_hook_can_call_guest_functions() {
     assert_eq!(call_import.call(&mut guest.store, 7).unwrap(), 0);
     assert_eq!(guest.eval("traps"), (0, 1, 0));
     assert_eq!(guest.eval("ran"), (0, 1, 0));
+    assert_eq!(guest.release(), 0);
+}
+
+/// A guest function called from JavaScript that an import ran without
+/// lending the store cannot run, and throws instead of returning undefined.
+/// napi_create_error is such an import: it assigns `code`, which runs a
+/// setter on the prototype chain.
+#[test]
+fn a_call_that_cannot_reach_the_guest_throws() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    let create_error: TypedFunction<(), i32> = guest.typed("create_error");
+    assert_eq!(
+        guest.eval(
+            "globalThis.outcome = 0; \
+             Object.defineProperty(Error.prototype, 'code', { configurable: true, set() { \
+             try { outcome = rec(1, () => 40) === undefined ? 1 : 2; } catch (error) { \
+             outcome = /store is not lent/.test(error.message) ? 3 : 4; } } }); 0"
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(create_error.call(&mut guest.store).unwrap(), 0);
+    assert_eq!(
+        guest.eval("delete Error.prototype.code; outcome"),
+        (0, 3, 0)
+    );
+    // The same call from an import that lends the store runs.
+    assert_eq!(guest.eval("rec(1, () => 40)"), (0, 41, 0));
     assert_eq!(guest.release(), 0);
 }
 

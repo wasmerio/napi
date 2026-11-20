@@ -973,8 +973,8 @@ fn guest_unofficial_napi_get_own_non_index_properties(
 //
 // An initializer that is a guest function, or calls one, can only reach the
 // guest from an import that lends the store. A first read from one that does
-// not (napi_coerce_to_string, for one) gets undefined from the guest function,
-// as any getter would, and V8 keeps that as the property's value.
+// not makes the guest function throw, as it would from any getter, and the
+// property stays lazy.
 #[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_define_lazy_data_properties(
     mut env: FunctionEnvMut<NapiEnv>,

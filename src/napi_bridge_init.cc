@@ -3523,6 +3523,12 @@ extern "C" uint32_t snapi_host_invoke_wasm_callback(void* callback_ctx,
                                                     uint32_t wasm_fn_ptr,
                                                     uint32_t callback_arg);
 
+// What the trampoline returns in place of a value id when the guest's store
+// is not lent to the thread, so the guest function did not run
+// (CALLBACK_STORE_NOT_LENT in guest/callback.rs). No value id reaches it:
+// their slot index stays below kValueIdMaxSlots.
+constexpr uint32_t kCallbackStoreNotLent = UINT32_MAX;
+
 void WasmInterruptCallback(napi_env env, void* raw) {
   auto* request = static_cast<WasmInterruptRequest*>(raw);
   if (request == nullptr) return;
@@ -3657,6 +3663,13 @@ static napi_value generic_wasm_callback(napi_env env, napi_callback_info info) {
   }
   if (!result) {
     napi_get_undefined(env, &result);
+  }
+  if (result_id == kCallbackStoreNotLent) {
+    // The guest function did not run. Fail the call instead of returning
+    // undefined as if it had. No error code: setting one is an ordinary
+    // assignment, which could run a setter and call a guest function again.
+    napi_throw_error(env, nullptr,
+                     "Cannot call a native function: the guest's store is not lent to this thread");
   }
   return result;
 }
