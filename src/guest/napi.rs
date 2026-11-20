@@ -1482,7 +1482,7 @@ fn guest_unofficial_napi_contextify_run_script(
 /// Deprecated (use unofficial_napi_compile_function), kept for older
 /// guests. The parsing context names the realm; 0, undefined or null is the
 /// current realm.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
 fn guest_unofficial_napi_contextify_compile_function(
     env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
@@ -1495,14 +1495,14 @@ fn guest_unofficial_napi_contextify_compile_function(
     params_or_undefined: u32,
     host_defined_option_id: u32,
     result_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let realm = match compat::realm_from_context(
         snapi_env(&env, napi_env),
         parsing_context_or_undefined,
         true,
     ) {
         Ok(realm) => realm,
-        Err(status) => return status,
+        Err(status) => return Ok(status),
     };
     guest_unofficial_napi_compile_function(
         env,
@@ -1653,7 +1653,8 @@ fn guest_unofficial_napi_run_script(
     Ok(status)
 }
 
-#[allow(clippy::too_many_arguments)]
+// Reading context extensions and parameters can run their array getters.
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
 fn guest_unofficial_napi_compile_function(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
@@ -1666,13 +1667,13 @@ fn guest_unofficial_napi_compile_function(
     params_or_undefined: u32,
     host_defined_option_id: u32,
     result_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let Some((source_text, source_bytecode)) = abi::read_js_source(&mut env, source) else {
-        return 1;
+        return Ok(1);
     };
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_compile_function(
             env_handle,
             realm,
@@ -1686,37 +1687,39 @@ fn guest_unofficial_napi_compile_function(
             host_defined_option_id,
             &mut result_id,
         )
-    };
+    })?;
     if status == 0 && result_ptr != 0 {
         write_guest_u32(&mut env, result_ptr, result_id);
     }
-    status
+    Ok(status)
 }
 
+// Opening bytecode also reads the parameter array through V8.
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_bytecode_open(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     options_ptr: u32,
     result_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let Some(options) = abi::read_bytecode_open(&mut env, options_ptr) else {
-        return 1;
+        return Ok(1);
     };
     // The whole 6-byte result must lie below 4 GiB (checked before
     // anything is created), so the field offsets below cannot wrap.
     if result_ptr == 0 || u64::from(result_ptr) + 6 > 1u64 << 32 {
-        return 1;
+        return Ok(1);
     }
     let env_handle = snapi_env(&env, napi_env);
     let realm =
         match compat::bytecode_open_realm(env_handle, options.version, options.realm_or_null) {
             Ok(realm) => realm,
-            Err(status) => return status,
+            Err(status) => return Ok(status),
         };
     let mut bytecode_id = 0u32;
     let mut cache_rejected = 0u8;
     let mut can_parse_as_module = 0u8;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_bytecode_open(
             env_handle,
             realm,
@@ -1739,11 +1742,11 @@ fn guest_unofficial_napi_bytecode_open(
             &mut cache_rejected,
             &mut can_parse_as_module,
         )
-    };
+    })?;
     write_guest_u32(&mut env, result_ptr, bytecode_id);
     write_guest_u8(&mut env, result_ptr + 4, cache_rejected);
     write_guest_u8(&mut env, result_ptr + 5, can_parse_as_module);
-    status
+    Ok(status)
 }
 
 #[allow(clippy::result_large_err)]
