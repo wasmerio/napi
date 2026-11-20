@@ -939,30 +939,33 @@ fn guest_unofficial_napi_set_promise_reject_callback(
     unsafe { snapi_bridge_unofficial_set_promise_reject_callback(env_handle, callback_id) }
 }
 
+// Listing a Proxy's keys runs its `ownKeys` trap, so this runs in the callback
+// context.
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_get_own_non_index_properties(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     value: u32,
     filter_bits: u32,
     result_out_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     if value == 0 || result_out_ptr == 0 {
-        return 1;
+        return Ok(1);
     }
     let env_handle = snapi_env(&env, napi_env);
     let mut out = 0u32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_get_own_non_index_properties(
             env_handle,
             value,
             filter_bits,
             &mut out,
         )
-    };
+    })?;
     if status == 0 {
         write_guest_u32(&mut env, result_out_ptr, out);
     }
-    status
+    Ok(status)
 }
 
 // Reading `names` can run its elements' getters (author code if an embedder
@@ -1119,14 +1122,19 @@ fn guest_unofficial_napi_preserve_error_source_message(
     unsafe { snapi_bridge_unofficial_preserve_error_source_message(env_handle, error_id) }
 }
 
+// Marking a rejected promise as handled runs the env's promise-reject
+// callback, which may call guest functions.
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_mark_promise_as_handled(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     promise: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let env_handle = snapi_env(&env, napi_env);
     let promise_id = promise;
-    unsafe { snapi_bridge_unofficial_mark_promise_as_handled(env_handle, promise_id) }
+    with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_mark_promise_as_handled(env_handle, promise_id)
+    })
 }
 
 fn guest_unofficial_napi_get_heap_statistics(
@@ -3004,12 +3012,30 @@ fn guest_napi_get_prototype(mut env: FunctionEnvMut<NapiEnv>, e: u32, o: u32, rp
     s
 }
 
-fn guest_napi_object_freeze(env: FunctionEnvMut<NapiEnv>, e: u32, o: u32) -> i32 {
-    unsafe { snapi_bridge_object_freeze(snapi_env(&env, e), o) }
+// Freezing or sealing a Proxy runs its traps, so both run in the callback
+// context.
+#[allow(clippy::result_large_err)]
+fn guest_napi_object_freeze(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: u32,
+    o: u32,
+) -> Result<i32, WasiError> {
+    let snapi = snapi_env(&env, e);
+    with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_object_freeze(snapi, o)
+    })
 }
 
-fn guest_napi_object_seal(env: FunctionEnvMut<NapiEnv>, e: u32, o: u32) -> i32 {
-    unsafe { snapi_bridge_object_seal(snapi_env(&env, e), o) }
+#[allow(clippy::result_large_err)]
+fn guest_napi_object_seal(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: u32,
+    o: u32,
+) -> Result<i32, WasiError> {
+    let snapi = snapi_env(&env, e);
+    with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_object_seal(snapi, o)
+    })
 }
 
 // --- Comparison ---
@@ -3143,17 +3169,26 @@ fn guest_napi_get_and_clear_last_exception(
 
 // --- Promise ---
 
-fn guest_napi_create_promise(mut env: FunctionEnvMut<NapiEnv>, e: u32, dp: u32, rp: u32) -> i32 {
+// Creating a promise runs the env's promise init hook, if one is set, and
+// that hook may call guest functions.
+#[allow(clippy::result_large_err)]
+fn guest_napi_create_promise(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: u32,
+    dp: u32,
+    rp: u32,
+) -> Result<i32, WasiError> {
     let mut deferred_id: u32 = 0;
     let mut promise_id: u32 = 0;
-    let s = unsafe {
-        snapi_bridge_create_promise(snapi_env(&env, e), &mut deferred_id, &mut promise_id)
-    };
+    let snapi = snapi_env(&env, e);
+    let s = with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_create_promise(snapi, &mut deferred_id, &mut promise_id)
+    })?;
     if s == 0 {
         write_guest_u32(&mut env, dp, deferred_id);
         write_guest_u32(&mut env, rp, promise_id);
     }
-    s
+    Ok(s)
 }
 
 // Resolving reads the value's `then` at once, which can run a getter or a
@@ -3448,17 +3483,21 @@ fn guest_node_api_create_sharedarraybuffer(
     s
 }
 
+// Setting a Proxy's prototype runs its `setPrototypeOf` trap, so this runs in
+// the callback context.
+#[allow(clippy::result_large_err)]
 fn guest_node_api_set_prototype(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     object: u32,
     prototype: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let object_id = object;
     let prototype_id = prototype;
-    unsafe {
-        snapi_bridge_node_api_set_prototype(snapi_env(&env, napi_env), object_id, prototype_id)
-    }
+    let snapi = snapi_env(&env, napi_env);
+    with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_node_api_set_prototype(snapi, object_id, prototype_id)
+    })
 }
 
 // --- TypedArray ---
@@ -4212,17 +4251,20 @@ fn guest_napi_define_class(
     0
 }
 
+// Defining a property on a Proxy runs its `defineProperty` trap, so the
+// definition runs in the callback context.
+#[allow(clippy::result_large_err)]
 fn guest_napi_define_properties(
     mut env: FunctionEnvMut<NapiEnv>,
     e: u32,
     obj: u32,
     prop_count: u32,
     props_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let snapi = snapi_env(&env, e);
     let pc = prop_count;
     if pc == 0 {
-        return unsafe {
+        return Ok(unsafe {
             snapi_bridge_define_properties(
                 snapi,
                 obj,
@@ -4236,18 +4278,18 @@ fn guest_napi_define_properties(
                 std::ptr::null(),
                 std::ptr::null(),
             )
-        };
+        });
     }
 
     let total_bytes = pc as usize * PROP_DESC_SIZE;
     let Some(raw) = read_guest_bytes(&mut env, props_ptr, total_bytes) else {
-        return 1;
+        return Ok(1);
     };
     // The per-property arrays below and every name, however short, stay
     // charged until the bridge call returns.
     let mut names_charge = TransientCharge::default();
     if !names_charge.add(&env.data().budget, pc as usize * PROP_SCRATCH_BYTES) {
-        return 1;
+        return Ok(1);
     }
 
     let mut prop_names_c: Vec<CString> = Vec::with_capacity(pc as usize);
@@ -4302,7 +4344,7 @@ fn guest_napi_define_properties(
         let pname = if utf8name_guest != 0 {
             match try_read_guest_c_string_max(&mut env, utf8name_guest, V8_MAX_STRING_BYTES) {
                 Ok(name) => name.unwrap_or_default(),
-                Err(CopyRefused) => return 9,
+                Err(CopyRefused) => return Ok(9),
             }
         } else {
             HostCopy::default()
@@ -4312,7 +4354,7 @@ fn guest_napi_define_properties(
         if pname.len() < UNCHARGED_HOST_COPY_BYTES
             && !names_charge.add(&env.data().budget, pname.len() + 1)
         {
-            return 1;
+            return Ok(1);
         }
         let c_pname = CString::new(pname).unwrap_or_default();
         prop_name_ids.push(name_id);
@@ -4320,7 +4362,7 @@ fn guest_napi_define_properties(
         if method_ptr != 0 {
             let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
             if reg_id == 0 {
-                return 9; // the bookkeeping budget refused the registration
+                return Ok(9); // the bookkeeping budget refused the registration
             }
             unsafe {
                 snapi_bridge_register_callback(snapi, reg_id, e, method_ptr, data_ptr as u64)
@@ -4333,7 +4375,7 @@ fn guest_napi_define_properties(
         } else if getter_ptr != 0 && setter_ptr != 0 {
             let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
             if reg_id == 0 {
-                return 9; // the bookkeeping budget refused the registration
+                return Ok(9); // the bookkeeping budget refused the registration
             }
             unsafe {
                 snapi_bridge_register_callback_pair(
@@ -4353,7 +4395,7 @@ fn guest_napi_define_properties(
         } else if getter_ptr != 0 {
             let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
             if reg_id == 0 {
-                return 9; // the bookkeeping budget refused the registration
+                return Ok(9); // the bookkeeping budget refused the registration
             }
             unsafe {
                 snapi_bridge_register_callback(snapi, reg_id, e, getter_ptr, data_ptr as u64)
@@ -4366,7 +4408,7 @@ fn guest_napi_define_properties(
         } else if setter_ptr != 0 {
             let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
             if reg_id == 0 {
-                return 9; // the bookkeeping budget refused the registration
+                return Ok(9); // the bookkeeping budget refused the registration
             }
             unsafe {
                 snapi_bridge_register_callback(snapi, reg_id, e, setter_ptr, data_ptr as u64)
@@ -4392,7 +4434,7 @@ fn guest_napi_define_properties(
         prop_names_ptrs.push(cn.as_ptr());
     }
 
-    unsafe {
+    with_cb_context(&mut env, e, || unsafe {
         snapi_bridge_define_properties(
             snapi,
             obj,
@@ -4406,7 +4448,7 @@ fn guest_napi_define_properties(
             prop_setter_reg_ids.as_ptr(),
             prop_attributes.as_ptr(),
         )
-    }
+    })
 }
 
 // --- Script execution ---
