@@ -1572,14 +1572,30 @@ struct BytecodeRecord {
   // Host-defined-option symbol baked into the artifact's origin; consumers
   // with a different symbol re-consume `bytes` instead of reusing it.
   v8::Global<v8::Symbol> host_symbol;
+
+  // The handle owns one reference. Retain another when using the bytecode
+  // as source because a JavaScript getter can release the handle mid-call.
+  size_t ref_count = 1;
+
+  void Release() {
+    if (--ref_count == 0) delete this;
+  }
 };
 
-BytecodeRecord* BytecodeRecordFromSource(const unofficial_napi_js_source* source) {
+struct ReleaseBytecodeRecord {
+  void operator()(BytecodeRecord* record) const { record->Release(); }
+};
+
+using BytecodeRecordRef = std::unique_ptr<BytecodeRecord, ReleaseBytecodeRecord>;
+
+BytecodeRecordRef RetainBytecodeRecordFromSource(const unofficial_napi_js_source* source) {
   if (source == nullptr || source->kind != unofficial_napi_js_source_bytecode ||
       source->text != nullptr || source->bytecode == nullptr) {
-    return nullptr;
+    return {};
   }
-  return reinterpret_cast<BytecodeRecord*>(source->bytecode);
+  auto* record = reinterpret_cast<BytecodeRecord*>(source->bytecode);
+  ++record->ref_count;
+  return BytecodeRecordRef(record);
 }
 
 // The UTF-8 of `value`, charged to `charge` (if any) before it is copied out
@@ -2267,7 +2283,7 @@ napi_status NAPI_CDECL unofficial_napi_bytecode_serialize(
 napi_status NAPI_CDECL unofficial_napi_bytecode_release(
     napi_env env, unofficial_napi_bytecode bytecode) {
   if (env == nullptr || bytecode == nullptr) return napi_invalid_arg;
-  delete reinterpret_cast<BytecodeRecord*>(bytecode);
+  reinterpret_cast<BytecodeRecord*>(bytecode)->Release();
   return napi_ok;
 }
 
@@ -2301,7 +2317,7 @@ napi_status NAPI_CDECL unofficial_napi_run_script(
   v8::MicrotaskQueue* target_queue =
       realm_or_null != nullptr ? realm_or_null->own_microtask_queue.Get() : nullptr;
 
-  BytecodeRecord* bytecode_record = BytecodeRecordFromSource(source);
+  auto bytecode_record = RetainBytecodeRecordFromSource(source);
   if (bytecode_record != nullptr &&
       bytecode_record->shape != unofficial_napi_bytecode_shape_script) {
     return napi_invalid_arg;
@@ -2457,7 +2473,7 @@ napi_status NAPI_CDECL unofficial_napi_compile_function(
   v8::Local<v8::Context> parsing_context = RealmContext(env, realm_or_null);
   if (parsing_context.IsEmpty()) return napi_invalid_arg;
 
-  BytecodeRecord* bytecode_record = BytecodeRecordFromSource(source);
+  auto bytecode_record = RetainBytecodeRecordFromSource(source);
   if (bytecode_record != nullptr &&
       bytecode_record->shape != unofficial_napi_bytecode_shape_cjs_function) {
     return napi_invalid_arg;
@@ -2693,7 +2709,7 @@ static napi_status CreateSourceTextModule(
   if (context.IsEmpty()) return napi_invalid_arg;
   v8::Context::Scope context_scope(context);
 
-  BytecodeRecord* bytecode_record = BytecodeRecordFromSource(source);
+  auto bytecode_record = RetainBytecodeRecordFromSource(source);
   if (bytecode_record != nullptr &&
       bytecode_record->shape != unofficial_napi_bytecode_shape_module) {
     return napi_invalid_arg;

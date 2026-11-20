@@ -95,7 +95,7 @@ jobs:
       - name: Test the library and the WAT guests
         run: >-
           ./cargo-standalone.sh test --locked --lib
-          --test guest_callbacks --test guest_c_strings
+          --test guest_callbacks --test guest_cache_callbacks --test guest_c_strings
           --test guest_memory --test guest_memory_pressure
           --test guest_lazy_properties --test message_memory
 

@@ -1,8 +1,6 @@
-//! Cache serialization makes a plain Uint8Array and runs no JS, so it never
-//! reaches the guest: not through a global Buffer, its getter or Buffer.from
-//! (wasmerio/napi#146). Both imports keep their callback context all the same.
-//! Exercise them through real Wasmer dispatch with a guest-native Buffer
-//! getter installed that would throw or exit the guest if it ran.
+//! Exercise cache imports through real Wasmer dispatch. Serialization must
+//! leave the guest-native Buffer getter alone. Opening and compiling bytecode
+//! can call guest functions through getters on the parameter array.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -25,6 +23,10 @@ const WAT: &str = r#"(module
     (func $release_env (param i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_bytecode_open"
     (func $bytecode_open (param i32 i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_bytecode_release"
+    (func $bytecode_release (param i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_compile_function"
+    (func $compile (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_bytecode_serialize"
     (func $serialize (param i32 i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_module_wrap_create"
@@ -50,6 +52,7 @@ const WAT: &str = r#"(module
   (table (export "__indirect_function_table") 2 funcref)
   (global $env (mut i32) (i32.const 0))
   (global $bytecode (mut i32) (i32.const 0))
+  (global $function_bytecode (mut i32) (i32.const 0))
   (global $module (mut i32) (i32.const 0))
   (global $mode (mut i32) (i32.const 0))
   (global $calls (mut i32) (i32.const 0))
@@ -59,6 +62,7 @@ const WAT: &str = r#"(module
   (data (i32.const 352) "export const value = 42;")
   (data (i32.const 384) "cache.js")
   (data (i32.const 400) "cache.mjs")
+  (data (i32.const 416) "return x;")
 
   (func $string (param $ptr i32) (param $len i32) (result i32)
     (if (call $create_string (global.get $env) (local.get $ptr) (local.get $len) (i32.const 28))
@@ -100,6 +104,26 @@ const WAT: &str = r#"(module
       (then unreachable))
     (global.set $module (i32.load (i32.const 304))))
 
+  ;; Use the last script result as the function's parameter array.
+  (func (export "open_function_bytecode") (result i32)
+    (local $status i32)
+    (i32.store (i32.const 136) (call $string (i32.const 416) (i32.const 9)))
+    (i32.store (i32.const 144) (i32.const 1)) ;; function bytecode shape
+    (i32.store (i32.const 148) (i32.load (i32.const 32)))
+    (local.set $status (call $bytecode_open (global.get $env) (i32.const 128) (i32.const 192)))
+    (global.set $function_bytecode (i32.load (i32.const 192)))
+    (local.get $status))
+
+  ;; The parameter getter releases the bytecode while compiling it.
+  (func (export "compile_from_bytecode") (result i32)
+    (global.set $mode (i32.const 3))
+    (i32.store (i32.const 16) (i32.const 1)) ;; bytecode source
+    (i32.store (i32.const 20) (i32.const 0))
+    (i32.store (i32.const 24) (global.get $function_bytecode))
+    (call $compile (global.get $env) (i32.const 0) (i32.const 16)
+      (i32.load (i32.const 140)) (i32.const 0) (i32.const 0)
+      (i32.const 0) (i32.load (i32.const 32)) (i32.const 0) (i32.const 208)))
+
   (func (export "bytecode_cache") (param $mode i32) (result i32)
     (global.set $mode (local.get $mode))
     (i32.store (i32.const 208) (i32.const 4660))
@@ -121,6 +145,10 @@ const WAT: &str = r#"(module
       (then
         (drop (call $throw (local.get $env) (i32.const 0) (i32.const 112)))
         (return (i32.const 0))))
+    (if (i32.eq (global.get $mode) (i32.const 3))
+      (then
+        (if (call $bytecode_release (local.get $env) (global.get $function_bytecode))
+          (then unreachable))))
     (i32.store (i32.const 200) (i32.const 1))
     (if (call $get_cb_info (local.get $env) (local.get $info) (i32.const 200)
           (i32.const 204) (i32.const 0) (i32.const 0)) (then unreachable))
@@ -170,18 +198,11 @@ impl Guest {
             .typed::<(), ()>("create")
             .call(&mut guest.store)
             .unwrap();
-        let source = "Object.defineProperty(globalThis, 'Buffer', \
-                      { get: from, configurable: true });";
-        guest
-            .memory
-            .view(&guest.store)
-            .write(u64::from(SOURCE_PTR), source.as_bytes())
-            .unwrap();
         assert_eq!(
-            guest
-                .typed::<(i32, i32), i32>("eval")
-                .call(&mut guest.store, SOURCE_PTR as i32, source.len() as i32)
-                .unwrap(),
+            guest.eval(
+                "Object.defineProperty(globalThis, 'Buffer', \
+                        { get: from, configurable: true });"
+            ),
             0
         );
         guest
@@ -205,6 +226,16 @@ impl Guest {
         self.typed::<(), i32>(name).call(&mut self.store).unwrap()
     }
 
+    fn eval(&mut self, source: &str) -> i32 {
+        self.memory
+            .view(&self.store)
+            .write(u64::from(SOURCE_PTR), source.as_bytes())
+            .unwrap();
+        self.typed::<(i32, i32), i32>("eval")
+            .call(&mut self.store, SOURCE_PTR as i32, source.len() as i32)
+            .unwrap()
+    }
+
     fn cache(&mut self, name: &str, mode: i32) -> Result<i32, RuntimeError> {
         self.typed::<i32, i32>(name).call(&mut self.store, mode)
     }
@@ -225,11 +256,30 @@ fn cache_imports_never_run_guest_code() {
     // Mode 0 returns from the getter, 1 throws from it, 2 exits the guest.
     for mode in 0..3 {
         for export in EXPORTS {
-            assert_eq!(guest.cache(export, mode).unwrap(), 0, "{export} mode {mode}");
+            assert_eq!(
+                guest.cache(export, mode).unwrap(),
+                0,
+                "{export} mode {mode}"
+            );
             assert_ne!(guest.output(), 0, "{export} mode {mode}");
             assert_ne!(guest.output(), UNWRITTEN, "{export} mode {mode}");
         }
     }
     assert_eq!(guest.call0("calls"), 0);
+    assert_eq!(guest.call0("release"), 0);
+}
+
+#[test]
+fn bytecode_parameter_getters_can_call_guest_functions() {
+    let mut guest = Guest::new();
+    assert_eq!(
+        guest.eval("Object.defineProperty(['x'], 0, { get: () => from('x') })"),
+        0
+    );
+    assert_eq!(guest.call0("open_function_bytecode"), 0);
+    assert_eq!(guest.call0("calls"), 1);
+    assert_eq!(guest.call0("compile_from_bytecode"), 0);
+    assert_eq!(guest.call0("calls"), 2);
+    assert_ne!(guest.output(), 0);
     assert_eq!(guest.call0("release"), 0);
 }
