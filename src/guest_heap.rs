@@ -69,7 +69,7 @@ use std::sync::{
 
 use offset_allocator::{Allocation, Allocator as OffsetAllocator};
 use wasmer::sys::NativeEngineExt;
-use wasmer::{AsStoreRef, Memory, MemoryStyle, Pages, StoreMut};
+use wasmer::{AsStoreRef, Memory, MemoryStyle, Pages, Store, StoreMut};
 
 use crate::budget::{Pool, ResourceBudget};
 
@@ -497,7 +497,7 @@ impl GuestHeap {
 
     /// Top the arena up when free space is low or an allocation recently came
     /// up short. Called from import boundaries, where the store is in hand
-    /// without any lending, so the arena stays ahead of allocations that
+    /// without any parking, so the arena stays ahead of allocations that
     /// arrive without a store.
     pub(crate) fn maybe_refill(&self, store: &mut StoreMut<'_>) {
         let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
@@ -741,10 +741,8 @@ pub extern "C" fn napi_host_guest_heap_alloc(
     let Some(heap) = ctx.heap.upgrade() else {
         return std::ptr::null_mut();
     };
-    let offset = crate::guest::callback::with_lent_store(|store| {
-        heap.alloc_with_store(store, length, zero != 0)
-    })
-    .unwrap_or_else(|| heap.alloc(length, zero != 0));
+    let offset = Store::with_current(|store| heap.alloc_with_store(store, length, zero != 0))
+        .unwrap_or_else(|| heap.alloc(length, zero != 0));
     match offset {
         Some(offset) => heap.offset_to_host(offset).cast(),
         None => std::ptr::null_mut(),

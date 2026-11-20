@@ -1673,9 +1673,8 @@ fn guest_unofficial_napi_compile_function(
     let Some((source_text, source_bytecode)) = abi::read_js_source(&mut env, source) else {
         return Ok(1);
     };
-    let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
-    let status = with_cb_context(&mut env, napi_env, || unsafe {
+    let status = bridge(&mut env, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_compile_function(
             env_handle,
             realm,
@@ -1721,7 +1720,7 @@ fn guest_unofficial_napi_bytecode_open(
     let mut bytecode_id = 0u32;
     let mut cache_rejected = 0u8;
     let mut can_parse_as_module = 0u8;
-    let status = with_cb_context(&mut env, napi_env, || unsafe {
+    let status = bridge(&mut env, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_bytecode_open(
             env_handle,
             realm,

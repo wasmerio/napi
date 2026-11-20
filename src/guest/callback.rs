@@ -7,117 +7,23 @@ use wasmer_wasix::wasmer_wasix_types::wasi::ExitCode;
 use super::callback_cache::CachedGuestCallback;
 use crate::{NapiEnv, snapi::SnapiEnv};
 
-/// What the imports running on a thread lend to the callbacks their bridge
-/// calls run, and what those callbacks hand back. One thread-local holds
-/// both, so that an import reaches them with a single lookup.
-struct Lent {
-    /// The innermost import on this thread whose bridge call is running, as
-    /// a pointer to its own `FunctionEnvMut`: the store it lends. Null while
-    /// no import is lending, and while a callback holds the store.
-    ///
-    /// The import holds `&mut` to that `FunctionEnvMut` for as long as the
-    /// pointer is here (see [`lend_store`]), so nothing else can reach it,
-    /// and a callback that takes the pointer reborrows from that `&mut`.
-    /// This is what `StoreMut::parked` and `Store::with_current` do through
-    /// Wasmer's own thread-local stack, at a fraction of the cost: one
-    /// pointer written and one restored.
-    env: Cell<*mut FunctionEnvMut<'static, NapiEnv>>,
-    /// A guest instance exit (`WasiError::Exit`) that trapped out of a guest
-    /// callback and must be re-raised through the N-API import layers.
-    ///
-    /// When the guest calls `_exit`/`proc_exit` — e.g. Node's fatal-exception
-    /// path taking `std::_Exit` on the main thread after an unhandled exception
-    /// — WASI `proc_exit` unwinds the guest and the [`func.call`] that dispatched
-    /// the callback returns a trap carrying [`WasiError::Exit`]. The trampoline
-    /// runs inside host V8 (a native C++ frame that cannot carry a Rust trap), so
-    /// it cannot re-raise directly. Instead it stashes the exit here; the nearest
-    /// enclosing N-API import boundary ([`lend_store`]) takes it back out and
-    /// the import returns it as an `Err`, so wasmer re-raises the same exit
-    /// through every guest→host layer until the runner
-    /// (`bin_factory`/`thread_spawn`) handles it — the standard WASIX
-    /// process-exit propagation. Swallowing it (the old behavior) left the host
-    /// event loop spinning forever (observed as `test-tls-handshake-exception`
-    /// hanging).
-    ///
-    /// This terminates only the guest instance whose callback exited, never the
-    /// host process.
-    ///
-    /// [`func.call`]: wasmer::Function::call
-    exit: Cell<Option<ExitCode>>,
-}
-
 thread_local! {
-    static LENT: Lent = const {
-        Lent {
-            env: Cell::new(std::ptr::null_mut()),
-            exit: Cell::new(None),
-        }
-    };
+    /// A guest instance exit that trapped out of a callback. The trampoline
+    /// cannot propagate a WASI trap through V8's native frames. The enclosing
+    /// N-API import retrieves the exit and returns it to Wasmer.
+    static PENDING_GUEST_EXIT: Cell<Option<ExitCode>> = const { Cell::new(None) };
 }
 
-/// Puts a lent pointer back when the code that replaced it is done, on
-/// return and on unwind.
-struct RestoreLent<'a> {
-    lent: &'a Lent,
-    env: *mut FunctionEnvMut<'static, NapiEnv>,
-}
-
-impl Drop for RestoreLent<'_> {
-    fn drop(&mut self) {
-        self.lent.env.set(self.env);
-    }
-}
-
-/// Lends `env`'s store for the duration of `f`, so that host V8 callbacks
-/// fired inside a bridge call can be dispatched into the wasm guest (see
-/// [`snapi_host_invoke_wasm_callback`]) and V8's array-buffer allocator can
-/// grow guest memory (see `napi_host_guest_heap_alloc`).
-///
-/// Returns what `f` returned, and a guest exit that a callback stashed while
-/// it ran. The caller must re-raise that exit.
-///
-/// `f` cannot use `env`: the `&mut` this function holds keeps it out of
-/// reach until `f` returns, which is what makes handing it to a callback
-/// sound rather than aliasing.
+/// Lends the store across the bridge call so V8 callbacks and the guest-heap
+/// allocator can recover it with [`Store::with_current`]. Wasmer coordinates
+/// nested parks and decides whether the active store can be borrowed.
+/// Returns any guest exit the bridge call must propagate.
 pub(crate) fn lend_store<R>(
     env: &mut FunctionEnvMut<NapiEnv>,
     f: impl FnOnce() -> R,
 ) -> (R, Option<ExitCode>) {
-    LENT.with(|lent| {
-        let env = (env as *mut FunctionEnvMut<'_, NapiEnv>).cast();
-        // Lends nest: a callback's guest code calls imports that lend in turn.
-        let _restore = RestoreLent {
-            lent,
-            env: lent.env.replace(env),
-        };
-        let result = f();
-        (result, lent.exit.take())
-    })
-}
-
-/// Runs `f` with the store lent to this thread, if one is: the store of the
-/// innermost import inside [`lend_store`], else a store that Wasmer says is
-/// parked (`StoreMut::parked`). `None` when neither is.
-///
-/// The store is not necessarily the caller's: several can share a thread,
-/// so check its id before using a handle with it.
-pub(crate) fn with_lent_store<R>(f: impl FnOnce(&mut StoreMut<'_>) -> R) -> Option<R> {
-    LENT.with(|lent| {
-        let env = lent.env.replace(std::ptr::null_mut());
-        if env.is_null() {
-            return Store::with_current(f);
-        }
-        // `f` holds the store until it returns: it is not lent again, unless
-        // by an import that guest code `f` runs calls.
-        let _restore = RestoreLent { lent, env };
-        // SAFETY: the import that stored `env` holds `&mut` to this
-        // `FunctionEnvMut` and cannot touch it until its bridge call, which
-        // this code runs inside, returns. Taking the pointer out above keeps
-        // a second borrow from being made while this one lives.
-        let env = unsafe { &mut *env };
-        let mut store = env.as_store_mut();
-        Some(f(&mut store))
-    })
+    let result = env.as_store_mut().parked(f);
+    (result, take_pending_guest_exit())
 }
 
 /// If a guest callback trapped with a WASI process exit, stash the exit code so
@@ -125,7 +31,7 @@ pub(crate) fn with_lent_store<R>(f: impl FnOnce(&mut StoreMut<'_>) -> R) -> Opti
 /// Non-exit traps return `false` and are left for the caller to log.
 fn stash_guest_exit(err: &wasmer::RuntimeError) -> bool {
     if let Some(WasiError::Exit(code)) = err.downcast_ref::<WasiError>() {
-        LENT.with(|lent| lent.exit.set(Some(*code)));
+        PENDING_GUEST_EXIT.with(|exit| exit.set(Some(*code)));
         return true;
     }
     false
@@ -135,7 +41,7 @@ fn stash_guest_exit(err: &wasmer::RuntimeError) -> bool {
 /// any. For an import boundary that did not lend its store; [`lend_store`]
 /// hands the exit to one that did.
 pub(crate) fn take_pending_guest_exit() -> Option<ExitCode> {
-    LENT.with(|lent| lent.exit.take())
+    PENDING_GUEST_EXIT.with(Cell::take)
 }
 
 /// What [`snapi_host_invoke_wasm_callback`] returns in place of a value id
@@ -167,7 +73,7 @@ pub(crate) struct CallbackInvocationCtx {
 impl CallbackInvocationCtx {
     /// The lent store, if it is the one this context's env lives in.
     fn with_store<R>(&self, f: impl FnOnce(&mut StoreMut<'_>) -> R) -> Option<R> {
-        with_lent_store(|store| {
+        Store::with_current(|store| {
             (store.objects_mut().id().as_raw().get() == self.store_id).then(|| f(store))
         })
         .flatten()
@@ -395,7 +301,7 @@ mod tests {
 
     /// Whether a store is lent to this thread, as a callback would find out.
     fn lent() -> bool {
-        with_lent_store(|_| ()).is_some()
+        Store::with_current(|_| ()).is_some()
     }
 
     /// Calls `import` as Wasm would call an N-API import and returns what it
@@ -418,7 +324,7 @@ mod tests {
                 let mut held = i32::from(!lent());
                 let ((), exit) = lend_store(&mut env, || {
                     for _ in 0..2 {
-                        let callback = with_lent_store(|store| {
+                        let callback = Store::with_current(|store| {
                             // A callback gets the import's store, and holds
                             // it: nothing lends it a second time.
                             (store_id(store) == id, !lent())
@@ -456,8 +362,9 @@ mod tests {
                 let id = store_id(&mut env.as_store_mut());
                 // The callback that called this import holds the store.
                 let held = !lent();
-                let (found, _) =
-                    lend_store(&mut env, || with_lent_store(|store| store_id(store) == id));
+                let (found, _) = lend_store(&mut env, || {
+                    Store::with_current(|store| store_id(store) == id)
+                });
                 i32::from(held) << 1 | i32::from(found == Some(true))
             },
         );
@@ -467,7 +374,7 @@ mod tests {
             &env,
             |mut env: FunctionEnvMut<NapiEnv>| -> i32 {
                 let (nested, _) = lend_store(&mut env, || {
-                    let nested = with_lent_store(|store| {
+                    let nested = Store::with_current(|store| {
                         let inner = INNER_IMPORT.with(|slot| slot.borrow().clone().unwrap());
                         let nested = inner.call(store, &[]).unwrap()[0].unwrap_i32();
                         // The inner import's lend ended with it: this
@@ -482,6 +389,91 @@ mod tests {
         );
         assert_eq!(call_import(&mut store, &outer), 0b11_1_1);
         INNER_IMPORT.with(|slot| slot.borrow_mut().take());
+    }
+
+    #[test]
+    fn lending_respects_async_store_borrow_tracking() {
+        use std::{
+            future::Future,
+            pin::pin,
+            task::{Context, Poll, Waker},
+        };
+
+        let mut store = Store::default();
+        let env = FunctionEnv::new(&mut store, napi_env());
+        let import = Function::new_typed_with_env(
+            &mut store,
+            &env,
+            |mut env: FunctionEnvMut<NapiEnv>| -> (i32, i32) {
+                let ctx = CallbackInvocationCtx {
+                    func_env: env.as_ref(),
+                    store_id: store_id(&mut env.as_store_mut()),
+                };
+                // Check whether dispatch can enter the store without actually
+                // re-entering Wasm or suspending while its borrow is live.
+                let wasmer_can_lend = env
+                    .as_store_mut()
+                    .parked(|| Store::with_current(|_| ()).is_some());
+                let (napi_can_lend, _) = lend_store(&mut env, || ctx.with_store(|_| ()).is_some());
+                (i32::from(wasmer_can_lend), i32::from(napi_can_lend))
+            },
+        );
+
+        let store = store.into_async();
+        let mut call = pin!(import.call_async(&store, Vec::new()));
+        let Poll::Ready(result) = call.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("the import suspended while checking whether its store was lent");
+        };
+        let results = result.expect("the import trapped");
+        assert_eq!(
+            results[1].unwrap_i32(),
+            results[0].unwrap_i32(),
+            "N-API callback dispatch must respect whether Wasmer can lend the async store"
+        );
+    }
+
+    #[test]
+    fn lending_respects_inner_wasmer_park() {
+        let mut store = Store::default();
+        let env = FunctionEnv::new(&mut store, napi_env());
+        let import = Function::new_typed_with_env(
+            &mut store,
+            &env,
+            |mut env: FunctionEnvMut<NapiEnv>| -> (i32, i32, i32, i32) {
+                let outer = CallbackInvocationCtx {
+                    func_env: env.as_ref(),
+                    store_id: store_id(&mut env.as_store_mut()),
+                };
+                let mut inner_store = Store::default();
+                let inner = CallbackInvocationCtx {
+                    func_env: FunctionEnv::new(&mut inner_store, napi_env()),
+                    store_id: store_id(&mut inner_store.as_store_mut()),
+                };
+
+                let (observed, _) = lend_store(&mut env, || {
+                    let before = outer.with_store(|_| 1).unwrap_or(0);
+                    let (inner_parked, outer_parked) = inner_store.as_store_mut().parked(|| {
+                        (
+                            inner.with_store(|_| 1).unwrap_or(0),
+                            outer.with_store(|_| 1).unwrap_or(0),
+                        )
+                    });
+                    let after = outer.with_store(|_| 1).unwrap_or(0);
+                    (before, inner_parked, outer_parked, after)
+                });
+                observed
+            },
+        )
+        .typed::<(), (i32, i32, i32, i32)>(&store)
+        .expect("the import has the expected signature");
+
+        let (before, inner_parked, outer_parked, after) =
+            import.call(&mut store).expect("the import trapped");
+        assert_eq!(before, 1, "the outer store is lent before the inner park");
+        assert_eq!(inner_parked, 1, "the inner store is lent during its park");
+        assert_eq!(outer_parked, 0, "the inner park hides the outer store");
+        assert_eq!(after, 1, "the outer store is lent again after the park");
     }
 
     #[test]
