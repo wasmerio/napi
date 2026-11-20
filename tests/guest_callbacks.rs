@@ -683,7 +683,11 @@ fn a_deferred_being_settled_cannot_be_settled_again() {
         (0, 0, 0)
     );
     for round in 0..200 {
-        assert_eq!(settle.call(&mut guest.store, 0).unwrap(), 0, "round {round}");
+        assert_eq!(
+            settle.call(&mut guest.store, 0).unwrap(),
+            0,
+            "round {round}"
+        );
     }
     assert_eq!(guest.eval("nested"), (0, 101, 0));
 
@@ -696,7 +700,11 @@ fn a_deferred_being_settled_cannot_be_settled_again() {
     );
     assert_eq!(watch.call(&mut guest.store).unwrap(), 0);
     for round in 0..200 {
-        assert_eq!(settle.call(&mut guest.store, 1).unwrap(), 0, "round {round}");
+        assert_eq!(
+            settle.call(&mut guest.store, 1).unwrap(),
+            0,
+            "round {round}"
+        );
     }
     assert_eq!(guest.eval("nested"), (0, 101, 0));
     assert_eq!(guest.release(), 0);
@@ -731,8 +739,16 @@ fn the_source_map_callback_can_call_guest_functions() {
         (1, "unofficial_napi_get_error_metadata"),
     ] {
         assert_eq!(guest.eval("calls = mapped = 0"), (0, 0, 0), "{name}");
-        assert_eq!(format_error.call(&mut guest.store, which).unwrap(), 0, "{name}");
-        assert_eq!(guest.eval("calls"), (0, 1, 0), "{name} did not run the callback");
+        assert_eq!(
+            format_error.call(&mut guest.store, which).unwrap(),
+            0,
+            "{name}"
+        );
+        assert_eq!(
+            guest.eval("calls"),
+            (0, 1, 0),
+            "{name} did not run the callback"
+        );
         assert_eq!(guest.eval("mapped"), (0, 41, 0), "{name}");
     }
 
