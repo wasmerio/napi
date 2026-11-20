@@ -52,10 +52,14 @@ pub(crate) fn take_pending_guest_exit() -> Option<ExitCode> {
 
 /// What [`snapi_host_invoke_wasm_callback`] returns in place of a value id
 /// when the guest's store is not lent to the thread, so the guest function
-/// did not run. The bridge turns it into a JavaScript error. Value ids never
-/// reach this value: `kCallbackStoreNotLent` in `napi_bridge_init.cc` is the
-/// same constant.
-pub(crate) const CALLBACK_STORE_NOT_LENT: u32 = u32::MAX;
+/// did not run. The bridge turns it into a JavaScript error.
+///
+/// No value id has this value: an id holds its slot index plus one in the
+/// upper 20 bits, which is never zero, and here those bits are zero.
+/// `kCallbackStoreNotLent` in `napi_bridge_init.cc` is the same constant and
+/// checks that against the id layout. A guest that returns this number
+/// itself is handled in [`snapi_host_invoke_wasm_callback`].
+pub(crate) const CALLBACK_STORE_NOT_LENT: u32 = 1;
 
 /// What a V8 callback needs to reach the guest: a handle to the guest
 /// instance's N-API env and the id of its store. Neither changes for the
@@ -251,6 +255,10 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
     });
 
     match dispatched {
+        // A guest function that returns the sentinel's number returned no
+        // valid value id; report that as the null id, so the bridge does not
+        // take it for a call that never ran.
+        Some(CALLBACK_STORE_NOT_LENT) => 0,
         Some(result) => result,
         None => {
             // No import of this guest lent its store to the code that entered

@@ -1051,17 +1051,20 @@ fn guest_unofficial_napi_get_hash_seed(
     status
 }
 
+// Formatting an error's source line calls the env's source-map callback, if
+// one is configured, and that callback may call guest functions.
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_get_error_metadata(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     error: u32,
     mode: i32,
     metadata_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     // The whole 28-byte metadata struct must lie below 4 GiB, so the field
     // offsets below cannot wrap.
     if metadata_ptr != 0 && u64::from(metadata_ptr) + 28 > 1u64 << 32 {
-        return 1;
+        return Ok(1);
     }
     let env_handle = snapi_env(&env, napi_env);
     let error_id = error;
@@ -1072,7 +1075,7 @@ fn guest_unofficial_napi_get_error_metadata(
     let mut line_number = 0i32;
     let mut start_column = 0i32;
     let mut end_column = 0i32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_get_error_metadata(
             env_handle,
             error_id,
@@ -1085,9 +1088,9 @@ fn guest_unofficial_napi_get_error_metadata(
             &mut start_column,
             &mut end_column,
         )
-    };
+    })?;
     if status != 0 {
-        return status;
+        return Ok(status);
     }
     if metadata_ptr != 0 {
         write_guest_u32(&mut env, metadata_ptr, source_line_id);
@@ -1098,7 +1101,7 @@ fn guest_unofficial_napi_get_error_metadata(
         write_guest_i32(&mut env, metadata_ptr + 20, start_column);
         write_guest_i32(&mut env, metadata_ptr + 24, end_column);
     }
-    0
+    Ok(0)
 }
 
 fn guest_unofficial_napi_configure_source_maps(
@@ -1112,14 +1115,17 @@ fn guest_unofficial_napi_configure_source_maps(
     unsafe { snapi_bridge_unofficial_configure_source_maps(env_handle, enabled, callback_id) }
 }
 
+// Runs the source-map callback, as unofficial_napi_get_error_metadata does.
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_preserve_error_source_message(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     error: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let env_handle = snapi_env(&env, napi_env);
-    let error_id = error;
-    unsafe { snapi_bridge_unofficial_preserve_error_source_message(env_handle, error_id) }
+    with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_preserve_error_source_message(env_handle, error)
+    })
 }
 
 // Marking a rejected promise as handled runs the env's promise-reject
@@ -1768,19 +1774,22 @@ fn guest_unofficial_napi_bytecode_release(
     unsafe { snapi_bridge_unofficial_bytecode_release(env_handle, bytecode) }
 }
 
+// A module that fails to compile gets its source line formatted, which runs
+// the source-map callback (see unofficial_napi_get_error_metadata).
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_module_wrap_create(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     options_ptr: u32,
     result_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let Some(options) = abi::read_module_create(&mut env, options_ptr) else {
-        return 1;
+        return Ok(1);
     };
     // The whole 9-byte result must lie below 4 GiB (checked before
     // anything is created), so the field offsets below cannot wrap.
     if result_ptr == 0 || u64::from(result_ptr) + 9 > 1u64 << 32 {
-        return 1;
+        return Ok(1);
     }
     let env_handle = snapi_env(&env, napi_env);
     let realm = match compat::module_create_realm(
@@ -1790,12 +1799,12 @@ fn guest_unofficial_napi_module_wrap_create(
         options.realm_or_null,
     ) {
         Ok(realm) => realm,
-        Err(status) => return status,
+        Err(status) => return Ok(status),
     };
     let mut handle_id = 0u32;
     let mut requests_id = 0u32;
     let mut has_top_level_await = 0u8;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_module_wrap_create(
             env_handle,
             options.kind,
@@ -1813,13 +1822,13 @@ fn guest_unofficial_napi_module_wrap_create(
             &mut requests_id,
             &mut has_top_level_await,
         )
-    };
+    })?;
     if status == 0 {
         write_guest_u32(&mut env, result_ptr, handle_id);
         write_guest_u32(&mut env, result_ptr + 4, requests_id);
         write_guest_bytes(&mut env, result_ptr + 8, &[has_top_level_await]);
     }
-    status
+    Ok(status)
 }
 
 fn guest_unofficial_napi_module_wrap_destroy(
@@ -1858,13 +1867,18 @@ fn guest_unofficial_napi_module_wrap_link(
     }
 }
 
+// A module that fails to instantiate gets its source line formatted, which
+// runs the source-map callback (see unofficial_napi_get_error_metadata).
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_module_wrap_instantiate(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     handle: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let env_handle = snapi_env(&env, napi_env);
-    unsafe { snapi_bridge_unofficial_module_wrap_instantiate(env_handle, handle) }
+    with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_module_wrap_instantiate(env_handle, handle)
+    })
 }
 
 #[allow(clippy::result_large_err)]
@@ -1989,22 +2003,24 @@ fn guest_unofficial_napi_module_wrap_check_unsettled_top_level_await(
     handle: u32,
     warnings: i32,
     settled_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let env_handle = snapi_env(&env, napi_env);
     let handle_id = handle;
     let mut settled = 0i32;
-    let status = unsafe {
+    // Printing a stalled await formats its source line, which runs the
+    // source-map callback (see unofficial_napi_get_error_metadata).
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_module_wrap_check_unsettled_top_level_await(
             env_handle,
             handle_id,
             warnings,
             &mut settled,
         )
-    };
+    })?;
     if status == 0 && settled_ptr != 0 {
         write_guest_u8(&mut env, settled_ptr, (settled != 0) as u8);
     }
-    status
+    Ok(status)
 }
 
 fn guest_unofficial_napi_module_wrap_set_export(
@@ -3154,17 +3170,23 @@ fn guest_napi_is_exception_pending(mut env: FunctionEnvMut<NapiEnv>, e: u32, rp:
     s
 }
 
+// Taking the exception formats its source line, which runs the source-map
+// callback (see unofficial_napi_get_error_metadata).
+#[allow(clippy::result_large_err)]
 fn guest_napi_get_and_clear_last_exception(
     mut env: FunctionEnvMut<NapiEnv>,
     e: u32,
     rp: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_get_and_clear_last_exception(snapi_env(&env, e), &mut out) };
+    let snapi = snapi_env(&env, e);
+    let s = with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_get_and_clear_last_exception(snapi, &mut out)
+    })?;
     if s == 0 {
         write_guest_u32(&mut env, rp, out);
     }
-    s
+    Ok(s)
 }
 
 // --- Promise ---

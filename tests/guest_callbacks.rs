@@ -1,8 +1,10 @@
 //! JavaScript calling guest functions through real Wasmer dispatch, the
 //! bridge and V8: nested callbacks, scopes a callback leaves open, return
 //! values created in them, argument counts, missing arguments, settling a
-//! deferred, Proxy traps and promise hooks run by an import, a call that
-//! cannot reach the guest, and envs created one after another on one thread.
+//! deferred (and settling it again from inside), Proxy traps, promise hooks
+//! and the source-map callback run by an import, a call that cannot reach the
+//! guest, raw return values, and envs created one after another on one
+//! thread.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -65,11 +67,19 @@ const WAT: &str = r#"(module
     (func $mark_handled (param i32 i32) (result i32)))
   (import "napi_extension_wasmer_v0" "unofficial_napi_set_promise_hooks"
     (func $set_promise_hooks (param i32 i32 i32 i32 i32) (result i32)))
+  (import "napi" "napi_get_and_clear_last_exception"
+    (func $take_exception (param i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_configure_source_maps"
+    (func $configure_source_maps (param i32 i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_preserve_error_source_message"
+    (func $preserve_source_message (param i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_get_error_metadata"
+    (func $get_error_metadata (param i32 i32 i32 i32) (result i32)))
 
   ;; 8 env, 12 scope, 28 string, 32 script result, 48 global, 52 function,
-  ;; 72 int out, 200..228 callback scratch, 432..439 coercion scratch,
+  ;; 72 int out, 200..251 callback scratch, 432..439 coercion scratch,
   ;; 440 deferred, 444 promise, 448 import result, 560..591 property
-  ;; descriptor.
+  ;; descriptor, 656..683 error metadata.
   ;; Callbacks take 64- or 256-byte frames from a stack starting at 32768
   ;; so nested calls keep their own out-slots.
   (memory (export "memory") 2)
@@ -87,6 +97,10 @@ const WAT: &str = r#"(module
   (data (i32.const 156) "many16\00")
   (data (i32.const 164) "undef\00")
   (data (i32.const 172) "badret\00")
+  (data (i32.const 180) "resettle\00")
+  (data (i32.const 192) "raw\00")
+  (data (i32.const 624) "mapper\00")
+  (data (i32.const 640) "thrown\00")
   (data (i32.const 480) "coercionInput\00")
   (data (i32.const 496) "coercionResult\00")
   (data (i32.const 512) "InstanceCheck\00")
@@ -121,7 +135,9 @@ const WAT: &str = r#"(module
     (call $define (i32.const 132) (i32.const 5))
     (call $define (i32.const 156) (i32.const 6))
     (call $define (i32.const 164) (i32.const 7))
-    (call $define (i32.const 172) (i32.const 8)))
+    (call $define (i32.const 172) (i32.const 8))
+    (call $define (i32.const 180) (i32.const 9))
+    (call $define (i32.const 192) (i32.const 10)))
 
   (func (export "release") (result i32)
     (call $release_env (global.get $scope) (i32.const 0)))
@@ -189,6 +205,26 @@ const WAT: &str = r#"(module
     (if (call $get_undefined (global.get $env) (i32.const 448)) (then (return (i32.const -1))))
     (call $set_promise_hooks (global.get $env) (call $global_value (i32.const 608))
       (i32.load (i32.const 448)) (i32.load (i32.const 448)) (i32.load (i32.const 448))))
+
+  ;; Makes the global `mapper` the env's source-map callback.
+  (func (export "map_sources") (result i32)
+    (call $configure_source_maps (global.get $env) (i32.const 1)
+      (call $global_value (i32.const 624))))
+
+  ;; Formats the source line of the global `thrown`:
+  ;; 0 unofficial_napi_preserve_error_source_message,
+  ;; 1 unofficial_napi_get_error_metadata in its `current` mode.
+  (func (export "format_error") (param $which i32) (result i32)
+    (local $value i32)
+    (local.set $value (call $global_value (i32.const 640)))
+    (if (result i32) (local.get $which)
+      (then (call $get_error_metadata (global.get $env) (local.get $value)
+              (i32.const 0) (i32.const 656)))
+      (else (call $preserve_source_message (global.get $env) (local.get $value)))))
+
+  ;; Takes the pending exception.
+  (func (export "take_exception") (result i32)
+    (call $take_exception (global.get $env) (i32.const 448)))
 
   ;; Calls one import on the global `settleValue`: 0 node_api_set_prototype
   ;; (to the global object), 1 napi_object_freeze, 2 napi_object_seal,
@@ -411,7 +447,33 @@ const WAT: &str = r#"(module
     (if (call $create_int32 (local.get $env) (i32.const 1234) (i32.const 304))
       (then (call $fail (i32.const 72))))
     (i32.load (i32.const 304)))
-  (elem (i32.const 1) $rec $leak $many20 $stale $probe $many16 $undef $badret)
+
+  ;; resettle(): resolves and then rejects, with undefined, the deferred that
+  ;; `settle` is settling. Returns the first status * 100 + the second.
+  (func $resettle (param $env i32) (param $info i32) (result i32)
+    (local $resolved i32) (local $rejected i32)
+    (if (call $get_undefined (local.get $env) (i32.const 232))
+      (then (call $fail (i32.const 91))))
+    (local.set $resolved (call $resolve_deferred (local.get $env) (i32.load (i32.const 440))
+      (i32.load (i32.const 232))))
+    (local.set $rejected (call $reject_deferred (local.get $env) (i32.load (i32.const 440))
+      (i32.load (i32.const 232))))
+    (if (call $create_int32 (local.get $env)
+          (i32.add (i32.mul (local.get $resolved) (i32.const 100)) (local.get $rejected))
+          (i32.const 236))
+      (then (call $fail (i32.const 92))))
+    (i32.load (i32.const 236)))
+
+  ;; raw(x): returns the number x itself where a value id is expected.
+  (func $raw (param $env i32) (param $info i32) (result i32)
+    (i32.store (i32.const 240) (i32.const 1))
+    (if (call $get_cb_info (local.get $env) (local.get $info) (i32.const 240) (i32.const 244)
+          (i32.const 0) (i32.const 0))
+      (then (call $fail (i32.const 93))))
+    (if (call $get_int32 (local.get $env) (i32.load (i32.const 244)) (i32.const 248))
+      (then (call $fail (i32.const 94))))
+    (i32.load (i32.const 248)))
+  (elem (i32.const 1) $rec $leak $many20 $stale $probe $many16 $undef $badret $resettle $raw)
 )"#;
 
 struct Guest {
@@ -600,6 +662,104 @@ fn settling_a_deferred_can_call_guest_functions() {
     );
     assert_eq!(settle.call(&mut guest.store, 0).unwrap(), 0);
     assert_eq!(guest.eval("settled"), (0, 41, 0));
+    assert_eq!(guest.release(), 0);
+}
+
+/// JavaScript that runs while a deferred settles cannot settle that deferred
+/// again: both imports refuse it (`napi_invalid_arg` is 1), the settlement
+/// in flight succeeds, and the deferred is released once.
+#[test]
+fn a_deferred_being_settled_cannot_be_settled_again() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    let watch: TypedFunction<(), i32> = guest.typed("watch_rejections");
+    let settle: TypedFunction<i32, i32> = guest.typed("settle");
+
+    assert_eq!(
+        guest.eval(
+            "globalThis.nested = -1; globalThis.settleValue = { get then() { \
+             nested = resettle(); return undefined; } }; 0"
+        ),
+        (0, 0, 0)
+    );
+    for round in 0..200 {
+        assert_eq!(settle.call(&mut guest.store, 0).unwrap(), 0, "round {round}");
+    }
+    assert_eq!(guest.eval("nested"), (0, 101, 0));
+
+    assert_eq!(
+        guest.eval(
+            "globalThis.nested = -1; globalThis.settleValue = 1; \
+             globalThis.rejectHook = () => { nested = resettle(); }; 0"
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(watch.call(&mut guest.store).unwrap(), 0);
+    for round in 0..200 {
+        assert_eq!(settle.call(&mut guest.store, 1).unwrap(), 0, "round {round}");
+    }
+    assert_eq!(guest.eval("nested"), (0, 101, 0));
+    assert_eq!(guest.release(), 0);
+}
+
+/// Imports that format an error's source line run the env's source-map
+/// callback, which can call guest functions.
+#[test]
+fn the_source_map_callback_can_call_guest_functions() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    let map_sources: TypedFunction<(), i32> = guest.typed("map_sources");
+    let format_error: TypedFunction<i32, i32> = guest.typed("format_error");
+    let take_exception: TypedFunction<(), i32> = guest.typed("take_exception");
+    assert_eq!(
+        guest.eval(
+            "globalThis.calls = 0; globalThis.mapped = 0; globalThis.mapper = () => { \
+             calls++; mapped = rec(1, () => 40); return 'mapped line'; }; 0"
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(map_sources.call(&mut guest.store).unwrap(), 0);
+    assert_eq!(
+        guest.eval(
+            "try { null.x; } catch (error) { globalThis.thrown = error; } 0\n\
+             //# sourceURL=mapped.js"
+        ),
+        (0, 0, 0)
+    );
+    for (which, name) in [
+        (0, "unofficial_napi_preserve_error_source_message"),
+        (1, "unofficial_napi_get_error_metadata"),
+    ] {
+        assert_eq!(guest.eval("calls = mapped = 0"), (0, 0, 0), "{name}");
+        assert_eq!(format_error.call(&mut guest.store, which).unwrap(), 0, "{name}");
+        assert_eq!(guest.eval("calls"), (0, 1, 0), "{name} did not run the callback");
+        assert_eq!(guest.eval("mapped"), (0, 41, 0), "{name}");
+    }
+
+    // napi_get_and_clear_last_exception formats the exception it hands out.
+    assert_eq!(guest.eval("calls = mapped = 0"), (0, 0, 0));
+    let thrown = guest.eval("throw new Error('x');\n//# sourceURL=mapped.js");
+    assert_eq!(thrown.0, 10, "napi_pending_exception");
+    assert_eq!(take_exception.call(&mut guest.store).unwrap(), 0);
+    assert_eq!(guest.eval("calls"), (0, 1, 0));
+    assert_eq!(guest.eval("mapped"), (0, 41, 0));
+    assert_eq!(guest.release(), 0);
+}
+
+/// A guest function that returns a number that is no value id returns
+/// undefined. That includes 1, which the trampoline itself uses to report a
+/// call that could not reach the guest, and -1, the largest possible id.
+#[test]
+fn a_raw_number_returned_as_a_value_id_is_undefined() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    for raw in ["1", "-1", "0", "4095"] {
+        assert_eq!(
+            guest.eval(&format!("Number(raw({raw}) === undefined)")),
+            (0, 1, 0),
+            "raw({raw})"
+        );
+    }
     assert_eq!(guest.release(), 0);
 }
 

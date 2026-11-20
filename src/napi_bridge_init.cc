@@ -770,11 +770,31 @@ uint32_t CommitDeferred(SnapiEnvState& state, napi_deferred d) {
   return id;
 }
 
-napi_deferred LoadDeferred(SnapiEnvState& state, uint32_t id) {
+// Takes the deferred `id` for one settlement, or returns null if there is
+// none or it is already being settled. Settling runs JavaScript (a `then`
+// getter, the promise-reject callback) that can call back into the guest,
+// and a second settlement of the same deferred from there would release it
+// twice. The entry stays in the table, empty, until EndSettlingDeferred.
+napi_deferred BeginSettlingDeferred(SnapiEnvState& state, uint32_t id) {
   if (id == 0) return nullptr;
-  const SnapiAgentState& agent = *state.agent;
+  SnapiAgentState& agent = *state.agent;
   auto it = agent.deferreds.find(id);
-  return it != agent.deferreds.end() ? it->second : nullptr;
+  if (it == agent.deferreds.end()) return nullptr;
+  return std::exchange(it->second, nullptr);
+}
+
+void RemoveDeferred(SnapiEnvState& state, uint32_t id);
+
+// Retires the deferred if it was settled; otherwise the provider still owns
+// it and the guest may settle it again.
+void EndSettlingDeferred(SnapiEnvState& state, uint32_t id, napi_deferred d, bool settled) {
+  if (settled) {
+    RemoveDeferred(state, id);
+    return;
+  }
+  // Looked up again: the JavaScript may have added entries to the table.
+  auto it = state.agent->deferreds.find(id);
+  if (it != state.agent->deferreds.end()) it->second = d;
 }
 
 void RemoveDeferred(SnapiEnvState& state, uint32_t id) {
@@ -2042,11 +2062,12 @@ extern "C" int snapi_bridge_resolve_deferred(SnapiEnvState* env_state, uint32_t 
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  napi_deferred d = LoadDeferred(*bridge_state, deferred_id);
   napi_value val = LoadValue(*bridge_state, value_id);
-  if (!d || !val) return napi_invalid_arg;
+  if (!val) return napi_invalid_arg;
+  napi_deferred d = BeginSettlingDeferred(*bridge_state, deferred_id);
+  if (!d) return napi_invalid_arg;
   napi_status s = napi_resolve_deferred(env, d, val);
-  if (s == napi_ok) RemoveDeferred(*bridge_state, deferred_id);
+  EndSettlingDeferred(*bridge_state, deferred_id, d, s == napi_ok);
   return s;
 }
 
@@ -2056,11 +2077,12 @@ extern "C" int snapi_bridge_reject_deferred(SnapiEnvState* env_state, uint32_t d
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
-  napi_deferred d = LoadDeferred(*bridge_state, deferred_id);
   napi_value val = LoadValue(*bridge_state, value_id);
-  if (!d || !val) return napi_invalid_arg;
+  if (!val) return napi_invalid_arg;
+  napi_deferred d = BeginSettlingDeferred(*bridge_state, deferred_id);
+  if (!d) return napi_invalid_arg;
   napi_status s = napi_reject_deferred(env, d, val);
-  if (s == napi_ok) RemoveDeferred(*bridge_state, deferred_id);
+  EndSettlingDeferred(*bridge_state, deferred_id, d, s == napi_ok);
   return s;
 }
 
@@ -3525,9 +3547,13 @@ extern "C" uint32_t snapi_host_invoke_wasm_callback(void* callback_ctx,
 
 // What the trampoline returns in place of a value id when the guest's store
 // is not lent to the thread, so the guest function did not run
-// (CALLBACK_STORE_NOT_LENT in guest/callback.rs). No value id reaches it:
-// their slot index stays below kValueIdMaxSlots.
-constexpr uint32_t kCallbackStoreNotLent = UINT32_MAX;
+// (CALLBACK_STORE_NOT_LENT in guest/callback.rs). No value id has this
+// value: an id's upper bits hold its slot index plus one, never zero. The
+// trampoline never passes this number on from a guest function.
+constexpr uint32_t kCallbackStoreNotLent = 1;
+static_assert(kCallbackStoreNotLent != 0 &&
+                  (kCallbackStoreNotLent >> kValueIdGenBits) == 0,
+              "the sentinel must not be the null id or a possible value id");
 
 void WasmInterruptCallback(napi_env env, void* raw) {
   auto* request = static_cast<WasmInterruptRequest*>(raw);
