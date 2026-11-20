@@ -1,11 +1,15 @@
-use std::{cell::Cell, ffi::c_void, sync::Arc};
+use std::{
+    cell::{Cell, UnsafeCell},
+    ffi::c_void,
+    sync::Arc,
+};
 
 use wasmer::{AsStoreMut, FunctionEnv, FunctionEnvMut, Store, StoreMut, Table, Value};
 use wasmer_wasix::WasiError;
 use wasmer_wasix::wasmer_wasix_types::wasi::ExitCode;
 
 use super::callback_cache::CachedGuestCallback;
-use crate::{NapiEnv, snapi::SnapiEnv};
+use crate::{NapiEnv, env::CallbackDepth, snapi::SnapiEnv};
 
 /// What the imports running on a thread lend to the callbacks their bridge
 /// calls run, and what those callbacks hand back. One thread-local holds
@@ -158,15 +162,88 @@ pub(crate) struct CallbackInvocationCtx {
     /// lent: no store may be lent (JavaScript outside an import that lends
     /// it), or another store's, when stores share the thread.
     store_id: usize,
+    /// The store's callback depth, shared with its `NapiEnv` so that a
+    /// callback counts its crossing without looking the env data up.
+    depth: CallbackDepth,
+    /// The guest functions this env's callbacks called last, so that a
+    /// repeated call finds its function without the env data either.
+    hot: StoreLocal<HotCallbacks>,
 }
 
+/// A value that belongs to one store and is only reached by whoever holds
+/// that store's `&mut`, which is what lets it sit behind a shared pointer
+/// (the bridge's pointer to a [`CallbackInvocationCtx`]) without a lock.
+struct StoreLocal<T>(UnsafeCell<T>);
+
+// SAFETY: every access goes through `get`, whose caller holds the store's
+// `&mut`: one thread at a time, so the value is never used from two threads
+// at once, only handed from one to the next along with the store.
+unsafe impl<T: Send> Sync for StoreLocal<T> {}
+
+impl<T> StoreLocal<T> {
+    /// # Safety
+    /// The caller holds the `&mut` of the store the value belongs to, and
+    /// drops the reference before anything that could call `get` again runs:
+    /// in particular before it enters the guest, whose imports can call back.
+    #[allow(clippy::mut_from_ref)]
+    #[inline]
+    unsafe fn get(&self) -> &mut T {
+        unsafe { &mut *self.0.get() }
+    }
+}
+
+/// How many guest functions a callback context keeps at hand. A power of two.
+const HOT_CALLBACKS: usize = 64;
+
+/// A direct-mapped cache in front of `NapiEnv::func_cache`, by table index.
+/// Two functions that share a slot take turns at it; both stay in the env's
+/// cache, which answers whenever this one does not.
+struct HotCallbacks(Box<[Option<(u32, CachedGuestCallback)>; HOT_CALLBACKS]>);
+
 impl CallbackInvocationCtx {
+    fn new(func_env: FunctionEnv<NapiEnv>, store_id: usize, depth: CallbackDepth) -> Self {
+        Self {
+            func_env,
+            store_id,
+            depth,
+            hot: StoreLocal(UnsafeCell::new(HotCallbacks(Box::new(std::array::from_fn(
+                |_| None,
+            ))))),
+        }
+    }
+
     /// The lent store, if it is the one this context's env lives in.
+    #[inline]
     fn with_store<R>(&self, f: impl FnOnce(&mut StoreMut<'_>) -> R) -> Option<R> {
         with_lent_store(|store| {
             (store.objects_mut().id().as_raw().get() == self.store_id).then(|| f(store))
         })
         .flatten()
+    }
+
+    /// The guest function at `wasm_fn_ptr` in the indirect function table.
+    /// `None` if the instance has no table or the element is not a function.
+    ///
+    /// `store` is this context's store ([`Self::with_store`]).
+    #[inline]
+    fn guest_callback(
+        &self,
+        store: &mut StoreMut<'_>,
+        wasm_fn_ptr: u32,
+    ) -> Option<CachedGuestCallback> {
+        // SAFETY: the caller holds this context's store, and the reference
+        // ends with this function, which runs no guest code: reading the
+        // table and the env data does not.
+        let hot = unsafe { self.hot.get() };
+        let entry = &mut hot.0[wasm_fn_ptr as usize % HOT_CALLBACKS];
+        if let Some((index, func)) = entry
+            && *index == wasm_fn_ptr
+        {
+            return Some(func.clone());
+        }
+        let func = cached_guest_callback(store, &self.func_env, wasm_fn_ptr)?;
+        *entry = Some((wasm_fn_ptr, func.clone()));
+        Some(func)
     }
 }
 
@@ -179,10 +256,11 @@ pub(crate) fn install_callback_ctx(
     env_id: u32,
     snapi_env: SnapiEnv,
 ) {
-    let ctx = Arc::new(CallbackInvocationCtx {
-        func_env: env.as_ref(),
-        store_id: env.objects_mut().id().as_raw().get(),
-    });
+    let ctx = Arc::new(CallbackInvocationCtx::new(
+        env.as_ref(),
+        env.objects_mut().id().as_raw().get(),
+        env.data().callback_depth(),
+    ));
     let ctx_ptr = Arc::as_ptr(&ctx).cast_mut().cast::<c_void>();
     env.data_mut().native_callback_contexts.insert(env_id, ctx);
     unsafe {
@@ -190,42 +268,56 @@ pub(crate) fn install_callback_ctx(
     }
 }
 
-fn call_guest_callback(
+/// The guest function at `wasm_fn_ptr` in the indirect function table, from
+/// the store's cache or, the first time, from the table. `None` if the
+/// instance has no table or the element is not a function.
+#[cold]
+#[inline(never)]
+fn cached_guest_callback(
     store: &mut StoreMut<'_>,
     func_env: &FunctionEnv<NapiEnv>,
-    table: &Table,
+    wasm_fn_ptr: u32,
+) -> Option<CachedGuestCallback> {
+    match func_env.as_ref(store).func_cache.get(&wasm_fn_ptr) {
+        Some(func) => Some(func.clone()),
+        None => resolve_guest_callback(store, func_env, wasm_fn_ptr),
+    }
+}
+
+/// The first call of a guest function: reads it from the table and caches it.
+#[cold]
+#[inline(never)]
+fn resolve_guest_callback(
+    store: &mut StoreMut<'_>,
+    func_env: &FunctionEnv<NapiEnv>,
+    wasm_fn_ptr: u32,
+) -> Option<CachedGuestCallback> {
+    let table: Table = func_env.as_ref(store).table.clone()?;
+    let Value::FuncRef(Some(func)) = table.get(store, wasm_fn_ptr)? else {
+        return None;
+    };
+    let callback = CachedGuestCallback::new(func, store);
+    func_env
+        .as_mut(store)
+        .func_cache
+        .insert(wasm_fn_ptr, callback.clone());
+    Some(callback)
+}
+
+#[inline]
+fn call_guest_callback(
+    store: &mut StoreMut<'_>,
+    ctx: &CallbackInvocationCtx,
     guest_env: u32,
     wasm_fn_ptr: u32,
     callback_arg: u32,
 ) -> u32 {
-    let func = match func_env.as_ref(store).func_cache.get(&wasm_fn_ptr).cloned() {
-        Some(func) => func,
-        None => {
-            let Some(elem) = table.get(store, wasm_fn_ptr) else {
-                return 0;
-            };
-            let func = match elem {
-                Value::FuncRef(Some(func)) => func,
-                Value::FuncRef(None) => return 0,
-                _ => return 0,
-            };
-            let callback = CachedGuestCallback::new(func, store);
-            func_env
-                .as_mut(store)
-                .func_cache
-                .insert(wasm_fn_ptr, callback.clone());
-            callback
-        }
+    let Some(func) = ctx.guest_callback(store, wasm_fn_ptr) else {
+        return 0;
     };
     match func.call(store, guest_env, callback_arg) {
         Ok(result) => result,
-        Err(err) => {
-            if stash_guest_exit(&err) {
-                return 0;
-            }
-            eprintln!("[callback trampoline] error calling function: {err}");
-            0
-        }
+        Err(err) => callback_trapped(&err, "[callback trampoline] error calling function"),
     }
 }
 
@@ -235,41 +327,49 @@ fn call_guest_callback(
 fn call_guest_callback2(
     store: &mut StoreMut<'_>,
     func_env: &FunctionEnv<NapiEnv>,
-    table: &Table,
     guest_env: u32,
     wasm_fn_ptr: u32,
     arg0: u32,
     arg1: u32,
 ) -> u32 {
-    let func = match func_env.as_ref(store).func_cache.get(&wasm_fn_ptr).cloned() {
-        Some(func) => func,
-        None => {
-            let Some(elem) = table.get(store, wasm_fn_ptr) else {
-                return 0;
-            };
-            let func = match elem {
-                Value::FuncRef(Some(func)) => func,
-                Value::FuncRef(None) => return 0,
-                _ => return 0,
-            };
-            let callback = CachedGuestCallback::new(func, store);
-            func_env
-                .as_mut(store)
-                .func_cache
-                .insert(wasm_fn_ptr, callback.clone());
-            callback
-        }
+    // Finalizers are not hot: straight from the store's cache.
+    let Some(func) = cached_guest_callback(store, func_env, wasm_fn_ptr) else {
+        return 0;
     };
     match func.call_finalizer(store, guest_env, arg0, arg1) {
         Ok(result) => result,
-        Err(err) => {
-            if stash_guest_exit(&err) {
-                return 0;
-            }
-            eprintln!("[finalizer trampoline] error calling guest finalizer: {err}");
-            0
-        }
+        Err(err) => callback_trapped(
+            &err,
+            "[finalizer trampoline] error calling guest finalizer",
+        ),
     }
+}
+
+/// A guest callback trapped: stashes a guest exit for the import boundary,
+/// logs anything else. The callback's result is 0 either way.
+#[cold]
+#[inline(never)]
+fn callback_trapped(err: &wasmer::RuntimeError, what: &str) -> u32 {
+    if !stash_guest_exit(err) {
+        eprintln!("{what}: {err}");
+    }
+    0
+}
+
+/// The callback at the reentrancy depth limit is refused. As before the
+/// counter moved out of the env data, an instance without a table refuses it
+/// silently.
+#[cold]
+#[inline(never)]
+fn depth_limit_exceeded(
+    store: &mut StoreMut<'_>,
+    func_env: &FunctionEnv<NapiEnv>,
+    what: &str,
+) -> u32 {
+    if func_env.as_ref(store).table.is_some() {
+        eprintln!("{what} reentrancy depth limit exceeded");
+    }
+    0
 }
 
 /// Rust trampoline called from C++ when a V8 callback fires.
@@ -288,44 +388,35 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
     // SAFETY: `callback_ctx` is the context `install_callback_ctx` gave the
     // env, which lives at least as long as the env's agent points to it.
     let ctx = unsafe { &*(callback_ctx as *const CallbackInvocationCtx) };
-    let func_env = ctx.func_env.clone();
 
     let dispatched = ctx.with_store(|store| {
-        let Some(table) = func_env.as_ref(store).table.clone() else {
-            return 0;
-        };
-
         // Bound guest↔host callback reentrancy so a runaway recursion cannot
         // overflow the host native stack (an uncatchable SIGSEGV that would take
         // down every co-tenant). Refuse the callback past the limit rather than
         // crash. The increment below always pairs with the decrement, since
         // `call_guest_callback` returns normally on both success and trap.
-        if !func_env.as_mut(store).enter_callback() {
-            eprintln!("[callback trampoline] reentrancy depth limit exceeded");
-            return 0;
+        if !ctx.depth.enter() {
+            return depth_limit_exceeded(store, &ctx.func_env, "[callback trampoline]");
         }
-        let result = call_guest_callback(
-            store,
-            &func_env,
-            &table,
-            guest_env,
-            wasm_fn_ptr,
-            callback_arg,
-        );
-        func_env.as_mut(store).leave_callback();
+        let result = call_guest_callback(store, ctx, guest_env, wasm_fn_ptr, callback_arg);
+        ctx.depth.leave();
         result
     });
 
     match dispatched {
         Some(result) => result,
-        None => {
-            // No import of this guest lent its store to the code that entered
-            // V8, so there is no way back into the guest from here. The
-            // bridge throws in the JavaScript that made the call.
-            eprintln!("[callback trampoline] the guest's store is not lent to this thread");
-            CALLBACK_STORE_NOT_LENT
-        }
+        None => store_not_lent(),
     }
+}
+
+/// No import of this guest lent its store to the code that entered V8, so
+/// there is no way back into the guest from here. The bridge throws in the
+/// JavaScript that made the call.
+#[cold]
+#[inline(never)]
+fn store_not_lent() -> u32 {
+    eprintln!("[callback trampoline] the guest's store is not lent to this thread");
+    CALLBACK_STORE_NOT_LENT
 }
 
 /// Rust trampoline called from C++ when a guest-registered N-API finalizer
@@ -347,21 +438,16 @@ pub extern "C" fn snapi_host_invoke_wasm_finalizer(
     }
     // SAFETY: as in `snapi_host_invoke_wasm_callback`.
     let ctx = unsafe { &*(callback_ctx as *const CallbackInvocationCtx) };
-    let func_env = ctx.func_env.clone();
 
     ctx.with_store(|store| {
-        let Some(table) = func_env.as_ref(store).table.clone() else {
-            return 0;
-        };
         // Same reentrancy bound as the regular callback trampoline: a finalizer
         // may itself create/free values and trigger more callbacks.
-        if !func_env.as_mut(store).enter_callback() {
-            eprintln!("[finalizer trampoline] reentrancy depth limit exceeded");
-            return 0;
+        if !ctx.depth.enter() {
+            return depth_limit_exceeded(store, &ctx.func_env, "[finalizer trampoline]");
         }
         let result =
-            call_guest_callback2(store, &func_env, &table, guest_env, wasm_fn_ptr, data, hint);
-        func_env.as_mut(store).leave_callback();
+            call_guest_callback2(store, &ctx.func_env, guest_env, wasm_fn_ptr, data, hint);
+        ctx.depth.leave();
         result
     })
     .unwrap_or(0)
@@ -528,11 +614,13 @@ mod tests {
         for _ in 0..crate::guest::MAX_CALLBACK_DEPTH {
             assert!(env.enter_callback());
         }
+        let depth = env.callback_depth();
         let func_env = FunctionEnv::new(&mut store, env);
-        let mut ctx = CallbackInvocationCtx {
-            func_env: func_env.clone(),
-            store_id: store.objects_mut().id().as_raw().get(),
-        };
+        let mut ctx = CallbackInvocationCtx::new(
+            func_env.clone(),
+            store.objects_mut().id().as_raw().get(),
+            depth,
+        );
         let mut invoke = || snapi_host_invoke_wasm_callback((&raw mut ctx).cast(), 0, 0, 0);
         assert_eq!(store.as_store_mut().parked(&mut invoke), 0);
         func_env.as_mut(&mut store).leave_callback();
@@ -557,11 +645,13 @@ mod tests {
             )
             .unwrap(),
         );
+        let depth = env.callback_depth();
         let func_env = FunctionEnv::new(&mut store, env);
-        let mut ctx = CallbackInvocationCtx {
+        let mut ctx = CallbackInvocationCtx::new(
             func_env,
-            store_id: store.objects_mut().id().as_raw().get(),
-        };
+            store.objects_mut().id().as_raw().get(),
+            depth,
+        );
         let mut invoke = || snapi_host_invoke_wasm_callback((&raw mut ctx).cast(), 0, 0, 0);
         // No store lent, then another store lent: the guest is out of reach.
         assert_eq!(invoke(), CALLBACK_STORE_NOT_LENT);

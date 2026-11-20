@@ -52,6 +52,10 @@ pub struct SnapiUnofficialHeapCodeStatistics {
 
 // Items allowed to be dead for the JS backend are reached by its guest layer
 // through `snapi_js::host_js_*` entry points or direct guest memory access.
+/// What [`snapi_bridge_create_small_integer`] returns for a value V8 would
+/// allocate a heap number for. Not a `napi_status`.
+pub const SNAPI_NOT_A_SMALL_INTEGER: i32 = -1;
+
 unsafe extern "C" {
     pub fn snapi_bridge_init() -> i32;
     // Host only: the JS backend has no V8 platform queue to wake for.
@@ -526,6 +530,9 @@ unsafe extern "C" {
         wasm_length: u32,
         out_id: *mut u32,
     ) -> i32;
+    /// A number for `value` if V8 holds it as a small integer, which takes
+    /// no heap allocation; [`SNAPI_NOT_A_SMALL_INTEGER`] otherwise.
+    pub fn snapi_bridge_create_small_integer(env: SnapiEnv, value: i32, out_id: *mut u32) -> i32;
     pub fn snapi_bridge_create_int32(env: SnapiEnv, value: i32, out_id: *mut u32) -> i32;
     pub fn snapi_bridge_create_uint32(env: SnapiEnv, value: u32, out_id: *mut u32) -> i32;
     pub fn snapi_bridge_create_double(env: SnapiEnv, value: f64, out_id: *mut u32) -> i32;
@@ -607,6 +614,35 @@ unsafe extern "C" {
         env: SnapiEnv,
         obj_id: u32,
         key_id: u32,
+        result: *mut i32,
+    ) -> i32;
+    // The three named-property calls with the name's `NameKey` (0, 0 for
+    // none): the provider keeps a numbered name's string.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_set_named_property_keyed(
+        env: SnapiEnv,
+        obj_id: u32,
+        name: *const c_char,
+        name_slot: u32,
+        name_key: u64,
+        val_id: u32,
+    ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_get_named_property_keyed(
+        env: SnapiEnv,
+        obj_id: u32,
+        name: *const c_char,
+        name_slot: u32,
+        name_key: u64,
+        out_id: *mut u32,
+    ) -> i32;
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub fn snapi_bridge_has_named_property_keyed(
+        env: SnapiEnv,
+        obj_id: u32,
+        name: *const c_char,
+        name_slot: u32,
+        name_key: u64,
         result: *mut i32,
     ) -> i32;
     #[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(dead_code))]

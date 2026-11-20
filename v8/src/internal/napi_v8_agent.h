@@ -105,6 +105,19 @@ class NapiHostCharge {
   uint64_t bytes_ = 0;
 };
 
+// A property name the embedder numbered (napi_v8_*_named_property_keyed):
+// the internalized string for `key`, the embedder's process-unique id of the
+// name's bytes. `pins` counts the calls using the handle right now; the slot
+// is not given to another name meanwhile.
+struct napi_name_key__ {
+  uint64_t key = 0;
+  uint32_t pins = 0;
+  v8::Global<v8::String> name;
+};
+
+// The number of slots an embedder may number names into.
+inline constexpr uint32_t kNapiNameKeySlots = 512;
+
 struct napi_agent__ {
   explicit napi_agent__(v8::Isolate* isolate);
   ~napi_agent__();
@@ -199,6 +212,10 @@ struct napi_agent__ {
   // after a termination request, it makes V8 act on the request at its
   // entry, a stack check.
   v8::Global<v8::Function> termination_probe;
+
+  // The names numbered so far, kNapiNameKeySlots of them, made at the first
+  // keyed property call. The strings are the isolate's, not a realm's.
+  std::unique_ptr<napi_name_key__[]> name_keys;
 
   // Profiler sessions. V8's CPU and sampling heap profilers are per isolate.
   v8::CpuProfiler* cpu_profiler = nullptr;

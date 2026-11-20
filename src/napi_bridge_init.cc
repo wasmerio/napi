@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
@@ -60,10 +61,12 @@ namespace {
 std::mutex g_mu;
 
 struct CbRegistration {
-  uint32_t guest_env;
-  uint32_t wasm_fn_ptr;
-  uint32_t wasm_setter_fn_ptr;
-  uint64_t data_val;
+  uint32_t guest_env = 0;
+  uint32_t wasm_fn_ptr = 0;
+  uint32_t wasm_setter_fn_ptr = 0;
+  // False for an id that was allocated but not registered (yet).
+  bool registered = false;
+  uint64_t data_val = 0;
 };
 
 struct CallbackInvocation {
@@ -241,16 +244,29 @@ struct ValueSlot {
 // Non-root frames own a real (heap) napi handle scope and the slots minted
 // while they were innermost; closing the frame frees those slots so their ids
 // go stale before the Locals die with the underlying scope.
+//
+// A frame owns the entries of the agent's owned_slots stack from its
+// slots_begin up to the next frame's (or the top): frames close innermost
+// first and values are minted into the innermost one, so one stack serves
+// them all and opening or closing a frame allocates nothing. Trivially
+// copyable on purpose.
+constexpr uint32_t kNoSlot = UINT32_MAX;
+
 struct ScopeFrame {
   napi_handle_scope scope = nullptr;
   napi_escapable_handle_scope esc_scope = nullptr;
   // The env that opened the napi scope, which must also close it. Frames are
   // shared by every env of an agent, so the env popping a frame may differ.
   napi_env env = nullptr;
-  std::vector<uint32_t> owned_slots;
   // Guest-visible id (0 for the root frame and for implicit per-callback
   // frames, which the guest cannot close).
   uint32_t id = 0;
+  // Where this frame's slots start in the agent's owned_slots.
+  uint32_t slots_begin = 0;
+  // The slot of the value escaped from this (escapable) frame, or kNoSlot.
+  // It belongs to the frame below, which gets it when this one closes: until
+  // then this frame's own slots are in the way on the shared stack.
+  uint32_t escaped_slot = kNoSlot;
 };
 
 struct SnapiEnvState;
@@ -308,9 +324,16 @@ struct SnapiAgentState {
   // on first use; new values are minted into the innermost frame.
   std::vector<ScopeFrame> scope_frames;
   uint32_t next_scope_id = 1;
-  // Emptied owned_slots buffers of popped frames. The next frame reuses one,
-  // so a guest callback does not allocate and free a buffer on every call.
-  std::vector<std::vector<uint32_t>> spare_owned_slots;
+  // The slots the open frames own, outermost frame first (see ScopeFrame).
+  std::vector<uint32_t> owned_slots;
+  // Ids of undefined, null, false and true, minted once: V8 hands out the
+  // same slot of its roots table for each, which lives as long as the
+  // isolate. No frame owns them. 0 until minted (see StoreSingleton).
+  uint32_t singleton_ids[4] = {0, 0, 0, 0};
+  napi_value singleton_values[4] = {nullptr, nullptr, nullptr, nullptr};
+  // Set when the provider's handle for one of them turned out not to be such
+  // a stable slot: they are minted per call then, like any other value.
+  bool singletons_unstable = false;
 
   // Handle table for napi_ref (references).
   std::unordered_map<uint32_t, napi_ref> refs;
@@ -379,10 +402,19 @@ struct SnapiEnvState {
   // for another env.
   std::atomic<uint32_t> holders{1};
 
-  // Guest callbacks registered through this env. Each entry records the guest
-  // env id the callback is invoked with, so they belong to the env.
-  std::unordered_map<uint32_t, CbRegistration> cb_registry;
+  // Guest callbacks registered through this env, indexed by registration id
+  // (ids are handed out in sequence, so entry 0 is unused). Each entry
+  // records the guest env id the callback is invoked with, so they belong to
+  // the env. Emptied when the agent's release starts.
+  std::vector<CbRegistration> cb_registry;
   uint32_t next_cb_reg_id = 1;
+
+  // The registration of `reg_id`, or null.
+  const CbRegistration* FindRegistration(uint32_t reg_id) const {
+    if (reg_id >= cb_registry.size()) return nullptr;
+    const CbRegistration& registration = cb_registry[reg_id];
+    return registration.registered ? &registration : nullptr;
+  }
   std::vector<std::unique_ptr<CallbackBinding>> callback_bindings;
 };
 
@@ -395,42 +427,68 @@ struct CallbackBinding {
 // exit (see the runtime-globals comment in unofficial_napi.cc).
 std::unordered_set<SnapiEnvState*>& g_envs = *new std::unordered_set<SnapiEnvState*>();
 
-// Envs created on this thread and not yet released. Only this thread inserts
-// or erases its entries, so membership proves both that an env is alive and
-// that the caller owns it, without taking g_mu on every N-API call. A plain
-// pointer (freed when the thread's last env goes) keeps it usable from other
-// thread-exit destructors that may still release envs.
-thread_local std::unordered_set<SnapiEnvState*>* t_owned_envs = nullptr;
-// The env this thread resolved last, always a member of t_owned_envs. A
-// thread usually drives one env, so this answers most lookups without
-// hashing.
-thread_local SnapiEnvState* t_last_owned_env = nullptr;
+// What the bridge keeps per thread, in one thread-local so a bridge call
+// resolves it once (a thread-local access is a call on some platforms).
+// Constant-initialized and trivially destructible: no lazy-init guard, and
+// usable from other thread-exit destructors that may still release envs.
+struct BridgeThread {
+  // Envs created on this thread and not yet released. Only this thread
+  // inserts or erases its entries, so membership proves both that an env is
+  // alive and that the caller owns it, without taking g_mu on every N-API
+  // call. A plain pointer, freed when the thread's last env goes.
+  std::unordered_set<SnapiEnvState*>* owned_envs = nullptr;
+  // The env this thread resolved last, always a member of owned_envs. A
+  // thread usually drives one env, so this answers most lookups without
+  // hashing.
+  SnapiEnvState* last_owned_env = nullptr;
+  // See BridgeEnvScope.
+  v8::Isolate* resident_isolate = nullptr;
+  uint32_t bridge_depth = 0;
+};
+constinit thread_local BridgeThread t_bridge{};
 
-bool OwnedByThisThread(const SnapiEnvState* state) {
-  if (state == nullptr) return false;
-  if (state == t_last_owned_env) return true;
-  if (t_owned_envs == nullptr ||
-      t_owned_envs->count(const_cast<SnapiEnvState*>(state)) == 0) {
+#if defined(__GNUC__) || defined(__clang__)
+#define SNAPI_ALWAYS_INLINE inline __attribute__((always_inline))
+#define SNAPI_NOINLINE __attribute__((noinline))
+#else
+#define SNAPI_ALWAYS_INLINE inline
+#define SNAPI_NOINLINE
+#endif
+
+SNAPI_NOINLINE bool OwnedByThreadSlow(BridgeThread& thread, const SnapiEnvState* state) {
+  if (thread.owned_envs == nullptr ||
+      thread.owned_envs->count(const_cast<SnapiEnvState*>(state)) == 0) {
     return false;
   }
-  t_last_owned_env = const_cast<SnapiEnvState*>(state);
+  thread.last_owned_env = const_cast<SnapiEnvState*>(state);
   return true;
 }
 
+SNAPI_ALWAYS_INLINE bool OwnedByThread(BridgeThread& thread, const SnapiEnvState* state) {
+  if (state == nullptr) return false;
+  return state == thread.last_owned_env || OwnedByThreadSlow(thread, state);
+}
+
+bool OwnedByThisThread(const SnapiEnvState* state) {
+  return OwnedByThread(t_bridge, state);
+}
+
 void AdoptOnThisThread(SnapiEnvState* state) {
-  if (t_owned_envs == nullptr) {
-    t_owned_envs = new std::unordered_set<SnapiEnvState*>();
+  BridgeThread& thread = t_bridge;
+  if (thread.owned_envs == nullptr) {
+    thread.owned_envs = new std::unordered_set<SnapiEnvState*>();
   }
-  t_owned_envs->insert(state);
+  thread.owned_envs->insert(state);
 }
 
 void ForgetOnThisThread(SnapiEnvState* state) {
-  if (t_last_owned_env == state) t_last_owned_env = nullptr;
-  if (t_owned_envs == nullptr) return;
-  t_owned_envs->erase(state);
-  if (t_owned_envs->empty()) {
-    delete t_owned_envs;
-    t_owned_envs = nullptr;
+  BridgeThread& thread = t_bridge;
+  if (thread.last_owned_env == state) thread.last_owned_env = nullptr;
+  if (thread.owned_envs == nullptr) return;
+  thread.owned_envs->erase(state);
+  if (thread.owned_envs->empty()) {
+    delete thread.owned_envs;
+    thread.owned_envs = nullptr;
   }
 }
 
@@ -495,14 +553,17 @@ CallbackBinding* RegisterCallbackBinding(SnapiEnvState* state, uint32_t reg_id) 
   return state->callback_bindings.back().get();
 }
 
-SnapiEnvState* LookupEnvState(SnapiEnvState* env_state) {
-  if (env_state == nullptr) return nullptr;
+SNAPI_ALWAYS_INLINE SnapiEnvState* LookupEnvState(BridgeThread& thread, SnapiEnvState* env_state) {
   // The pointer originates from the guest (via the Rust env-id layer); gate it
   // on live-env membership before the first dereference so a stale or forged
   // env handle fails cleanly instead of touching freed memory. Only envs this
   // thread owns are usable here; other threads get null.
-  if (!OwnedByThisThread(env_state) || env_state->env == nullptr) return nullptr;
+  if (!OwnedByThread(thread, env_state) || env_state->env == nullptr) return nullptr;
   return env_state;
+}
+
+SnapiEnvState* LookupEnvState(SnapiEnvState* env_state) {
+  return LookupEnvState(t_bridge, env_state);
 }
 
 uint32_t RegisterCallbackInvocation(SnapiEnvState* state, napi_callback_info info) {
@@ -535,8 +596,9 @@ ScopeFrame& CurrentFrame(SnapiEnvState& state) {
 }
 
 // Pushes the frame for a napi scope `state` just opened, above the root
-// frame. The frame records that env, which must also close the scope. It
-// reuses a popped frame's buffer, so a callback doesn't allocate one per call.
+// frame. The frame records that env, which must also close the scope. Both
+// scopes null: a frame that only owns ids (a guest callback's, whose Locals
+// V8's own scope around the callback reclaims).
 ScopeFrame& PushScopeFrame(SnapiEnvState& state, napi_handle_scope scope,
                            napi_escapable_handle_scope esc_scope) {
   (void)CurrentFrame(state);
@@ -545,29 +607,24 @@ ScopeFrame& PushScopeFrame(SnapiEnvState& state, napi_handle_scope scope,
   frame.scope = scope;
   frame.esc_scope = esc_scope;
   frame.env = state.env;
-  if (!agent.spare_owned_slots.empty()) {
-    frame.owned_slots = std::move(agent.spare_owned_slots.back());
-    agent.spare_owned_slots.pop_back();
-  }
+  frame.slots_begin = static_cast<uint32_t>(agent.owned_slots.size());
   return frame;
 }
 
-// Mints an id for `val` owned by `frame`. The common path stores into the
-// innermost frame; escape_handle stores into the parent of the escaped scope.
-uint32_t StoreValueInFrame(SnapiEnvState& state, napi_value val, ScopeFrame& frame) {
-  if (val == nullptr) return 0;
-  if (state.env == nullptr) return 0;
-  SnapiAgentState& agent = *state.agent;
+// Takes a free slot for `val` and returns its index, or kNoSlot if the table
+// is full or the bookkeeping account refused a new slot. No frame owns the
+// slot yet.
+SNAPI_ALWAYS_INLINE uint32_t TakeValueSlot(SnapiAgentState& agent, napi_value val) {
   uint32_t index;
-  if (!agent.value_free_slots.empty()) {
+  if (!agent.value_free_slots.empty()) [[likely]] {
     index = agent.value_free_slots.back();
     agent.value_free_slots.pop_back();
   } else {
-    if (agent.value_slots.size() >= kValueIdMaxSlots) return 0;
+    if (agent.value_slots.size() >= kValueIdMaxSlots) return kNoSlot;
     // The slot table only grows: a slot is charged when it is created, and
     // the agent's release returns the charge. Returning 0 surfaces as an
     // N-API failure the guest can handle.
-    if (!agent.bookkeeping.Charge()) return 0;
+    if (!agent.bookkeeping.Charge()) return kNoSlot;
     index = static_cast<uint32_t>(agent.value_slots.size());
     agent.value_slots.emplace_back();
   }
@@ -575,12 +632,95 @@ uint32_t StoreValueInFrame(SnapiEnvState& state, napi_value val, ScopeFrame& fra
   slot.value = val;
   slot.in_use = true;
   ++agent.live_value_count;
-  frame.owned_slots.push_back(index);
-  return ((index + 1) << kValueIdGenBits) | slot.generation;
+  return index;
 }
 
-uint32_t StoreValue(SnapiEnvState& state, napi_value val) {
-  return StoreValueInFrame(state, val, CurrentFrame(state));
+SNAPI_ALWAYS_INLINE uint32_t ValueIdOfSlot(const SnapiAgentState& agent, uint32_t index) {
+  return ((index + 1) << kValueIdGenBits) | agent.value_slots[index].generation;
+}
+
+// Mints an id for `val`, owned by the innermost frame.
+SNAPI_ALWAYS_INLINE uint32_t StoreValue(SnapiEnvState& state, napi_value val) {
+  if (val == nullptr) return 0;
+  if (state.env == nullptr) return 0;
+  SnapiAgentState& agent = *state.agent;
+  if (agent.scope_frames.empty()) [[unlikely]] agent.scope_frames.emplace_back();
+  const uint32_t index = TakeValueSlot(agent, val);
+  if (index == kNoSlot) [[unlikely]] return 0;
+  agent.owned_slots.push_back(index);
+  return ValueIdOfSlot(agent, index);
+}
+
+SNAPI_ALWAYS_INLINE void FreeValueSlot(SnapiAgentState& agent, uint32_t index);
+
+// Mints an id for the value escaped from the escapable frame `frame`. The
+// frame below owns it, once `frame` closes (see ScopeFrame::escaped_slot).
+uint32_t StoreEscapedValue(SnapiEnvState& state, napi_value val, ScopeFrame& frame) {
+  if (val == nullptr) return 0;
+  if (state.env == nullptr) return 0;
+  SnapiAgentState& agent = *state.agent;
+  const uint32_t index = TakeValueSlot(agent, val);
+  if (index == kNoSlot) return 0;
+  // The provider lets a scope escape once, so nothing is there; were that to
+  // change, the earlier value's id is retired here.
+  if (frame.escaped_slot != kNoSlot) FreeValueSlot(agent, frame.escaped_slot);
+  frame.escaped_slot = index;
+  return ValueIdOfSlot(agent, index);
+}
+
+napi_status ProviderSingleton(napi_env env, int which, napi_value* result) {
+  switch (which) {
+    case 0: return napi_get_undefined(env, result);
+    case 1: return napi_get_null(env, result);
+    default: return napi_get_boolean(env, which == 3, result);
+  }
+}
+
+// First use of a singleton primitive (see StoreSingleton), or the provider's
+// handle is not the one remembered.
+SNAPI_NOINLINE uint32_t StoreSingletonSlow(SnapiEnvState& state, int which, napi_value val) {
+  SnapiAgentState& agent = *state.agent;
+  if (val == nullptr || state.env == nullptr) return 0;
+  if (!agent.singletons_unstable && agent.singleton_ids[which] == 0) {
+    // V8 hands out the address of the isolate's root for these, which lives
+    // as long as the isolate. Check that instead of assuming it: asked twice
+    // more under a scope of its own, handles of that scope would be two new
+    // addresses, a root is `val` both times.
+    bool stable = false;
+    {
+      v8::HandleScope probe(state.env->isolate);
+      napi_value first = nullptr;
+      napi_value second = nullptr;
+      stable = ProviderSingleton(state.env, which, &first) == napi_ok &&
+               ProviderSingleton(state.env, which, &second) == napi_ok &&
+               first == val && second == val;
+    }
+    if (stable) {
+      const uint32_t index = TakeValueSlot(agent, val);
+      if (index == kNoSlot) return 0;
+      // Not a value some frame will retire: keep it out of the live count,
+      // which leak checks compare across scopes.
+      --agent.live_value_count;
+      agent.singleton_values[which] = val;
+      agent.singleton_ids[which] = ValueIdOfSlot(agent, index);
+      return agent.singleton_ids[which];
+    }
+    agent.singletons_unstable = true;
+  }
+  return StoreValue(state, val);
+}
+
+// Mints the id of one of V8's singleton primitives (`which`: 0 undefined,
+// 1 null, 2 false, 3 true) from the provider's handle `val` for it. Their
+// handles do not belong to a handle scope, so one id per agent serves every
+// call and is never retired: a guest that asks for undefined in a loop gets
+// one id, not one slot per call.
+SNAPI_ALWAYS_INLINE uint32_t StoreSingleton(SnapiEnvState& state, int which, napi_value val) {
+  const SnapiAgentState& agent = *state.agent;
+  if (agent.singleton_ids[which] != 0 && agent.singleton_values[which] == val) [[likely]] {
+    return agent.singleton_ids[which];
+  }
+  return StoreSingletonSlow(state, which, val);
 }
 
 napi_value LoadValue(SnapiEnvState& state, uint32_t id) {
@@ -602,7 +742,7 @@ napi_value LoadValue(SnapiEnvState& state, uint32_t id) {
 // Releases a slot and bumps its generation so any id minted for the old
 // occupant is rejected by LoadValue. The Local itself dies when the owning
 // napi scope closes; this only retires the id.
-void FreeValueSlot(SnapiAgentState& agent, uint32_t index) {
+SNAPI_ALWAYS_INLINE void FreeValueSlot(SnapiAgentState& agent, uint32_t index) {
   ValueSlot& slot = agent.value_slots[index];
   if (!slot.in_use) return;
   slot.value = nullptr;
@@ -615,23 +755,33 @@ void FreeValueSlot(SnapiAgentState& agent, uint32_t index) {
 // Frees every slot the innermost frame owns and pops it. Closes the frame's
 // napi scope (which kills the backing Locals) unless `close_napi_scope` is
 // false (env-teardown drain, where release_env reclaims the whole env).
-void PopCurrentFrame(SnapiEnvState& state, bool close_napi_scope) {
+SNAPI_ALWAYS_INLINE void PopFrame(SnapiEnvState& state, bool close_napi_scope) {
   SnapiAgentState& agent = *state.agent;
   if (agent.scope_frames.empty()) return;
-  ScopeFrame frame = std::move(agent.scope_frames.back());
+  const ScopeFrame frame = agent.scope_frames.back();
   agent.scope_frames.pop_back();
-  for (uint32_t index : frame.owned_slots) {
-    FreeValueSlot(agent, index);
+  std::vector<uint32_t>& owned = agent.owned_slots;
+  const size_t begin = std::min<size_t>(frame.slots_begin, owned.size());
+  for (size_t i = begin; i < owned.size(); ++i) {
+    FreeValueSlot(agent, owned[i]);
   }
-  // Keep a few small buffers for the next frames; drop large ones so one
-  // big scope does not pin its memory for the agent's lifetime.
-  constexpr size_t kMaxSpareFrames = 8;
-  constexpr size_t kMaxSpareCapacity = 256;
-  if (agent.spare_owned_slots.size() < kMaxSpareFrames &&
-      frame.owned_slots.capacity() != 0 &&
-      frame.owned_slots.capacity() <= kMaxSpareCapacity) {
-    frame.owned_slots.clear();
-    agent.spare_owned_slots.push_back(std::move(frame.owned_slots));
+  owned.erase(owned.begin() + begin, owned.end());
+  // One big scope must not pin its buffer for the agent's lifetime.
+  constexpr size_t kKeepCapacity = 1024;
+  if (owned.capacity() > kKeepCapacity && owned.size() < owned.capacity() / 4) [[unlikely]] {
+    std::vector<uint32_t> smaller;
+    smaller.reserve(std::max<size_t>(owned.size() * 2, kKeepCapacity / 4));
+    smaller.assign(owned.begin(), owned.end());
+    owned.swap(smaller);
+  }
+  if (frame.escaped_slot != kNoSlot) {
+    // The frame below owns the escaped value from here on. (Only a frame
+    // above the root can be escaped from, so there is one.)
+    if (agent.scope_frames.empty()) {
+      FreeValueSlot(agent, frame.escaped_slot);
+    } else {
+      owned.push_back(frame.escaped_slot);
+    }
   }
   if (close_napi_scope && state.env != nullptr && frame.env != nullptr) {
     if (frame.esc_scope != nullptr) {
@@ -640,6 +790,10 @@ void PopCurrentFrame(SnapiEnvState& state, bool close_napi_scope) {
       (void)napi_close_handle_scope(frame.env, frame.scope);
     }
   }
+}
+
+SNAPI_NOINLINE void PopCurrentFrame(SnapiEnvState& state, bool close_napi_scope) {
+  PopFrame(state, close_napi_scope);
 }
 
 uint64_t BackingStoreToken(const std::shared_ptr<v8::BackingStore>& backing_store) {
@@ -807,6 +961,29 @@ void RemoveBytecodeHandle(SnapiEnvState& state, uint32_t id) {
   state.agent->bytecode_handles.Remove(id);
 }
 
+// The values of a call's arguments, on the stack for the usual counts: a
+// call with arguments does not allocate for them.
+class CallArguments {
+ public:
+  explicit CallArguments(uint32_t argc) {
+    if (argc > kInline) {
+      heap_.resize(argc);
+      data_ = heap_.data();
+    }
+  }
+  CallArguments(const CallArguments&) = delete;
+  CallArguments& operator=(const CallArguments&) = delete;
+
+  napi_value& operator[](uint32_t index) { return data_[index]; }
+  napi_value* data() { return data_; }
+
+ private:
+  static constexpr uint32_t kInline = 8;
+  napi_value inline_[kInline];
+  std::vector<napi_value> heap_;
+  napi_value* data_ = inline_;
+};
+
 // Binds an agent's instance lane to this thread, restoring the previous
 // binding on exit. Stores of different instances can share an OS thread.
 class AgentLaneScope {
@@ -838,8 +1015,14 @@ void ReconcileHeapLease(SnapiAgentState& agent, napi_env env);
 // (no bridge call is on the stack); a nested call for another isolate enters
 // it for its own duration only. DisposeBridgeState leaves the resident
 // isolate before the isolate goes.
-thread_local v8::Isolate* t_resident_isolate = nullptr;
-thread_local uint32_t t_bridge_depth = 0;
+//
+// The lane binding follows the same idea at no cost in generality: the call
+// binds its lane with one swap and gives the previous binding back only if
+// it was another one. Everything that binds a lane inside a bridge call (a
+// nested call, the Rust host's ManagedV8LaneScope around an env's creation,
+// the platform's lane worker loop) is lexically scoped and restores what it
+// found, so when the previous binding was this lane already, it still is
+// when the call returns.
 
 // True when `isolate` is this thread's resident isolate but another isolate
 // is entered above it, so it cannot be left yet. A nested bridge call enters
@@ -848,18 +1031,19 @@ thread_local uint32_t t_bridge_depth = 0;
 // the provider leaves an idle resident isolate before it creates an env. So
 // only an isolate the host entered itself with V8's API can bury it.
 bool ResidentIsolateBuried(v8::Isolate* isolate) {
-  return isolate != nullptr && t_resident_isolate == isolate &&
+  return isolate != nullptr && t_bridge.resident_isolate == isolate &&
          v8::Isolate::TryGetCurrent() != isolate;
 }
 
 // Leaves `isolate` if it is this thread's resident isolate and the current
 // one. A buried resident isolate stays entered (see ResidentIsolateBuried).
 void LeaveResidentIsolate(v8::Isolate* isolate) {
-  if (isolate == nullptr || t_resident_isolate != isolate ||
+  BridgeThread& thread = t_bridge;
+  if (isolate == nullptr || thread.resident_isolate != isolate ||
       v8::Isolate::TryGetCurrent() != isolate) {
     return;
   }
-  t_resident_isolate = nullptr;
+  thread.resident_isolate = nullptr;
   isolate->Exit();
 }
 
@@ -868,54 +1052,102 @@ void LeaveResidentIsolate(v8::Isolate* isolate) {
 // where a bridge env ran. With no bridge call on the stack, nothing uses the
 // resident isolate, so leave it; a later bridge call enters it again.
 void LeaveIdleResidentIsolate() {
-  if (t_bridge_depth == 0) LeaveResidentIsolate(t_resident_isolate);
+  BridgeThread& thread = t_bridge;
+  if (thread.bridge_depth == 0) LeaveResidentIsolate(thread.resident_isolate);
 }
 
 [[maybe_unused]] const bool g_isolate_entry_hook_installed =
     (NapiV8SetIsolateEntryHook(&LeaveIdleResidentIsolate), true);
 
-class BridgeEnvScope {
+// The common case costs one thread-local lookup, one lane swap and one
+// question to V8 (which isolate is current); the rest is out of line.
+//
+// `kFull` is false for the calls whose import may run on the Wasm stack it
+// was called from (napi_import_runs_in_place in src/guest/napi.rs;
+// InPlaceBridgeEnvScope below). They allocate nothing on the V8 heap, run no
+// JavaScript, throw nothing and call no guest function, so:
+// - they cannot have caused a heap lease; one that is pending was taken by
+//   JavaScript further up, whose interrupt or enclosing bridge call
+//   reconciles it. Leaving it keeps V8's heap controls, which reconciling
+//   uses, off the Wasm stack;
+// - they bind no lane: the platform reads the thread's lane only when V8
+//   posts a task or an env is created, and these calls do neither.
+template <bool kFull>
+class BridgeEnvScopeT {
  public:
-  explicit BridgeEnvScope(SnapiEnvState* state) : state_(LookupEnvState(state)) {
+  SNAPI_ALWAYS_INLINE explicit BridgeEnvScopeT(SnapiEnvState* state) {
+    BridgeThread& thread = t_bridge;
+    state_ = LookupEnvState(thread, state);
     if (state_ == nullptr) return;
-    ++t_bridge_depth;
-    // A WASIX thread can predate the platform's JIT key.
+    thread_ = &thread;
+    ++thread.bridge_depth;
+#if defined(__linux__) && defined(__x86_64__)
+    // A WASIX thread can predate the platform's JIT key. (A no-op elsewhere.)
     EdgeV8AllowJitKeyReads();
-    lane_scope_.emplace(state_->agent);
+#endif
+    if (kFull) {
+      lane_ = state_->agent->background_lane;
+      previous_lane_ = snapi_v8_lane_swap_current(lane_);
+    }
     v8::Isolate* isolate = state_->env->isolate;
     v8::Isolate* current = v8::Isolate::TryGetCurrent();
-    if (current == isolate) return;
-    if (t_bridge_depth == 1 && (current == nullptr || current == t_resident_isolate)) {
-      // Nothing of this thread runs in the resident isolate: switch it.
-      if (current != nullptr) current->Exit();
-      isolate->Enter();
-      t_resident_isolate = isolate;
-      return;
-    }
-    // A nested call for another isolate, or one someone else entered.
-    isolate_scope_.emplace(isolate);
+    if (current != isolate) [[unlikely]] EnterIsolate(isolate, current);
   }
   // The call's allocations are done: a heap lease V8 needed for one of them
   // is reconciled now, also for calls that run no JavaScript (where the
   // lease's interrupt would wait for the next one).
-  ~BridgeEnvScope() {
+  SNAPI_ALWAYS_INLINE ~BridgeEnvScopeT() {
     if (state_ == nullptr) return;
-    --t_bridge_depth;
-    if (state_->agent != nullptr && state_->agent->heap_lease_pending &&
-        state_->env != nullptr) {
+    --thread_->bridge_depth;
+    if (kFull && state_->agent != nullptr && state_->agent->heap_lease_pending &&
+        state_->env != nullptr) [[unlikely]] {
       ReconcileHeapLease(*state_->agent, state_->env);
     }
+    if (entered_isolate_ != nullptr) [[unlikely]] entered_isolate_->Exit();
+    if (!kFull) return;
+#if defined(SNAPI_BRIDGE_SELF_CHECK)
+    // What skipping the restore below relies on.
+    if (snapi_v8_lane_current() != lane_) {
+      std::fprintf(stderr, "SNAPI SELF CHECK: a bridge call returned with another lane bound\n");
+      std::abort();
+    }
+#endif
+    if (previous_lane_ != lane_) [[unlikely]] snapi_v8_lane_swap_current(previous_lane_);
   }
-  BridgeEnvScope(const BridgeEnvScope&) = delete;
-  BridgeEnvScope& operator=(const BridgeEnvScope&) = delete;
+  BridgeEnvScopeT(const BridgeEnvScopeT&) = delete;
+  BridgeEnvScopeT& operator=(const BridgeEnvScopeT&) = delete;
 
   SnapiEnvState* get() const { return state_; }
 
  private:
+  SNAPI_NOINLINE void EnterIsolate(v8::Isolate* isolate, v8::Isolate* current) {
+    if (thread_->bridge_depth == 1 &&
+        (current == nullptr || current == thread_->resident_isolate)) {
+      // Nothing of this thread runs in the resident isolate: switch it.
+      if (current != nullptr) current->Exit();
+      isolate->Enter();
+      thread_->resident_isolate = isolate;
+      return;
+    }
+    // A nested call for another isolate, or one someone else entered.
+    isolate->Enter();
+    entered_isolate_ = isolate;
+  }
+
   SnapiEnvState* state_;
-  std::optional<AgentLaneScope> lane_scope_;
-  std::optional<v8::Isolate::Scope> isolate_scope_;
+  // The rest is set only when state_ is.
+  BridgeThread* thread_;
+  // Only for kFull.
+  void* lane_;
+  void* previous_lane_;
+  // The isolate this call entered for its own duration, if any.
+  v8::Isolate* entered_isolate_ = nullptr;
 };
+
+using BridgeEnvScope = BridgeEnvScopeT<true>;
+// For a bridge function behind an import that may run in place: it must not
+// allocate on the V8 heap, run JavaScript, throw or call the guest.
+using InPlaceBridgeEnvScope = BridgeEnvScopeT<false>;
 
 // Tears down the agent `state` belongs to, with every env on it: release_env
 // takes the provider owner, which disposes the whole isolate.
@@ -953,7 +1185,11 @@ napi_status DisposeBridgeState(SnapiEnvState* state) {
     }
     agent->value_slots.clear();
     agent->value_free_slots.clear();
+    agent->owned_slots.clear();
     agent->live_value_count = 0;
+    // Their slots are gone with the table; finalizers the release runs mint
+    // them again.
+    for (uint32_t& id : agent->singleton_ids) id = 0;
     agent->next_scope_id = 1;
     agent->refs.clear();
     agent->next_ref_id = 1;
@@ -1071,43 +1307,43 @@ extern "C" void snapi_bridge_set_foreground_task_waker(void (*waker)()) {
 // ============================================================
 
 extern "C" int snapi_bridge_get_undefined(SnapiEnvState* env_state, uint32_t* out_id) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result;
   napi_status s = napi_get_undefined(env, &result);
   if (s != napi_ok) return s;
-  *out_id = StoreValue(*bridge_state, result);
+  *out_id = StoreSingleton(*bridge_state, 0, result);
   return napi_ok;
 }
 
 extern "C" int snapi_bridge_get_null(SnapiEnvState* env_state, uint32_t* out_id) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result;
   napi_status s = napi_get_null(env, &result);
   if (s != napi_ok) return s;
-  *out_id = StoreValue(*bridge_state, result);
+  *out_id = StoreSingleton(*bridge_state, 1, result);
   return napi_ok;
 }
 
 extern "C" int snapi_bridge_get_boolean(SnapiEnvState* env_state, int value, uint32_t* out_id) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_value result;
   napi_status s = napi_get_boolean(env, value != 0, &result);
   if (s != napi_ok) return s;
-  *out_id = StoreValue(*bridge_state, result);
+  *out_id = StoreSingleton(*bridge_state, value != 0 ? 3 : 2, result);
   return napi_ok;
 }
 
 extern "C" int snapi_bridge_get_global(SnapiEnvState* env_state, uint32_t* out_id) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -1145,6 +1381,24 @@ extern "C" int snapi_bridge_create_string_latin1(SnapiEnvState* env_state, const
       (wasm_length == 0xFFFFFFFFu) ? NAPI_AUTO_LENGTH : (size_t)wasm_length;
   napi_value result;
   napi_status s = napi_create_string_latin1(env, str, length, &result);
+  if (s != napi_ok) return s;
+  *out_id = StoreValue(*bridge_state, result);
+  return napi_ok;
+}
+
+// The number `value` when V8 holds it as a small integer, which takes a
+// handle and no heap allocation, so that the import can run on the Wasm stack
+// (see InPlaceBridgeEnvScope); -1 (SNAPI_NOT_A_SMALL_INTEGER) when V8 would
+// allocate a heap number, which the import then creates on the host stack.
+extern "C" int snapi_bridge_create_small_integer(SnapiEnvState* env_state, int32_t value,
+                                                 uint32_t* out_id) {
+  if (!v8::internal::Internals::IsValidSmi(value)) return -1;
+  InPlaceBridgeEnvScope env_scope(env_state);
+  auto* bridge_state = env_scope.get();
+  if (bridge_state == nullptr) return napi_invalid_arg;
+  napi_env env = bridge_state->env;
+  napi_value result;
+  napi_status s = napi_create_int32(env, value, &result);
   if (s != napi_ok) return s;
   *out_id = StoreValue(*bridge_state, result);
   return napi_ok;
@@ -1264,7 +1518,7 @@ extern "C" int snapi_bridge_get_value_string_latin1(SnapiEnvState* env_state, ui
 }
 
 extern "C" int snapi_bridge_get_value_int32(SnapiEnvState* env_state, uint32_t id, int32_t* result) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -1274,7 +1528,7 @@ extern "C" int snapi_bridge_get_value_int32(SnapiEnvState* env_state, uint32_t i
 }
 
 extern "C" int snapi_bridge_get_value_uint32(SnapiEnvState* env_state, uint32_t id, uint32_t* result) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -1284,7 +1538,7 @@ extern "C" int snapi_bridge_get_value_uint32(SnapiEnvState* env_state, uint32_t 
 }
 
 extern "C" int snapi_bridge_get_value_double(SnapiEnvState* env_state, uint32_t id, double* result) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -1294,7 +1548,7 @@ extern "C" int snapi_bridge_get_value_double(SnapiEnvState* env_state, uint32_t 
 }
 
 extern "C" int snapi_bridge_get_value_int64(SnapiEnvState* env_state, uint32_t id, int64_t* result) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -1304,7 +1558,7 @@ extern "C" int snapi_bridge_get_value_int64(SnapiEnvState* env_state, uint32_t i
 }
 
 extern "C" int snapi_bridge_get_value_bool(SnapiEnvState* env_state, uint32_t id, int* result) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -1322,7 +1576,7 @@ extern "C" int snapi_bridge_get_value_bool(SnapiEnvState* env_state, uint32_t id
 // ============================================================
 
 extern "C" int snapi_bridge_typeof(SnapiEnvState* env_state, uint32_t id, int* result) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -1336,7 +1590,7 @@ extern "C" int snapi_bridge_typeof(SnapiEnvState* env_state, uint32_t id, int* r
 }
 
 extern "C" int snapi_bridge_is_array(SnapiEnvState* env_state, uint32_t id, int* result) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -1350,7 +1604,7 @@ extern "C" int snapi_bridge_is_array(SnapiEnvState* env_state, uint32_t id, int*
 }
 
 extern "C" int snapi_bridge_is_error(SnapiEnvState* env_state, uint32_t id, int* result) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -1364,7 +1618,7 @@ extern "C" int snapi_bridge_is_error(SnapiEnvState* env_state, uint32_t id, int*
 }
 
 extern "C" int snapi_bridge_is_arraybuffer(SnapiEnvState* env_state, uint32_t id, int* result) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -1378,7 +1632,7 @@ extern "C" int snapi_bridge_is_arraybuffer(SnapiEnvState* env_state, uint32_t id
 }
 
 extern "C" int snapi_bridge_is_typedarray(SnapiEnvState* env_state, uint32_t id, int* result) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -1392,7 +1646,7 @@ extern "C" int snapi_bridge_is_typedarray(SnapiEnvState* env_state, uint32_t id,
 }
 
 extern "C" int snapi_bridge_is_dataview(SnapiEnvState* env_state, uint32_t id, int* result) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -1406,7 +1660,7 @@ extern "C" int snapi_bridge_is_dataview(SnapiEnvState* env_state, uint32_t id, i
 }
 
 extern "C" int snapi_bridge_is_date(SnapiEnvState* env_state, uint32_t id, int* result) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -1420,7 +1674,7 @@ extern "C" int snapi_bridge_is_date(SnapiEnvState* env_state, uint32_t id, int* 
 }
 
 extern "C" int snapi_bridge_is_promise(SnapiEnvState* env_state, uint32_t id, int* result) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -1590,9 +1844,14 @@ extern "C" int snapi_bridge_delete_property(SnapiEnvState* env_state, uint32_t o
   return napi_ok;
 }
 
-extern "C" int snapi_bridge_set_named_property(SnapiEnvState* env_state, uint32_t obj_id,
-                                               const char* name,
-                                               uint32_t val_id) {
+// The named-property calls take the name's number with it: `name_key` is the
+// host's process-unique id for the bytes at `name`, 0 for a name it did not
+// number, and `name_slot` where the isolate keeps that name's string
+// (napi_v8_*_named_property_keyed). A numbered name is not made into a V8
+// string again on each call.
+extern "C" int snapi_bridge_set_named_property_keyed(SnapiEnvState* env_state, uint32_t obj_id,
+                                                     const char* name, uint32_t name_slot,
+                                                     uint64_t name_key, uint32_t val_id) {
   BridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
@@ -1600,12 +1859,18 @@ extern "C" int snapi_bridge_set_named_property(SnapiEnvState* env_state, uint32_
   napi_value obj = LoadValue(*bridge_state, obj_id);
   napi_value val = LoadValue(*bridge_state, val_id);
   if (!obj || !val || !name) return napi_invalid_arg;
-  return napi_set_named_property(env, obj, name, val);
+  return napi_v8_set_named_property_keyed(env, obj, name, name_slot, name_key, val);
 }
 
-extern "C" int snapi_bridge_get_named_property(SnapiEnvState* env_state, uint32_t obj_id,
+extern "C" int snapi_bridge_set_named_property(SnapiEnvState* env_state, uint32_t obj_id,
                                                const char* name,
-                                               uint32_t* out_id) {
+                                               uint32_t val_id) {
+  return snapi_bridge_set_named_property_keyed(env_state, obj_id, name, 0, 0, val_id);
+}
+
+extern "C" int snapi_bridge_get_named_property_keyed(SnapiEnvState* env_state, uint32_t obj_id,
+                                                     const char* name, uint32_t name_slot,
+                                                     uint64_t name_key, uint32_t* out_id) {
   BridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
@@ -1613,15 +1878,21 @@ extern "C" int snapi_bridge_get_named_property(SnapiEnvState* env_state, uint32_
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj || !name) return napi_invalid_arg;
   napi_value result;
-  napi_status s = napi_get_named_property(env, obj, name, &result);
+  napi_status s = napi_v8_get_named_property_keyed(env, obj, name, name_slot, name_key, &result);
   if (s != napi_ok) return s;
   *out_id = StoreValue(*bridge_state, result);
   return napi_ok;
 }
 
-extern "C" int snapi_bridge_has_named_property(SnapiEnvState* env_state, uint32_t obj_id,
+extern "C" int snapi_bridge_get_named_property(SnapiEnvState* env_state, uint32_t obj_id,
                                                const char* name,
-                                               int* result) {
+                                               uint32_t* out_id) {
+  return snapi_bridge_get_named_property_keyed(env_state, obj_id, name, 0, 0, out_id);
+}
+
+extern "C" int snapi_bridge_has_named_property_keyed(SnapiEnvState* env_state, uint32_t obj_id,
+                                                     const char* name, uint32_t name_slot,
+                                                     uint64_t name_key, int* result) {
   BridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
@@ -1629,10 +1900,16 @@ extern "C" int snapi_bridge_has_named_property(SnapiEnvState* env_state, uint32_
   napi_value obj = LoadValue(*bridge_state, obj_id);
   if (!obj || !name) return napi_invalid_arg;
   bool has;
-  napi_status s = napi_has_named_property(env, obj, name, &has);
+  napi_status s = napi_v8_has_named_property_keyed(env, obj, name, name_slot, name_key, &has);
   if (s != napi_ok) return s;
   *result = has ? 1 : 0;
   return napi_ok;
+}
+
+extern "C" int snapi_bridge_has_named_property(SnapiEnvState* env_state, uint32_t obj_id,
+                                               const char* name,
+                                               int* result) {
+  return snapi_bridge_has_named_property_keyed(env_state, obj_id, name, 0, 0, result);
 }
 
 extern "C" int snapi_bridge_set_element(SnapiEnvState* env_state, uint32_t obj_id, uint32_t index,
@@ -1694,7 +1971,7 @@ extern "C" int snapi_bridge_delete_element(SnapiEnvState* env_state, uint32_t ob
 
 extern "C" int snapi_bridge_get_array_length(SnapiEnvState* env_state, uint32_t arr_id,
                                              uint32_t* result) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -1777,7 +2054,7 @@ extern "C" int snapi_bridge_object_seal(SnapiEnvState* env_state, uint32_t obj_i
 
 extern "C" int snapi_bridge_strict_equals(SnapiEnvState* env_state, uint32_t a_id, uint32_t b_id,
                                           int* result) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -1882,7 +2159,7 @@ extern "C" int snapi_bridge_throw_range_error(SnapiEnvState* env_state, const ch
 }
 
 extern "C" int snapi_bridge_is_exception_pending(SnapiEnvState* env_state, int* result) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -1955,7 +2232,7 @@ extern "C" int snapi_bridge_create_bigint_uint64(SnapiEnvState* env_state, uint6
 
 extern "C" int snapi_bridge_get_value_bigint_int64(SnapiEnvState* env_state, uint32_t id, int64_t* value,
                                                    int* lossless) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -1971,7 +2248,7 @@ extern "C" int snapi_bridge_get_value_bigint_int64(SnapiEnvState* env_state, uin
 extern "C" int snapi_bridge_get_value_bigint_uint64(SnapiEnvState* env_state, uint32_t id,
                                                     uint64_t* value,
                                                     int* lossless) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -2001,7 +2278,7 @@ extern "C" int snapi_bridge_create_date(SnapiEnvState* env_state, double time, u
 }
 
 extern "C" int snapi_bridge_get_date_value(SnapiEnvState* env_state, uint32_t id, double* result) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -2561,7 +2838,7 @@ extern "C" int snapi_bridge_create_external(SnapiEnvState* env_state, uint64_t d
 
 extern "C" int snapi_bridge_get_value_external(SnapiEnvState* env_state, uint32_t id,
                                                uint64_t* data_out) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -2632,7 +2909,7 @@ extern "C" int snapi_bridge_reference_unref(SnapiEnvState* env_state, uint32_t r
 
 extern "C" int snapi_bridge_get_reference_value(SnapiEnvState* env_state, uint32_t ref_id,
                                                 uint32_t* out_id) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -2650,7 +2927,7 @@ extern "C" int snapi_bridge_get_reference_value(SnapiEnvState* env_state, uint32
 // ============================================================
 
 extern "C" int snapi_bridge_open_handle_scope(SnapiEnvState* env_state, uint32_t* scope_out) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -2666,7 +2943,7 @@ extern "C" int snapi_bridge_open_handle_scope(SnapiEnvState* env_state, uint32_t
 }
 
 extern "C" int snapi_bridge_close_handle_scope(SnapiEnvState* env_state, uint32_t scope_id) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   const int idx = FindFrameById(*bridge_state, scope_id);
@@ -2684,7 +2961,7 @@ extern "C" int snapi_bridge_close_handle_scope(SnapiEnvState* env_state, uint32_
 }
 
 extern "C" int snapi_bridge_open_escapable_handle_scope(SnapiEnvState* env_state, uint32_t* scope_out) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -2700,7 +2977,7 @@ extern "C" int snapi_bridge_open_escapable_handle_scope(SnapiEnvState* env_state
 }
 
 extern "C" int snapi_bridge_close_escapable_handle_scope(SnapiEnvState* env_state, uint32_t scope_id) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   const int idx = FindFrameById(*bridge_state, scope_id);
@@ -2718,7 +2995,7 @@ extern "C" int snapi_bridge_close_escapable_handle_scope(SnapiEnvState* env_stat
 extern "C" int snapi_bridge_escape_handle(SnapiEnvState* env_state, uint32_t scope_id,
                                           uint32_t escapee_id,
                                           uint32_t* out_id) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -2735,7 +3012,7 @@ extern "C" int snapi_bridge_escape_handle(SnapiEnvState* env_state, uint32_t sco
   napi_status s =
       napi_escape_handle(env, frames[idx].esc_scope, escapee, &result);
   if (s != napi_ok) return s;
-  *out_id = StoreValueInFrame(*bridge_state, result, frames[idx - 1]);
+  *out_id = StoreEscapedValue(*bridge_state, result, frames[idx]);
   return napi_ok;
 }
 
@@ -2793,14 +3070,21 @@ extern "C" int snapi_bridge_call_function(SnapiEnvState* env_state, uint32_t rec
   napi_value recv = LoadValue(*bridge_state, recv_id);
   napi_value func = LoadValue(*bridge_state, func_id);
   if (!recv || !func) return napi_invalid_arg;
-  std::vector<napi_value> argv(argc);
+  // Most calls pass a few arguments: keep those off the heap.
+  napi_value inline_argv[16];
+  std::vector<napi_value> heap_argv;
+  napi_value* argv = inline_argv;
+  if (argc > std::size(inline_argv)) {
+    heap_argv.resize(argc);
+    argv = heap_argv.data();
+  }
   for (uint32_t i = 0; i < argc; i++) {
     argv[i] = LoadValue(*bridge_state, argv_ids[i]);
     if (!argv[i]) return napi_invalid_arg;
   }
   napi_value result;
   napi_status s =
-      napi_call_function(env, recv, func, argc, argv.data(), &result);
+      napi_call_function(env, recv, func, argc, argv, &result);
   if (s != napi_ok) return s;
   *out_id = StoreValue(*bridge_state, result);
   return napi_ok;
@@ -2966,7 +3250,7 @@ extern "C" int snapi_bridge_create_buffer_copy(SnapiEnvState* env_state, uint32_
 }
 
 extern "C" int snapi_bridge_is_buffer(SnapiEnvState* env_state, uint32_t id, int* result) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -3275,7 +3559,7 @@ extern "C" int snapi_bridge_new_instance(SnapiEnvState* env_state, uint32_t ctor
   napi_env env = bridge_state->env;
   napi_value ctor = LoadValue(*bridge_state, ctor_id);
   if (!ctor) return napi_invalid_arg;
-  std::vector<napi_value> argv(argc);
+  CallArguments argv(argc);
   for (uint32_t i = 0; i < argc; i++) {
     argv[i] = LoadValue(*bridge_state, argv_ids[i]);
     if (!argv[i]) return napi_invalid_arg;
@@ -3448,8 +3732,17 @@ extern "C" int snapi_bridge_get_cb_info(SnapiEnvState* env_state, uint32_t cbinf
                                         uint32_t* argc_ptr, uint32_t* argv_out,
                                         uint32_t max_argv,
                                         uint32_t* this_out, uint64_t* data_out) {
-  BridgeEnvScope env_scope(env_state);
-  auto* bridge_state = env_scope.get();
+  // No BridgeEnvScope: every guest callback makes this call, and it needs
+  // nothing the scope sets up. It reads the engine's frame of a callback that
+  // is running on this thread (the invocation is only found while it runs),
+  // which neither allocates in the engine, nor runs JavaScript, nor posts
+  // engine work: so it needs no current isolate, no instance lane and no
+  // heap-lease reconciliation, only the env to be alive and this thread's,
+  // which LookupEnvState checks. The values it hands out are the engine's
+  // own argument and receiver slots, valid for as long as the callback runs.
+  // This holds while the provider's napi_get_cb_info creates no handle (it
+  // only takes the addresses of the frame's slots and of a root).
+  auto* bridge_state = LookupEnvState(env_state);
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
   napi_callback_info info = FindCallbackInvocation(*bridge_state, cbinfo_id);
@@ -3478,10 +3771,8 @@ extern "C" int snapi_bridge_get_cb_info(SnapiEnvState* env_state, uint32_t cbinf
   auto* binding = static_cast<CallbackBinding*>(raw_data);
   uint64_t data_val = 0;
   if (binding != nullptr) {
-    auto reg_it = bridge_state->cb_registry.find(binding->reg_id);
-    if (reg_it != bridge_state->cb_registry.end()) {
-      data_val = reg_it->second.data_val;
-    }
+    const CbRegistration* registration = bridge_state->FindRegistration(binding->reg_id);
+    if (registration != nullptr) data_val = registration->data_val;
   }
   if (data_out) *data_out = data_val;
 
@@ -3504,7 +3795,7 @@ extern "C" int snapi_bridge_get_cb_info(SnapiEnvState* env_state, uint32_t cbinf
 // napi_get_new_target — only valid inside a constructor callback
 extern "C" int snapi_bridge_get_new_target(SnapiEnvState* env_state, uint32_t cbinfo_id,
                                            uint32_t* out_id) {
-  BridgeEnvScope env_scope(env_state);
+  InPlaceBridgeEnvScope env_scope(env_state);
   auto* bridge_state = env_scope.get();
   if (bridge_state == nullptr) return napi_invalid_arg;
   napi_env env = bridge_state->env;
@@ -3571,99 +3862,144 @@ void WasmInterruptCallback(napi_env env, void* raw) {
   delete request;
 }
 
+// How a guest callback's Locals are reclaimed (SNAPI_CALLBACK_V8_SCOPE):
+// 0: by the scope the callback runs in, as with Node's own N-API, whose
+//    callback wrapper opens no scope either. Called from JavaScript, that is
+//    a scope V8's API-callback builtin opens per call and closes when the
+//    callback returns. Called from C++ (v8::Function::Call or NewInstance,
+//    an accessor reached from a runtime path) there is no such scope: the
+//    Locals then live in the caller's scope until that one closes. They never
+//    die early, and the ids still go stale when the frame below pops. The
+//    bridge then only keeps a frame for the ids.
+// 1: by an escapable handle scope the bridge opens on its own stack, as
+//    before this change but without the provider's heap scope object.
+#ifndef SNAPI_CALLBACK_V8_SCOPE
+#define SNAPI_CALLBACK_V8_SCOPE 0
+#endif
+
+namespace {
+
+SNAPI_ALWAYS_INLINE napi_value CallbackUndefined(napi_env env) {
+#if defined(NAPI_ENABLE_LIFETIME_TRACKER)
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+#else
+  // What napi_get_undefined returns: the isolate's root, no handle.
+  return JsValueFromV8LocalValue(v8::Undefined(env->isolate));
+#endif
+}
+
+// The guest returned from a callback with handle scopes still open above the
+// callback's frame (at index `frame_index`), and `result` may be a Local of
+// one of them. Closes them, keeping the value alive across that, and returns
+// a handle to it in the scope the callback itself runs in.
+SNAPI_NOINLINE napi_value CloseScopesLeftOpen(SnapiEnvState& state, napi_env env,
+                                               size_t frame_index, napi_value result) {
+  std::vector<ScopeFrame>& frames = state.agent->scope_frames;
+  v8::Isolate* isolate = env->isolate;
+  v8::Global<v8::Value> kept;
+  if (result != nullptr) kept.Reset(isolate, napi_v8_unwrap_value(result));
+  while (frames.size() > frame_index + 1) {
+    PopCurrentFrame(state, /*close_napi_scope=*/true);
+  }
+  if (kept.IsEmpty()) return nullptr;
+  return napi_v8_wrap_value(env, kept.Get(isolate));
+}
+
+}  // namespace
+
 // Generic C++ callback invoked by V8 for all napi_create_function functions.
 // Passes the real callback frame explicitly to the Rust trampoline via a
 // short-lived callback-info token.
 static napi_value generic_wasm_callback(napi_env env, napi_callback_info info) {
-  void* raw_data = nullptr;
-  // Only the actual argument count and registration data select the guest
-  // callback. Guest napi_get_cb_info retrieves arguments/receiver on demand.
-  size_t argc = 0;
-  napi_get_cb_info(env, info, &argc, nullptr, nullptr, &raw_data);
-
-  auto* binding = static_cast<CallbackBinding*>(raw_data);
-  if (binding == nullptr) {
-    napi_value undef;
-    napi_get_undefined(env, &undef);
-    return undef;
-  }
+  // Only the registration data and, for an accessor pair, the actual argument
+  // count select the guest callback. Guest napi_get_cb_info retrieves
+  // arguments/receiver on demand.
+  auto* binding = static_cast<CallbackBinding*>(info->data());
+  if (binding == nullptr) return CallbackUndefined(env);
   auto* bridge_state = LookupEnvState(binding->state);
-  if (bridge_state == nullptr) {
-    napi_value undef;
-    napi_get_undefined(env, &undef);
-    return undef;
-  }
+  if (bridge_state == nullptr) return CallbackUndefined(env);
   SnapiAgentState& agent = *bridge_state->agent;
   GuestCallScope guest_call(bridge_state);
   void* callback_ctx =
       guest_call.allowed() ? agent.active_callback_ctx : nullptr;
-  if (callback_ctx == nullptr) {
-    napi_value undef;
-    napi_get_undefined(env, &undef);
-    return undef;
-  }
-  auto it = bridge_state->cb_registry.find(binding->reg_id);
-  if (it == bridge_state->cb_registry.end()) {
-    napi_value undef;
-    napi_get_undefined(env, &undef);
-    return undef;
-  }
+  if (callback_ctx == nullptr) return CallbackUndefined(env);
+  const CbRegistration* found = bridge_state->FindRegistration(binding->reg_id);
+  if (found == nullptr) return CallbackUndefined(env);
+  // The guest can register callbacks while it runs, which moves the table.
+  const CbRegistration registration = *found;
   const uint32_t cbinfo_id = RegisterCallbackInvocation(bridge_state, info);
-  if (cbinfo_id == 0) {
-    napi_value undef;
-    napi_get_undefined(env, &undef);
-    return undef;
-  }
+  if (cbinfo_id == 0) return CallbackUndefined(env);
 
-  // Implicit per-callback scope: ids minted while the guest services this
+  // Implicit per-callback frame: ids minted while the guest services this
   // callback (arguments, intermediates, the return id) die when it returns,
-  // matching N-API semantics. Escapable so the return value can be handed
-  // back to V8's trampoline in the enclosing scope.
-  napi_escapable_handle_scope cb_scope = nullptr;
-  if (napi_open_escapable_handle_scope(env, &cb_scope) == napi_ok && cb_scope != nullptr) {
-    PushScopeFrame(*bridge_state, nullptr, cb_scope);
+  // matching N-API semantics. The guest cannot close it (its id is 0), so it
+  // is still at this index when the guest returns.
+  //
+  // Opening a napi scope here used to clear the env's last error before the
+  // guest ran, as Node does before it calls into a module (CallIntoModule);
+  // keep that (an inline test when there is none to clear).
+  (void)env->error_state.clear();
+  std::vector<ScopeFrame>& frames = agent.scope_frames;
+#if defined(SNAPI_BRIDGE_SELF_CHECK)
+  {
+    // Shows whether V8 reclaims a callback's handles when it returns: the
+    // count at entry must not grow from one call to the next.
+    static thread_local uint64_t calls = 0;
+    ++calls;
+    if ((calls & (calls - 1)) == 0) {
+      std::fprintf(stderr, "SNAPI SELF CHECK: callback #%llu handles_at_entry=%d frames=%zu\n",
+                   static_cast<unsigned long long>(calls),
+                   v8::HandleScope::NumberOfHandles(env->isolate), frames.size());
+    }
   }
+#endif
+#if SNAPI_CALLBACK_V8_SCOPE
+  // Escapable so the return value can be handed back to V8's trampoline in
+  // the enclosing scope.
+  v8::EscapableHandleScope cb_scope(env->isolate);
+#endif
+  PushScopeFrame(*bridge_state, nullptr, nullptr);
+  const size_t frame_index = frames.size() - 1;
 
   // Call Rust trampoline → WASM callback
   const uint32_t wasm_fn_ptr =
-      (it->second.wasm_setter_fn_ptr != 0 && argc > 0)
-          ? it->second.wasm_setter_fn_ptr
-          : it->second.wasm_fn_ptr;
+      (registration.wasm_setter_fn_ptr != 0 && info->argc() > 0)
+          ? registration.wasm_setter_fn_ptr
+          : registration.wasm_fn_ptr;
 
   uint32_t result_id =
       snapi_host_invoke_wasm_callback(
-          callback_ctx, it->second.guest_env, wasm_fn_ptr, cbinfo_id);
+          callback_ctx, registration.guest_env, wasm_fn_ptr, cbinfo_id);
   // Callbacks nest, so ours is normally on top.
   auto& invocations = agent.callback_invocations;
-  auto invocation = std::find_if(invocations.rbegin(), invocations.rend(),
-                                 [&](const CallbackInvocation& i) { return i.id == cbinfo_id; });
-  if (invocation != invocations.rend()) invocations.erase(std::next(invocation).base());
+  if (!invocations.empty() && invocations.back().id == cbinfo_id) [[likely]] {
+    invocations.pop_back();
+  } else {
+    auto invocation = std::find_if(invocations.rbegin(), invocations.rend(),
+                                   [&](const CallbackInvocation& i) { return i.id == cbinfo_id; });
+    if (invocation != invocations.rend()) invocations.erase(std::next(invocation).base());
+  }
 
   napi_value result = LoadValue(*bridge_state, result_id);
-  std::vector<ScopeFrame>& frames = agent.scope_frames;
-  // Only while our frame is still open (it normally is the innermost one
-  // the guest did not close).
-  if (cb_scope != nullptr &&
-      std::find_if(frames.rbegin(), frames.rend(), [&](const ScopeFrame& frame) {
-        return frame.esc_scope == cb_scope;
-      }) != frames.rend()) {
-    // Escape first: the result may live in a scope the guest left open, which
-    // closing would free. The escape slot belongs to the scope around ours.
-    if (result != nullptr) {
-      napi_value escaped = nullptr;
-      result = napi_escape_handle(env, cb_scope, result, &escaped) == napi_ok
-                   ? escaped
-                   : nullptr;
+  // Only while our frame is still open (it always is: see above).
+  if (frames.size() > frame_index) [[likely]] {
+    // Close the scopes the guest left open first. The result may live in one
+    // of them, which closing would free.
+    if (frames.size() > frame_index + 1) [[unlikely]] {
+      result = CloseScopesLeftOpen(*bridge_state, env, frame_index, result);
     }
-    // Then close the scopes the guest left open, and ours.
-    while (frames.back().esc_scope != cb_scope) {
-      PopCurrentFrame(*bridge_state, /*close_napi_scope=*/true);
-    }
-    PopCurrentFrame(*bridge_state, /*close_napi_scope=*/true);
+    PopFrame(*bridge_state, /*close_napi_scope=*/true);
+    // As closing the callback's napi scope left it.
+    (void)env->error_state.clear();
   }
-  if (!result) {
-    napi_get_undefined(env, &result);
+#if SNAPI_CALLBACK_V8_SCOPE
+  if (result != nullptr) {
+    result = JsValueFromV8LocalValue(cb_scope.Escape(napi_v8_unwrap_value(result)));
   }
+#endif
+  if (!result) result = CallbackUndefined(env);
   if (result_id == kCallbackStoreNotLent) {
     // The guest function did not run. Fail the call instead of returning
     // undefined as if it had. No error code: setting one is an ordinary
@@ -3691,8 +4027,10 @@ extern "C" void snapi_bridge_register_callback(SnapiEnvState* env_state,
                                                uint32_t wasm_fn_ptr,
                                                uint64_t data_val) {
   env_state = LookupEnvState(env_state);
-  if (env_state == nullptr || reg_id == 0) return;
-  env_state->cb_registry[reg_id] = { guest_env, wasm_fn_ptr, 0, data_val };
+  // Only ids snapi_bridge_alloc_cb_reg_id handed out.
+  if (env_state == nullptr || reg_id == 0 || reg_id >= env_state->next_cb_reg_id) return;
+  if (env_state->cb_registry.size() <= reg_id) env_state->cb_registry.resize(reg_id + 1);
+  env_state->cb_registry[reg_id] = { guest_env, wasm_fn_ptr, 0, true, data_val };
 }
 
 extern "C" void snapi_bridge_register_callback_pair(SnapiEnvState* env_state,
@@ -3702,8 +4040,10 @@ extern "C" void snapi_bridge_register_callback_pair(SnapiEnvState* env_state,
                                                     uint32_t wasm_setter_fn_ptr,
                                                     uint64_t data_val) {
   env_state = LookupEnvState(env_state);
-  if (env_state == nullptr || reg_id == 0) return;
-  env_state->cb_registry[reg_id] = { guest_env, wasm_getter_fn_ptr, wasm_setter_fn_ptr, data_val };
+  if (env_state == nullptr || reg_id == 0 || reg_id >= env_state->next_cb_reg_id) return;
+  if (env_state->cb_registry.size() <= reg_id) env_state->cb_registry.resize(reg_id + 1);
+  env_state->cb_registry[reg_id] = { guest_env, wasm_getter_fn_ptr, wasm_setter_fn_ptr, true,
+                                     data_val };
 }
 
 // Create a JS function with generic_wasm_callback as its native callback.
@@ -5460,9 +5800,9 @@ extern "C" void snapi_bridge_dispose() {
   // Disposing an env disposes its agent and forgets every env on it, so take
   // one owned env at a time instead of iterating a snapshot. Agents already
   // closing are being released further up this thread's stack.
-  while (t_owned_envs != nullptr) {
+  while (t_bridge.owned_envs != nullptr) {
     SnapiEnvState* next = nullptr;
-    for (auto* state : *t_owned_envs) {
+    for (auto* state : *t_bridge.owned_envs) {
       if (!state->agent->closing) {
         next = state;
         break;

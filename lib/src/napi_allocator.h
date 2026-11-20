@@ -85,7 +85,12 @@ public:
     slot__ *slot = block->allocate();
     T *data = slot->construct(static_cast<Args &&>(args)...);
     napi_allocator_lifetime__<T, Owner>::record_create(owner_, data);
-    relink(block);
+    // A block at the front of the partial list that is not full yet stays
+    // there: relinking would unlink it and link it right back. (destroy()
+    // must still take its block off the lists while the payload's destructor
+    // runs, which may use this allocator.)
+    if (!is_first_partial(block) || block->is_full())
+      relink(block);
 
     return data;
   }
@@ -473,6 +478,12 @@ private:
       return N;
 
     return static_cast<size_t>(slot - begin);
+  }
+
+  // Whether `block` is the block allocate() takes next from the partial list.
+  constexpr bool is_first_partial(const block__ *block) const
+  {
+    return first_partial_.first() == &block->link_;
   }
 
   constexpr void relink(block__ *block)

@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize};
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
@@ -110,6 +112,41 @@ pub(crate) struct EnvRegistry {
     pub(crate) envs: HashMap<u32, usize>,
 }
 
+/// How deep one store's guest↔host callback crossings nest (see
+/// [`NapiEnv::enter_callback`]). The store's `NapiEnv` and the callback
+/// contexts of its envs share one counter, so the callback trampoline counts
+/// a crossing without looking the `NapiEnv` up in the store.
+///
+/// The counter is only ever touched by whoever holds the store's `&mut`: the
+/// `NapiEnv` methods take `&mut self`, and a trampoline runs with the store
+/// lent to it (`guest::callback::with_lent_store`). So its updates never
+/// race, and a plain load and store do; the atomic only makes the shared
+/// handle `Send + Sync`.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CallbackDepth(Arc<std::sync::atomic::AtomicU32>);
+
+impl CallbackDepth {
+    /// Claims one level; `false` at [`MAX_CALLBACK_DEPTH`].
+    ///
+    /// [`MAX_CALLBACK_DEPTH`]: crate::guest::MAX_CALLBACK_DEPTH
+    #[inline]
+    pub(crate) fn enter(&self) -> bool {
+        let depth = self.0.load(Ordering::Relaxed);
+        if depth >= crate::guest::MAX_CALLBACK_DEPTH {
+            return false;
+        }
+        self.0.store(depth + 1, Ordering::Relaxed);
+        true
+    }
+
+    /// Releases one level claimed by a `true` [`Self::enter`].
+    #[inline]
+    pub(crate) fn leave(&self) {
+        let depth = self.0.load(Ordering::Relaxed);
+        self.0.store(depth.saturating_sub(1), Ordering::Relaxed);
+    }
+}
+
 pub(crate) struct NapiEnv {
     /// The app's shared accountant. V8 env (isolate) heap ceilings and the
     /// `max_envs` isolate count are charged against it; workers share the same
@@ -143,16 +180,24 @@ pub(crate) struct NapiEnv {
     external_declared: u64,
     /// Depth of nested guest↔host callback crossings on this thread, bounded to
     /// keep guest→host→guest recursion from overflowing the host native stack
-    /// (an uncatchable SIGSEGV). See [`NapiEnv::enter_callback`].
-    callback_depth: u32,
+    /// (an uncatchable SIGSEGV). See [`NapiEnv::enter_callback`]. Shared with
+    /// the callback contexts of this store's envs ([`CallbackDepth`]).
+    callback_depth: CallbackDepth,
     pub(crate) memory: Option<Memory>,
     /// Host-side allocator over the guest's linear memory. `None` only before
     /// `NapiSession::configure_instance` runs; that call fails instantiation
     /// outright if a `GuestHeap` can't be built, so any env reachable from
     /// guest code is guaranteed to have one — it is the only allocation path
     /// for guest-visible V8 memory, never a best-effort fallback.
+    ///
+    /// Assign it with [`NapiEnv::set_guest_heap`] only, which keeps the
+    /// window on guest memory in [`HotEnv`] in step.
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) guest_heap: Option<Arc<crate::guest_heap::GuestHeap>>,
+    /// What the imports read of this env on every call, where they reach it
+    /// without going through the store (see [`HotEnv`]).
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    hot: Arc<HotEnv>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) malloc_fn: Option<TypedFunction<i32, i32>>,
     pub(crate) table: Option<Table>,
@@ -166,8 +211,13 @@ pub(crate) struct NapiEnv {
     /// unconditional store growth. See `guest::callback::call_guest_callback`.
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) func_cache: HashMap<u32, Function>,
+    ///
+    /// Table indices are the instance's own, not chosen per call by the
+    /// guest in a way that could flood a table (a module has as many as it
+    /// has functions), and the callback trampoline looks one up on every
+    /// JavaScript call into the guest: an [`IdHashMap`], not SipHash.
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    pub(crate) func_cache: HashMap<u32, CachedGuestCallback>,
+    pub(crate) func_cache: IdHashMap<u32, CachedGuestCallback>,
     pub(crate) default_napi_env_id: Option<u32>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) next_napi_scope_id: u32,
@@ -220,6 +270,9 @@ pub(crate) struct NapiEnv {
     /// for an env whose release was refused, kept for good when this goes.
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
     pub(crate) native_callback_contexts: IdHashMap<u32, Arc<CallbackInvocationCtx>>,
+    /// The property names the guest passes, by their guest address.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) name_cache: crate::guest::util::NameCache,
 }
 
 impl NapiEnv {
@@ -242,14 +295,19 @@ impl NapiEnv {
             messages: crate::message::PendingMessages::new(),
             env_heap_charges: IdHashMap::default(),
             external_declared: 0,
-            callback_depth: 0,
+            callback_depth: CallbackDepth::default(),
             memory: None,
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
             guest_heap: None,
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            hot: Arc::default(),
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
             malloc_fn: None,
             table: None,
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
             func_cache: HashMap::new(),
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            func_cache: IdHashMap::default(),
             default_napi_env_id: None,
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
             next_napi_scope_id: 0,
@@ -289,6 +347,8 @@ impl NapiEnv {
             native_buffer_leases: HashMap::new(),
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
             native_callback_contexts: IdHashMap::default(),
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            name_cache: Default::default(),
         }
     }
 
@@ -532,18 +592,20 @@ impl NapiEnv {
     /// [`MAX_CALLBACK_DEPTH`]: crate::guest::MAX_CALLBACK_DEPTH
     /// [`leave_callback`]: NapiEnv::leave_callback
     pub(crate) fn enter_callback(&mut self) -> bool {
-        if self.callback_depth >= crate::guest::MAX_CALLBACK_DEPTH {
-            return false;
-        }
-        self.callback_depth += 1;
-        true
+        self.callback_depth.enter()
+    }
+
+    /// The store's callback depth counter, for a callback context to share.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn callback_depth(&self) -> CallbackDepth {
+        self.callback_depth.clone()
     }
 
     /// Release one level claimed by a `true` [`enter_callback`].
     ///
     /// [`enter_callback`]: NapiEnv::enter_callback
     pub(crate) fn leave_callback(&mut self) {
-        self.callback_depth = self.callback_depth.saturating_sub(1);
+        self.callback_depth.leave();
     }
 
     pub(crate) fn register_napi_env(&mut self, env: SnapiEnv) -> (u32, u32) {
@@ -703,7 +765,7 @@ impl NapiEnv {
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
         let _ = registered;
         // The tracker is freed below: forget it first.
-        self.single_env = (0, 0, 0);
+        self.set_single_env((0, 0, 0));
         // Release the heap ceiling + any callback-granted growth + isolate slot
         // this env reserved.
         if let Some(handle) = self.env_heap_charges.remove(&env_id) {
@@ -742,13 +804,76 @@ impl NapiEnv {
         self.napi_envs.get(env_id).map(|env| *env as SnapiEnv)
     }
 
+    /// Sets the allocator over the guest's memory, and with it the window
+    /// [`Self::guest_mem`] hands out.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn set_guest_heap(&mut self, heap: Option<Arc<crate::guest_heap::GuestHeap>>) {
+        let (base, len) = heap
+            .as_ref()
+            .map_or((0, 0), |heap| (heap.base() as usize, heap.seen_len()));
+        // Nothing reads the window while this runs (`&mut self`). The
+        // length goes to zero first all the same, so that no pair of loads
+        // could ever put a new length on an old base.
+        self.hot.mem_len.store(0, Ordering::Relaxed);
+        self.hot.mem_base.store(base, Ordering::Relaxed);
+        self.hot.mem_len.store(len, Ordering::Relaxed);
+        self.guest_heap = heap;
+    }
+
+    /// The part of guest memory this env knows to be mapped: empty with no
+    /// guest heap.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    #[inline(always)]
+    pub(crate) fn guest_mem(&self) -> crate::guest::util::GuestMem {
+        self.hot.guest_mem()
+    }
+
+    /// What the imports of this env's store capture when they are made.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn hot(&self) -> &Arc<HotEnv> {
+        &self.hot
+    }
+
+    /// Takes over the length the guest heap has seen since, after a lookup
+    /// through it succeeded past [`Self::guest_mem`].
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) fn refresh_guest_mem(&self) {
+        if let Some(heap) = self.guest_heap.as_ref() {
+            debug_assert_eq!(
+                heap.base() as usize,
+                self.hot.mem_base.load(Ordering::Relaxed)
+            );
+            // Only this env's thread writes the length, so a load and a
+            // store do; the heap's length never goes down.
+            let seen = heap.seen_len();
+            if seen > self.hot.mem_len.load(Ordering::Relaxed) {
+                self.hot.mem_len.store(seen, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The bridge env of the guest's env `guest_env`, or null. Inlined into
+    /// every import: for the env of a store with one (see `single_env`) it
+    /// is a compare and a load, and the map lookup stays out of line.
+    #[inline(always)]
     pub(crate) fn resolve_napi_env(&self, guest_env: u32) -> SnapiEnv {
+        // No env has id 0, which is also what `single_env` holds for a store
+        // with none or several: 0 then resolves to its null.
+        if self.single_env.0 == guest_env {
+            debug_assert_eq!(
+                self.napi_envs.get(&guest_env).copied().unwrap_or(0),
+                self.single_env.1
+            );
+            return self.single_env.1 as SnapiEnv;
+        }
+        self.resolve_napi_env_in_map(guest_env)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn resolve_napi_env_in_map(&self, guest_env: u32) -> SnapiEnv {
         if guest_env == 0 {
             return std::ptr::null_mut();
-        }
-        if self.single_env.0 == guest_env {
-            debug_assert_eq!(self.napi_envs.get(&guest_env), Some(&self.single_env.1));
-            return self.single_env.1 as SnapiEnv;
         }
         self.napi_envs
             .get(&guest_env)
@@ -761,7 +886,7 @@ impl NapiEnv {
     ///
     /// [`single_env`]: NapiEnv::single_env
     fn refresh_single_env(&mut self) {
-        self.single_env = match self.napi_envs.iter().next() {
+        let single_env = match self.napi_envs.iter().next() {
             Some((&env_id, &env)) if self.napi_envs.len() == 1 => {
                 let tracker = self
                     .env_heap_charges
@@ -771,6 +896,89 @@ impl NapiEnv {
             }
             _ => (0, 0, 0),
         };
+        self.set_single_env(single_env);
+    }
+
+    /// The one place [`single_env`] is assigned, so that its copy in
+    /// [`HotEnv`] always says the same.
+    ///
+    /// [`single_env`]: NapiEnv::single_env
+    fn set_single_env(&mut self, single_env: (u32, usize, usize)) {
+        self.single_env = single_env;
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        {
+            // Id 0 (no single env) first, so that the id never stands beside
+            // another env's pointers.
+            self.hot.env_id.store(0, Ordering::Relaxed);
+            self.hot.env.store(single_env.1, Ordering::Relaxed);
+            self.hot.tracker.store(single_env.2, Ordering::Relaxed);
+            self.hot.env_id.store(single_env.0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// What nearly every import reads of its store's [`NapiEnv`], in an
+/// allocation of its own that the import functions hold directly (see
+/// `register_napi_imports`): the store's single env, as
+/// [`NapiEnv::single_env`] has it, and the window on guest memory.
+///
+/// An import otherwise reaches the env's data through the store on every
+/// call: it loads the store's list of function environments, checks the
+/// handle's store id, its index and the data's type, and only then loads the
+/// data's address. Those are four dependent loads before the bridge call can
+/// start. From here it is two, and no checks, since the import function
+/// belongs to the same store as the `NapiEnv` that gave it this record.
+///
+/// Everything is an atomic: the record is shared between the `NapiEnv`,
+/// which writes it, and the import functions, which only read. All of them
+/// run on the thread that holds the store, so the orderings are relaxed.
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+#[derive(Default)]
+pub(crate) struct HotEnv {
+    /// Guest id of the store's only env; 0 with none or several.
+    env_id: AtomicU32,
+    /// Its bridge env.
+    env: AtomicUsize,
+    /// Its heap tracker, or 0.
+    tracker: AtomicUsize,
+    /// Host address of guest offset 0 (the guest heap's fixed base), or 0
+    /// with no guest heap.
+    mem_base: AtomicUsize,
+    /// A length of the guest's memory that this env has seen, at most the
+    /// heap's range: a range that ends within it is mapped at `mem_base`,
+    /// because the memory only grows and its base never moves (see
+    /// `GuestHeap::host_range`, which this mirrors). 0 with no guest heap.
+    mem_len: AtomicU64,
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+impl HotEnv {
+    /// The bridge env of the guest's env `guest_env` if this record can
+    /// tell: `Some(null)` for id 0, `None` for an id other than the single
+    /// env's, which the caller looks up in the `NapiEnv`.
+    #[inline(always)]
+    pub(crate) fn resolve_napi_env(&self, guest_env: u32) -> Option<SnapiEnv> {
+        // With no single env the id here is 0 and the env null.
+        (self.env_id.load(Ordering::Relaxed) == guest_env)
+            .then(|| self.env.load(Ordering::Relaxed) as SnapiEnv)
+    }
+
+    /// Whether the env `guest_env` has a heap tracker, if this record can
+    /// tell (as [`Self::resolve_napi_env`]). Read after a bridge call, it
+    /// answers for the env as the call left it.
+    #[inline(always)]
+    pub(crate) fn has_heap_tracker(&self, guest_env: u32) -> Option<bool> {
+        (guest_env != 0 && self.env_id.load(Ordering::Relaxed) == guest_env)
+            .then(|| self.tracker.load(Ordering::Relaxed) != 0)
+    }
+
+    /// The part of guest memory the env knows to be mapped.
+    #[inline(always)]
+    pub(crate) fn guest_mem(&self) -> crate::guest::util::GuestMem {
+        crate::guest::util::GuestMem::new(
+            self.mem_base.load(Ordering::Relaxed) as *mut u8,
+            self.mem_len.load(Ordering::Relaxed),
+        )
     }
 }
 

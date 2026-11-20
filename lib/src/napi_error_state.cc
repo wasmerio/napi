@@ -15,8 +15,4 @@ napi_status error_state__::set(napi_status status, const char* message) {
   return status;
 }
 
-napi_status error_state__::clear() {
-  return set(napi_ok, nullptr);
-}
-
 }  // namespace napi

@@ -691,7 +691,7 @@ impl NapiSession {
                 .context(
                     "failed to initialize the guest-heap allocator over the guest's linear memory",
                 )?;
-            func_env.as_mut(&mut *store).guest_heap = Some(heap);
+            func_env.as_mut(&mut *store).set_guest_heap(Some(heap));
         }
 
         // The browser backend cannot expose a native pointer into Wasmer's JS

@@ -56,6 +56,24 @@ inline v8::Local<v8::Value> V8LocalValueFromJsValue(napi_value value) {
   return local;
 }
 
+// The Local that reads a strong Global's own slot, where Global::Get would
+// open a new handle in the current scope: Node's PersistentToLocal::Strong.
+// A Local and a Global are both one pointer to a slot (IndirectHandleBase),
+// which the static_asserts pin down. Only for a Global that is strong and is
+// not reset while the Local, or anything V8 derives from it, is in use.
+template <typename T>
+inline v8::Local<T> NapiV8StrongLocal(const v8::Global<T>& global) {
+#ifdef V8_ENABLE_DIRECT_HANDLE
+#error "NapiV8StrongLocal needs indirect handles, as napi_value does"
+#endif
+  static_assert(sizeof(v8::Local<T>) == sizeof(v8::Global<T>) &&
+                    sizeof(v8::Local<T>) == sizeof(void*),
+                "a Local and a Global must both be one slot pointer");
+  v8::Local<T> local;
+  std::memcpy(static_cast<void*>(&local), static_cast<const void*>(&global), sizeof(local));
+  return local;
+}
+
 // Frees an external backing store's memory. Runs in V8's deleter, on any
 // thread, so it must not use V8 or an env.
 typedef void (*napi_v8_external_free_callback)(void* data, void* hint);
@@ -126,11 +144,26 @@ struct napi_env__ {
 
   // The current realm's context: the innermost realm frame's, else the env's
   // own. N-API calls create what they make there.
-  v8::Local<v8::Context> context() const;
+  //
+  // The env's own context is read from `context_ref`'s slot, with no new
+  // handle: nearly every call asks for it, and a call made outside any
+  // handle scope the caller closes (a guest loop on the env's root scope)
+  // would otherwise leave one more handle per call. `context_ref` is strong
+  // and is reset only by the env's destructor, after which nothing may use
+  // the env or what it returned. A realm's context is held weakly, so it
+  // still gets a handle of its own.
+  v8::Local<v8::Context> context() const {
+    unofficial_napi_realm__* realm = current_realm();
+    return realm != nullptr ? realm_context(realm) : NapiV8StrongLocal(context_ref);
+  }
   // The env's own realm.
-  v8::Local<v8::Context> main_context() const;
+  v8::Local<v8::Context> main_context() const { return NapiV8StrongLocal(context_ref); }
   // The current realm; null for the env's own.
-  unofficial_napi_realm__* current_realm() const;
+  unofficial_napi_realm__* current_realm() const {
+    return realm_frames.empty() ? nullptr : realm_frames.back().realm;
+  }
+  // A handle for `realm`'s weakly held context.
+  v8::Local<v8::Context> realm_context(unofficial_napi_realm__* realm) const;
   // Pushes the frame of a callback running in `realm` (null: the env's own)
   // and returns the depth PopRealmFrames restores.
   size_t PushRealmFrame(unofficial_napi_realm__* realm);
@@ -241,7 +274,16 @@ class napi_realm_frame_scope__ {
  public:
   napi_realm_frame_scope__(napi_env env, unofficial_napi_realm__* realm)
       : env_(env), depth_(env->PushRealmFrame(realm)) {}
-  ~napi_realm_frame_scope__() { env_->PopRealmFrames(depth_); }
+  ~napi_realm_frame_scope__() {
+    // Nearly always only the frame this scope pushed is left, and it entered
+    // no context: drop it here. PopRealmFrames does the same for it.
+    std::vector<napi_realm_frame__>& frames = env_->realm_frames;
+    if (frames.size() == depth_ + 1 && frames.back().entered.IsEmpty()) [[likely]] {
+      frames.pop_back();
+      return;
+    }
+    env_->PopRealmFrames(depth_);
+  }
   napi_realm_frame_scope__(const napi_realm_frame_scope__&) = delete;
   napi_realm_frame_scope__& operator=(const napi_realm_frame_scope__&) = delete;
 
@@ -315,6 +357,34 @@ napi_status napi_v8_fail_terminating(napi_env env);
 // empty result. Returns false when nothing was pending and the env is not
 // terminating.
 bool napi_v8_rethrow_pending_exception(napi_env env);
+
+// napi_get_named_property, napi_set_named_property and
+// napi_has_named_property for a name the embedder has numbered: `name_key`
+// is its process-unique id for the bytes of `utf8name` (never reused for
+// other bytes; 0 for none), and `name_slot`, below kNapiNameKeySlots, where
+// the isolate keeps that name's string. A call with the key a slot already
+// holds makes no string. In everything else they are the calls they stand
+// for, which pass no key.
+extern "C" {
+napi_status napi_v8_get_named_property_keyed(napi_env env,
+                                             napi_value object,
+                                             const char* utf8name,
+                                             uint32_t name_slot,
+                                             uint64_t name_key,
+                                             napi_value* result);
+napi_status napi_v8_set_named_property_keyed(napi_env env,
+                                             napi_value object,
+                                             const char* utf8name,
+                                             uint32_t name_slot,
+                                             uint64_t name_key,
+                                             napi_value value);
+napi_status napi_v8_has_named_property_keyed(napi_env env,
+                                             napi_value object,
+                                             const char* utf8name,
+                                             uint32_t name_slot,
+                                             uint64_t name_key,
+                                             bool* result);
+}  // extern "C"
 
 napi_value napi_v8_wrap_value(napi_env env, v8::Local<v8::Value> value);
 v8::Local<v8::Value> napi_v8_unwrap_value(napi_value value);

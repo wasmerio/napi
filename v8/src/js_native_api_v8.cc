@@ -69,6 +69,85 @@ v8::MaybeLocal<v8::String> PropertyKeyFromUtf8(v8::Isolate* isolate,
   return v8::String::NewFromUtf8(isolate, name, v8::NewStringType::kInternalized);
 }
 
+// The key for a named-property call: the string an embedder-numbered name
+// (napi_v8_*_named_property_keyed) already has in the agent's table, else a
+// new one from `utf8name`, as napi_*_named_property makes.
+//
+// A numbered name's handle is the table's own Global slot, so the slot must
+// keep its string while V8 can still read the key: the pin does that. The
+// call the key is for can run JavaScript, and through it another keyed call
+// that wants the slot for a different name; a pinned slot is not given away,
+// and that call makes its key the ordinary way.
+class NamedKeyScope {
+ public:
+  NamedKeyScope(napi_env env, const char* utf8name, uint32_t slot, uint64_t key) {
+    napi_agent__* agent = env->agent;
+    if (key != 0 && slot < kNapiNameKeySlots && agent != nullptr &&
+        agent->name_keys != nullptr && agent->name_keys[slot].key == key) [[likely]] {
+      Pin(&agent->name_keys[slot]);
+      return;
+    }
+    Make(env, utf8name, slot, key);
+  }
+  ~NamedKeyScope() {
+    if (pinned_ != nullptr) --pinned_->pins;
+  }
+  NamedKeyScope(const NamedKeyScope&) = delete;
+  NamedKeyScope& operator=(const NamedKeyScope&) = delete;
+
+  // Empty if V8 refused the string (a name longer than a string can be).
+  v8::Local<v8::String> key() const { return key_; }
+
+ private:
+  void Pin(napi_name_key__* entry) {
+    ++entry->pins;
+    pinned_ = entry;
+    key_ = NapiV8StrongLocal(entry->name);
+  }
+
+  // The slot does not hold the name yet: gives it the name if nobody reads
+  // the slot, and otherwise (or for a name with no number) makes the key the
+  // ordinary way.
+  void Make(napi_env env, const char* utf8name, uint32_t slot, uint64_t key);
+
+  v8::Local<v8::String> key_;
+  napi_name_key__* pinned_ = nullptr;
+};
+
+void NamedKeyScope::Make(napi_env env, const char* utf8name, uint32_t slot, uint64_t key) {
+  v8::Isolate* isolate = env->isolate;
+  napi_agent__* agent = env->agent;
+  if (key != 0 && slot < kNapiNameKeySlots && agent != nullptr) {
+    if (agent->name_keys == nullptr) {
+      agent->name_keys.reset(new (std::nothrow) napi_name_key__[kNapiNameKeySlots]);
+    }
+    napi_name_key__* entry = agent->name_keys != nullptr ? &agent->name_keys[slot] : nullptr;
+    if (entry != nullptr && entry->pins == 0) {
+      // The slot holds another name (or none), and nobody reads it.
+      v8::Local<v8::String> made;
+      if (PropertyKeyFromUtf8(isolate, utf8name).ToLocal(&made)) {
+        entry->name.Reset(isolate, made);
+        entry->key = key;
+        Pin(entry);
+        return;
+      }
+      entry->name.Reset();
+      entry->key = 0;
+    }
+  }
+  (void)PropertyKeyFromUtf8(isolate, utf8name).ToLocal(&key_);
+}
+
+// A small integer V8 keeps unboxed in the handle (a Smi), read the way V8's
+// own inline API predicates read a value (v8::Value::QuickIsUndefined):
+// from the header, with no call into V8. False for every other value.
+inline bool SmiValueOf(v8::Local<v8::Value> value, int32_t* out) {
+  const v8::internal::Address raw = v8::internal::ValueHelper::ValueAsAddress(*value);
+  if (v8::internal::Internals::HasHeapObjectTag(raw)) return false;
+  *out = v8::internal::Internals::SmiValue(raw);
+  return true;
+}
+
 void ReleaseDrainToken(napi_env /*env*/, void* data) {
   auto* token = static_cast<napi_env_drain_token__*>(data);
   if (token->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) delete token;
@@ -639,6 +718,16 @@ inline napi_status InvalidArg(napi_env env) {
   return napi_invalid_arg;
 }
 
+// A call's arguments as V8 takes them. A napi_value is a Local's slot pointer
+// (JsValueFromV8LocalValue), so the caller's array already is an array of
+// Locals, as in Node's napi_call_function; no copy is made.
+inline v8::Local<v8::Value>* ArgumentsFromJsValues(const napi_value* argv) {
+  static_assert(sizeof(v8::Local<v8::Value>) == sizeof(napi_value) &&
+                    alignof(v8::Local<v8::Value>) == alignof(napi_value),
+                "an array of napi_value must be an array of Locals");
+  return reinterpret_cast<v8::Local<v8::Value>*>(const_cast<napi_value*>(argv));
+}
+
 inline napi_valuetype TypeOf(v8::Local<v8::Value> value) {
   if (value->IsUndefined()) return napi_undefined;
   if (value->IsNull()) return napi_null;
@@ -1112,6 +1201,8 @@ napi_agent__::napi_agent__(v8::Isolate* isolate_in) : isolate(isolate_in) {
 }
 
 napi_agent__::~napi_agent__() {
+  // The names' Globals go while the isolate is alive, like those below.
+  name_keys.reset();
   termination_probe.Reset();
   wrap_private_key.Reset();
   buffer_private_key.Reset();
@@ -1219,17 +1310,8 @@ napi_env__::~napi_env__() {
   NAPI_V8_LIFETIME_DUMP(this, "napi_env__ teardown end");
 }
 
-v8::Local<v8::Context> napi_env__::context() const {
-  unofficial_napi_realm__* realm = current_realm();
-  return realm != nullptr ? realm->context.Get(isolate) : context_ref.Get(isolate);
-}
-
-v8::Local<v8::Context> napi_env__::main_context() const {
-  return context_ref.Get(isolate);
-}
-
-unofficial_napi_realm__* napi_env__::current_realm() const {
-  return realm_frames.empty() ? nullptr : realm_frames.back().realm;
+v8::Local<v8::Context> napi_env__::realm_context(unofficial_napi_realm__* realm) const {
+  return realm->context.Get(isolate);
 }
 
 size_t napi_env__::PushRealmFrame(unofficial_napi_realm__* realm) {
@@ -1880,6 +1962,11 @@ napi_status NAPI_CDECL napi_get_value_double(napi_env env,
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
+  int32_t smi;
+  if (SmiValueOf(local, &smi)) {
+    *result = smi;
+    return napi_v8_clear_last_error(env);
+  }
   if (!local->IsNumber()) {
     return napi_v8_set_last_error(env, napi_number_expected, "A number was expected");
   }
@@ -1894,6 +1981,12 @@ napi_status NAPI_CDECL napi_get_value_uint32(napi_env env,
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
+  int32_t smi;
+  if (SmiValueOf(local, &smi)) {
+    // ToUint32 of an integer is its value modulo 2^32.
+    *result = static_cast<uint32_t>(smi);
+    return napi_v8_clear_last_error(env);
+  }
   if (!local->IsNumber()) {
     return napi_v8_set_last_error(env, napi_number_expected, "A number was expected");
   }
@@ -1908,6 +2001,7 @@ napi_status NAPI_CDECL napi_get_value_int32(napi_env env,
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
+  if (SmiValueOf(local, result)) return napi_v8_clear_last_error(env);
   if (!local->IsNumber()) {
     return napi_v8_set_last_error(env, napi_number_expected, "A number was expected");
   }
@@ -1922,6 +2016,11 @@ napi_status NAPI_CDECL napi_get_value_int64(napi_env env,
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
+  int32_t smi;
+  if (SmiValueOf(local, &smi)) {
+    *result = smi;
+    return napi_v8_clear_last_error(env);
+  }
   if (local->IsInt32()) {
     *result = local.As<v8::Int32>()->Value();
     return napi_v8_clear_last_error(env);
@@ -2559,12 +2658,9 @@ napi_status NAPI_CDECL napi_new_instance(napi_env env,
   v8::Local<v8::Value> ctorValue = napi_v8_unwrap_value(constructor);
   if (!ctorValue->IsFunction()) return napi_function_expected;
   v8::Local<v8::Function> ctor = ctorValue.As<v8::Function>();
-  std::vector<v8::Local<v8::Value>> args;
-  args.reserve(argc);
-  for (size_t i = 0; i < argc; ++i) args.push_back(napi_v8_unwrap_value(argv[i]));
   v8::Local<v8::Value> out;
   v8::TryCatch tryCatch(env->isolate);
-  if (!ctor->NewInstance(env->context(), static_cast<int>(argc), args.data())
+  if (!ctor->NewInstance(env->context(), static_cast<int>(argc), ArgumentsFromJsValues(argv))
            .ToLocal(&out)) {
     if (tryCatch.HasCaught()) {
       SetLastExceptionFromTryCatch(env, tryCatch);
@@ -2589,15 +2685,9 @@ napi_status NAPI_CDECL napi_call_function(napi_env env,
   if (!napi_v8_unwrap_value(func)->IsFunction()) return napi_function_expected;
   fn = napi_v8_unwrap_value(func).As<v8::Function>();
 
-  std::vector<v8::Local<v8::Value>> args;
-  args.reserve(argc);
-  for (size_t i = 0; i < argc; ++i) {
-    args.push_back(napi_v8_unwrap_value(argv[i]));
-  }
-
   v8::TryCatch tryCatch(env->isolate);
   v8::MaybeLocal<v8::Value> maybe = fn->Call(
-      context, napi_v8_unwrap_value(recv), argc, args.data());
+      context, napi_v8_unwrap_value(recv), static_cast<int>(argc), ArgumentsFromJsValues(argv));
   if (tryCatch.HasCaught()) {
     SetLastExceptionFromTryCatch(env, tryCatch);
     return napi_v8_set_last_error(env, napi_pending_exception, "Function call threw");
@@ -2767,10 +2857,12 @@ napi_status NAPI_CDECL napi_is_promise(napi_env env, napi_value value, bool* is_
   return napi_v8_clear_last_error(env);
 }
 
-napi_status NAPI_CDECL napi_has_named_property(napi_env env,
-                                               napi_value object,
-                                               const char* utf8name,
-                                               bool* result) {
+napi_status napi_v8_has_named_property_keyed(napi_env env,
+                                             napi_value object,
+                                             const char* utf8name,
+                                             uint32_t name_slot,
+                                             uint64_t name_key,
+                                             bool* result) {
   NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || utf8name == nullptr || result == nullptr) {
     return InvalidArg(env);
@@ -2778,10 +2870,9 @@ napi_status NAPI_CDECL napi_has_named_property(napi_env env,
   auto context = env->context();
   v8::Local<v8::Value> targetValue = napi_v8_unwrap_value(object);
   if (!targetValue->IsObject()) return napi_object_expected;
-  v8::Local<v8::String> key;
-  if (!PropertyKeyFromUtf8(env->isolate, utf8name).ToLocal(&key)) {
-    return napi_generic_failure;
-  }
+  NamedKeyScope named(env, utf8name, name_slot, name_key);
+  v8::Local<v8::String> key = named.key();
+  if (key.IsEmpty()) return napi_generic_failure;
   v8::TryCatch tc(env->isolate);
   auto has = targetValue.As<v8::Object>()->Has(context, key);
   if (has.IsNothing()) {
@@ -2789,6 +2880,13 @@ napi_status NAPI_CDECL napi_has_named_property(napi_env env,
   }
   *result = has.FromJust();
   return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_has_named_property(napi_env env,
+                                               napi_value object,
+                                               const char* utf8name,
+                                               bool* result) {
+  return napi_v8_has_named_property_keyed(env, object, utf8name, 0, 0, result);
 }
 
 napi_status NAPI_CDECL napi_set_property(napi_env env,
@@ -2958,6 +3056,15 @@ napi_status NAPI_CDECL napi_set_named_property(napi_env env,
                                                napi_value object,
                                                const char* utf8name,
                                                napi_value value) {
+  return napi_v8_set_named_property_keyed(env, object, utf8name, 0, 0, value);
+}
+
+napi_status napi_v8_set_named_property_keyed(napi_env env,
+                                             napi_value object,
+                                             const char* utf8name,
+                                             uint32_t name_slot,
+                                             uint64_t name_key,
+                                             napi_value value) {
   NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || utf8name == nullptr || value == nullptr) {
     return InvalidArg(env);
@@ -2965,10 +3072,9 @@ napi_status NAPI_CDECL napi_set_named_property(napi_env env,
   auto context = env->context();
   v8::Local<v8::Value> targetValue = napi_v8_unwrap_value(object);
   if (!targetValue->IsObject()) return napi_object_expected;
-  v8::Local<v8::String> key;
-  if (!PropertyKeyFromUtf8(env->isolate, utf8name).ToLocal(&key)) {
-    return napi_generic_failure;
-  }
+  NamedKeyScope named(env, utf8name, name_slot, name_key);
+  v8::Local<v8::String> key = named.key();
+  if (key.IsEmpty()) return napi_generic_failure;
   v8::TryCatch tc(env->isolate);
   if (!targetValue.As<v8::Object>()
            ->Set(context, key, napi_v8_unwrap_value(value))
@@ -2982,6 +3088,15 @@ napi_status NAPI_CDECL napi_get_named_property(napi_env env,
                                                napi_value object,
                                                const char* utf8name,
                                                napi_value* result) {
+  return napi_v8_get_named_property_keyed(env, object, utf8name, 0, 0, result);
+}
+
+napi_status napi_v8_get_named_property_keyed(napi_env env,
+                                             napi_value object,
+                                             const char* utf8name,
+                                             uint32_t name_slot,
+                                             uint64_t name_key,
+                                             napi_value* result) {
   NAPI_V8_RETURN_IF_TERMINATING(env);
   if (!CheckValue(env, object) || utf8name == nullptr || result == nullptr) {
     return InvalidArg(env);
@@ -2989,10 +3104,9 @@ napi_status NAPI_CDECL napi_get_named_property(napi_env env,
   auto context = env->context();
   v8::Local<v8::Value> targetValue = napi_v8_unwrap_value(object);
   if (!targetValue->IsObject()) return napi_object_expected;
-  v8::Local<v8::String> key;
-  if (!PropertyKeyFromUtf8(env->isolate, utf8name).ToLocal(&key)) {
-    return napi_generic_failure;
-  }
+  NamedKeyScope named(env, utf8name, name_slot, name_key);
+  v8::Local<v8::String> key = named.key();
+  if (key.IsEmpty()) return napi_generic_failure;
   v8::TryCatch tc(env->isolate);
   v8::Local<v8::Value> prop;
   if (!targetValue.As<v8::Object>()->Get(context, key).ToLocal(&prop)) {

@@ -11,7 +11,15 @@ class error_state__ {
  public:
   const napi_extended_error_info* info() const;
   napi_status set(napi_status status, const char* message);
-  napi_status clear();
+  // Every successful call clears the last error, and nearly always there is
+  // none to clear: that case writes nothing and stays in the caller. What
+  // set() leaves for (napi_ok, nullptr) is exactly the state tested here.
+  napi_status clear() {
+    if (info_.error_code == napi_ok && info_.error_message == nullptr) [[likely]] {
+      return napi_ok;
+    }
+    return set(napi_ok, nullptr);
+  }
 
  private:
   napi_extended_error_info info_{};

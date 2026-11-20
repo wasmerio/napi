@@ -79,6 +79,10 @@ const WAT: &str = r#"(module
   (global $sp (mut i32) (i32.const 32768))
   (global $err (mut i32) (i32.const 0))
   (global $stale_id (mut i32) (i32.const 0))
+  (global $far_base (mut i32) (i32.const 0))
+  (global $acc_value (mut i32) (i32.const 0))
+  (data (i32.const 624) "far\00")
+  (data (i32.const 632) "acc\00")
   (data (i32.const 100) "rec\00")
   (data (i32.const 108) "leak\00")
   (data (i32.const 116) "many20\00")
@@ -121,7 +125,8 @@ const WAT: &str = r#"(module
     (call $define (i32.const 132) (i32.const 5))
     (call $define (i32.const 156) (i32.const 6))
     (call $define (i32.const 164) (i32.const 7))
-    (call $define (i32.const 172) (i32.const 8)))
+    (call $define (i32.const 172) (i32.const 8))
+    (call $define (i32.const 624) (i32.const 9)))
 
   (func (export "release") (result i32)
     (call $release_env (global.get $scope) (i32.const 0)))
@@ -411,7 +416,94 @@ const WAT: &str = r#"(module
     (if (call $create_int32 (local.get $env) (i32.const 1234) (i32.const 304))
       (then (call $fail (i32.const 72))))
     (i32.load (i32.const 304)))
-  (elem (i32.const 1) $rec $leak $many20 $stale $probe $many16 $undef $badret)
+  ;; far(x): reads its callback info through pointers in a page the guest
+  ;; grew itself, past every length the host has seen; returns 3x + argc.
+  (func $far (param $env i32) (param $info i32) (result i32)
+    (local $f i32)
+    (if (i32.eqz (global.get $far_base))
+      (then
+        (local.set $f (memory.grow (i32.const 1)))
+        (if (i32.eq (local.get $f) (i32.const -1)) (then (call $fail (i32.const 91))))
+        (global.set $far_base (i32.shl (local.get $f) (i32.const 16)))))
+    (local.set $f (i32.add (global.get $far_base) (i32.const 65536)))
+    ;; argc is the last word of the page; argv, this and data lie below it.
+    (i32.store (i32.sub (local.get $f) (i32.const 4)) (i32.const 2))
+    (if (call $get_cb_info (local.get $env) (local.get $info)
+          (i32.sub (local.get $f) (i32.const 4)) (i32.sub (local.get $f) (i32.const 12))
+          (i32.sub (local.get $f) (i32.const 16)) (i32.sub (local.get $f) (i32.const 20)))
+      (then (call $fail (i32.const 92))))
+    (if (call $get_int32 (local.get $env) (i32.load (i32.sub (local.get $f) (i32.const 12)))
+          (i32.sub (local.get $f) (i32.const 24)))
+      (then (call $fail (i32.const 93))))
+    (if (call $create_int32 (local.get $env)
+          (i32.add (i32.mul (i32.load (i32.sub (local.get $f) (i32.const 24))) (i32.const 3))
+                   (i32.load (i32.sub (local.get $f) (i32.const 4))))
+          (i32.sub (local.get $f) (i32.const 28)))
+      (then (call $fail (i32.const 94))))
+    (i32.load (i32.sub (local.get $f) (i32.const 28))))
+
+  ;; The getter and setter of the accessor `acc`, registered as one pair
+  ;; with data 77: the getter returns the stored value plus its data, the
+  ;; setter stores its argument plus its data.
+  (func $acc_get (param $env i32) (param $info i32) (result i32)
+    (i32.store (i32.const 640) (i32.const 0))
+    (if (call $get_cb_info (local.get $env) (local.get $info) (i32.const 640) (i32.const 0)
+          (i32.const 0) (i32.const 644))
+      (then (call $fail (i32.const 101))))
+    (if (i32.load (i32.const 640)) (then (call $fail (i32.const 102))))
+    (if (call $create_int32 (local.get $env)
+          (i32.add (global.get $acc_value) (i32.load (i32.const 644))) (i32.const 648))
+      (then (call $fail (i32.const 103))))
+    (i32.load (i32.const 648)))
+  (func $acc_set (param $env i32) (param $info i32) (result i32)
+    (i32.store (i32.const 640) (i32.const 1))
+    (if (call $get_cb_info (local.get $env) (local.get $info) (i32.const 640) (i32.const 652)
+          (i32.const 0) (i32.const 644))
+      (then (call $fail (i32.const 104))))
+    (if (i32.ne (i32.load (i32.const 640)) (i32.const 1)) (then (call $fail (i32.const 105))))
+    (if (call $get_int32 (local.get $env) (i32.load (i32.const 652)) (i32.const 656))
+      (then (call $fail (i32.const 106))))
+    (global.set $acc_value (i32.add (i32.load (i32.const 656)) (i32.load (i32.const 644))))
+    (i32.const 0))
+
+  ;; Defines the accessor `acc` on the global object.
+  (func (export "define_accessor") (result i32)
+    (i32.store (i32.const 660) (i32.const 632))
+    (i32.store (i32.const 664) (i32.const 0))
+    (i32.store (i32.const 668) (i32.const 0))
+    (i32.store (i32.const 672) (i32.const 10))
+    (i32.store (i32.const 676) (i32.const 11))
+    (i32.store (i32.const 680) (i32.const 0))
+    (i32.store (i32.const 684) (i32.const 6))
+    (i32.store (i32.const 688) (i32.const 77))
+    (call $define_properties (global.get $env) (i32.load (i32.const 48))
+      (i32.const 1) (i32.const 660)))
+
+  ;; Calls the global function named at `name` with the argument `i`, for
+  ;; each i below n, straight from an import (no JavaScript frame between),
+  ;; inside one handle scope. Returns the sum of the results, or -1.
+  (func (export "call_direct") (param $name i32) (param $n i32) (result i32)
+    (local $i i32) (local $sum i32) (local $fn i32)
+    (if (call $open_scope (global.get $env) (i32.const 700)) (then (return (i32.const -1))))
+    (local.set $fn (call $global_value (local.get $name)))
+    (block $done
+      (loop $next
+        (br_if $done (i32.ge_u (local.get $i) (local.get $n)))
+        (if (call $create_int32 (global.get $env) (local.get $i) (i32.const 704))
+          (then (return (i32.const -1))))
+        (if (call $call_function (global.get $env) (i32.load (i32.const 48)) (local.get $fn)
+              (i32.const 1) (i32.const 704) (i32.const 708))
+          (then (return (i32.const -1))))
+        (if (call $get_int32 (global.get $env) (i32.load (i32.const 708)) (i32.const 712))
+          (then (return (i32.const -1))))
+        (local.set $sum (i32.add (local.get $sum) (i32.load (i32.const 712))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $next)))
+    (if (call $close_scope (global.get $env) (i32.load (i32.const 700)))
+      (then (return (i32.const -1))))
+    (local.get $sum))
+  (elem (i32.const 1) $rec $leak $many20 $stale $probe $many16 $undef $badret $far
+    $acc_get $acc_set)
 )"#;
 
 struct Guest {
@@ -764,4 +856,54 @@ fn envs_created_one_after_another_on_one_thread() {
         let after = eval.call(&mut guest.store, SOURCE_PTR as i32, 1);
         assert!(after.is_err(), "released env still ran: {after:?}");
     }
+}
+
+/// A callback whose out pointers lie in a page the guest grew itself, past
+/// the memory length the host had seen: the first call finds the page, and
+/// later calls read and write it like any other.
+#[test]
+fn callback_info_reaches_memory_the_guest_grew() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    let script = "(() => { let s = 0; for (let i = 0; i < 50; i++) s += far(i, 0); return s; })()";
+    assert_eq!(guest.eval(script), (0, 3 * (49 * 50 / 2) + 2 * 50, 0));
+    // One argument where two were asked for: the count that comes back is 1.
+    assert_eq!(guest.eval("far(7)"), (0, 22, 0));
+    assert_eq!(guest.release(), 0);
+}
+
+/// An accessor's getter and setter share one registration: the setter runs
+/// for a call with an argument, the getter otherwise, and both get the
+/// registration's data.
+#[test]
+fn an_accessor_pair_dispatches_by_argument_count() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    let define: TypedFunction<(), i32> = guest.typed("define_accessor");
+    assert_eq!(define.call(&mut guest.store).unwrap(), 0);
+    assert_eq!(guest.eval("acc"), (0, 77, 0));
+    let script = "(() => { let s = 0; for (let i = 0; i < 100; i++) { acc = i; s += acc; } return s; })()";
+    assert_eq!(guest.eval(script), (0, 99 * 100 / 2 + 2 * 77 * 100, 0));
+    assert_eq!(guest.release(), 0);
+}
+
+/// Guest functions called straight from an import, with no JavaScript frame
+/// between and all inside one handle scope: each call still gets its own ids
+/// and its result, also when it returns from a scope it left open.
+#[test]
+fn guest_functions_called_directly_by_an_import() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    let direct: TypedFunction<(i32, i32), i32> = guest.typed("call_direct");
+    // leak(i) returns 2i through an escapable scope it never closes.
+    assert_eq!(direct.call(&mut guest.store, 108, 500).unwrap(), 499 * 500);
+    // badret() returns 1234 from a plain scope it left open.
+    assert_eq!(direct.call(&mut guest.store, 172, 50).unwrap(), 50 * 1234);
+    // many16(i) sums its one argument.
+    assert_eq!(direct.call(&mut guest.store, 156, 500).unwrap(), 499 * 500 / 2);
+    let err: TypedFunction<(), i32> = guest.typed("err");
+    assert_eq!(err.call(&mut guest.store).unwrap(), 0);
+    // JavaScript still calls them afterwards.
+    assert_eq!(guest.eval(ROUNDS), (0, 300, 0));
+    assert_eq!(guest.release(), 0);
 }

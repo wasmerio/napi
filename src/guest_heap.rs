@@ -62,9 +62,10 @@
 //! else is acquired while the mutex is held.
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::sync::{
-    Arc, Mutex, OnceLock, Weak,
-    atomic::{AtomicU64, Ordering},
+    Arc, Mutex, MutexGuard, OnceLock, Weak,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use offset_allocator::{Allocation, Allocator as OffsetAllocator};
@@ -139,7 +140,47 @@ pub(crate) struct GuestHeap {
     /// Like the chunks this heap claims, this assumes the memory is never
     /// shrunk with `Memory::reset`.
     observed_len: AtomicU64,
+    /// Whether [`GuestHeap::maybe_refill`] would claim memory, as of the last
+    /// change to the arena's accounting: [`GuestHeap::refill_due`] reads it
+    /// without the lock. Written by [`Accounting`], under the lock.
+    refill_due: AtomicBool,
     inner: Mutex<HeapInner>,
+}
+
+/// The heap's state, locked by code that may change the arena's accounting
+/// (`free_bytes`, `pending_want`). Publishes [`GuestHeap::refill_due`] when
+/// it unlocks, so no such change can forget to.
+struct Accounting<'a> {
+    refill_due: &'a AtomicBool,
+    inner: MutexGuard<'a, HeapInner>,
+}
+
+impl Deref for Accounting<'_> {
+    type Target = HeapInner;
+
+    fn deref(&self) -> &HeapInner {
+        &self.inner
+    }
+}
+
+impl DerefMut for Accounting<'_> {
+    fn deref_mut(&mut self) -> &mut HeapInner {
+        &mut self.inner
+    }
+}
+
+impl Drop for Accounting<'_> {
+    fn drop(&mut self) {
+        self.refill_due
+            .store(self.inner.refill_due(), Ordering::Relaxed);
+    }
+}
+
+impl HeapInner {
+    /// Whether the arena is low, or an allocation recently came up short.
+    fn refill_due(&self) -> bool {
+        self.free_bytes < LOW_WATER_BYTES || self.pending_want != 0
+    }
 }
 
 // SAFETY: `base` points into a mapping that outlives the heap: the instance's
@@ -296,6 +337,8 @@ impl GuestHeap {
             budget,
             charged: AtomicU64::new(0),
             observed_len: AtomicU64::new(view.data_size()),
+            // Nothing is claimed yet.
+            refill_due: AtomicBool::new(true),
             inner: Mutex::new(HeapInner {
                 memories: vec![memory.clone()],
                 chunks: Vec::new(),
@@ -310,7 +353,7 @@ impl GuestHeap {
             // Best effort: an allocation that arrives with a store can
             // still claim for itself, so an unfunded heap is slower, not
             // broken. One that arrives without one has only this to draw on.
-            let mut inner = heap.inner.lock().expect("guest-heap mutex poisoned");
+            let mut inner = heap.accounting();
             if !heap.refill_with_store_locked(&mut inner, store, PREFUND_BYTES) {
                 integrity_warn("could not pre-claim the guest heap arena");
             }
@@ -323,6 +366,20 @@ impl GuestHeap {
     #[allow(dead_code)] // consumed by the V8 allocator hooks (next commit)
     pub(crate) fn base(&self) -> *mut u8 {
         self.base
+    }
+
+    /// The largest length of the memory seen so far, at most the heap's
+    /// range: a guest range that ends within it is mapped at [`Self::base`],
+    /// as [`Self::host_range`] has it.
+    pub(crate) fn seen_len(&self) -> u64 {
+        self.observed_len.load(Ordering::Acquire).min(self.max_bytes)
+    }
+
+    /// Takes note of the memory's base and length as a `MemoryView` just
+    /// gave them, like a lookup by [`Self::host_range`].
+    pub(crate) fn observe(&self, base_now: *mut u8, len_now: u64) {
+        self.check_base(base_now);
+        self.observed_len.fetch_max(len_now, Ordering::AcqRel);
     }
 
     /// Size in bytes of the guest address range this heap can ever cover.
@@ -400,7 +457,7 @@ impl GuestHeap {
         }
         let units = u32::try_from(len.max(1).div_ceil(UNIT as usize)).ok()?;
 
-        let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
+        let mut inner = self.accounting();
         let offset = match Self::try_chunks(&mut inner, units) {
             Some(offset) => offset,
             None => {
@@ -435,7 +492,7 @@ impl GuestHeap {
         }
         let units = u32::try_from(len.max(1).div_ceil(UNIT as usize)).ok()?;
 
-        let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
+        let mut inner = self.accounting();
         let offset = if let Some(offset) = Self::try_chunks(&mut inner, units) {
             offset
         } else {
@@ -495,13 +552,31 @@ impl GuestHeap {
         None
     }
 
+    /// Locks the heap's state for code that may change the arena's
+    /// accounting.
+    fn accounting(&self) -> Accounting<'_> {
+        Accounting {
+            refill_due: &self.refill_due,
+            inner: self.inner.lock().expect("guest-heap mutex poisoned"),
+        }
+    }
+
+    /// Whether [`Self::maybe_refill`] has anything to do, without the lock:
+    /// what the arena's accounting said when it last changed. Another thread
+    /// may be changing it now; `maybe_refill` decides again under the lock,
+    /// and a top-up this misses is made at the next import that asks.
+    #[inline]
+    pub(crate) fn refill_due(&self) -> bool {
+        self.refill_due.load(Ordering::Relaxed)
+    }
+
     /// Top the arena up when free space is low or an allocation recently came
     /// up short. Called from import boundaries, where the store is in hand
     /// without any lending, so the arena stays ahead of allocations that
     /// arrive without a store.
     pub(crate) fn maybe_refill(&self, store: &mut StoreMut<'_>) {
-        let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
-        if inner.free_bytes >= LOW_WATER_BYTES && inner.pending_want == 0 {
+        let mut inner = self.accounting();
+        if !inner.refill_due() {
             return;
         }
         let want = inner.pending_want.max(PREFUND_BYTES);
@@ -591,7 +666,7 @@ impl GuestHeap {
     /// the offset was a live allocation (unknown offsets are rejected and
     /// logged — double-frees and fabricated pointers must not corrupt state).
     pub(crate) fn free_offset(&self, offset: u32) -> bool {
-        let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
+        let mut inner = self.accounting();
         let Some(live) = inner.live.remove(&offset) else {
             integrity_warn("rejecting free of unknown guest offset");
             return false;
