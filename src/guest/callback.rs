@@ -50,6 +50,17 @@ pub(crate) fn take_pending_guest_exit() -> Option<ExitCode> {
     PENDING_GUEST_EXIT.with(|slot| slot.take())
 }
 
+/// What [`snapi_host_invoke_wasm_callback`] returns in place of a value id
+/// when the guest's store is not lent to the thread, so the guest function
+/// did not run. The bridge turns it into a JavaScript error.
+///
+/// No value id has this value: an id holds its slot index plus one in the
+/// upper 20 bits, which is never zero, and here those bits are zero.
+/// `kCallbackStoreNotLent` in `napi_bridge_init.cc` is the same constant and
+/// checks that against the id layout. A guest that returns this number
+/// itself is handled in [`snapi_host_invoke_wasm_callback`].
+pub(crate) const CALLBACK_STORE_NOT_LENT: u32 = 1;
+
 /// What a V8 callback needs to reach the guest: a handle to the guest
 /// instance's N-API env and the id of its store. Neither changes for the
 /// life of a bridge env, so [`install_callback_ctx`] gives each env one when
@@ -244,12 +255,17 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
     });
 
     match dispatched {
+        // A guest function that returns the sentinel's number returned no
+        // valid value id; report that as the null id, so the bridge does not
+        // take it for a call that never ran.
+        Some(CALLBACK_STORE_NOT_LENT) => 0,
         Some(result) => result,
         None => {
             // No import of this guest lent its store to the code that entered
-            // V8, so there is no way back into the guest from here.
+            // V8, so there is no way back into the guest from here. The
+            // bridge throws in the JavaScript that made the call.
             eprintln!("[callback trampoline] the guest's store is not lent to this thread");
-            0
+            CALLBACK_STORE_NOT_LENT
         }
     }
 }
@@ -356,9 +372,12 @@ mod tests {
         };
         let mut invoke = || snapi_host_invoke_wasm_callback((&raw mut ctx).cast(), 0, 0, 0);
         // No store lent, then another store lent: the guest is out of reach.
-        assert_eq!(invoke(), 0);
+        assert_eq!(invoke(), CALLBACK_STORE_NOT_LENT);
         let mut other = Store::default();
-        assert_eq!(other.as_store_mut().parked(&mut invoke), 0);
+        assert_eq!(
+            other.as_store_mut().parked(&mut invoke),
+            CALLBACK_STORE_NOT_LENT
+        );
         assert_eq!(store.as_store_mut().parked(invoke), 17);
     }
 }

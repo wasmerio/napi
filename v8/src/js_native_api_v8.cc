@@ -3550,19 +3550,24 @@ napi_status NAPI_CDECL napi_get_and_clear_last_exception(napi_env env,
   if (env->last_exception.IsEmpty()) return napi_generic_failure;
   v8::Local<v8::Value> ex = env->last_exception.Get(env->isolate);
   napi_value wrapped = napi_v8_wrap_value(env, ex);
-  if (wrapped != nullptr &&
-      env->last_exception_source_line.empty() &&
-      env->last_exception_thrown_at.empty()) {
-    v8::Local<v8::Message> message;
-    if (!env->last_exception_message.IsEmpty()) {
-      message = env->last_exception_message.Get(env->isolate);
-    }
+  v8::Local<v8::Message> message;
+  if (!env->last_exception_message.IsEmpty()) {
+    message = env->last_exception_message.Get(env->isolate);
+  }
+  const std::string source_line = std::move(env->last_exception_source_line);
+  const std::string thrown_at = std::move(env->last_exception_thrown_at);
+  const bool was_termination = env->last_exception_is_termination;
+  // The exception is taken before it is formatted: formatting can run the
+  // source-map callback, and a native function that callback calls must not
+  // find this exception still pending and rethrow it.
+  ClearLastException(env);
+  if (wrapped != nullptr && source_line.empty() && thrown_at.empty()) {
     if (!message.IsEmpty()) {
       const auto source = unofficial_napi_internal::GetErrorSource(env, message);
       // That can run the source-map callback, JS that V8 may terminate. The
       // V8 calls formatting makes would then drop the termination, as
       // NAPI_V8_RETURN_IF_TERMINATING says entering V8 does.
-      if (!TerminatedOrTerminating(env)) {
+      if (!was_termination && !TerminatedOrTerminating(env)) {
         if (source.attach_arrow) {
           unofficial_napi_internal::SetArrowMessageFromString(
               env->isolate, env->context(), ex, source.text);
@@ -3577,13 +3582,9 @@ napi_status NAPI_CDECL napi_get_and_clear_last_exception(napi_env env,
       (void)unofficial_napi_internal::PreserveErrorSourceMessage(env, wrapped);
     }
   } else {
-    unofficial_napi_internal::PreserveErrorFormatting(
-        env,
-        ex,
-        env->last_exception_source_line,
-        env->last_exception_thrown_at);
+    unofficial_napi_internal::PreserveErrorFormatting(env, ex, source_line, thrown_at);
   }
-  env->last_exception_message.Reset();
+  // Whatever the callback left pending goes with the exception, as before.
   ClearLastException(env);
   *result = napi_v8_wrap_value(env, ex);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;

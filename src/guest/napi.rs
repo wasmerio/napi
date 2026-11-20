@@ -939,30 +939,33 @@ fn guest_unofficial_napi_set_promise_reject_callback(
     unsafe { snapi_bridge_unofficial_set_promise_reject_callback(env_handle, callback_id) }
 }
 
+// Listing a Proxy's keys runs its `ownKeys` trap, so this runs in the callback
+// context.
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_get_own_non_index_properties(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     value: u32,
     filter_bits: u32,
     result_out_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     if value == 0 || result_out_ptr == 0 {
-        return 1;
+        return Ok(1);
     }
     let env_handle = snapi_env(&env, napi_env);
     let mut out = 0u32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_get_own_non_index_properties(
             env_handle,
             value,
             filter_bits,
             &mut out,
         )
-    };
+    })?;
     if status == 0 {
         write_guest_u32(&mut env, result_out_ptr, out);
     }
-    status
+    Ok(status)
 }
 
 // Reading `names` can run its elements' getters (author code if an embedder
@@ -970,8 +973,8 @@ fn guest_unofficial_napi_get_own_non_index_properties(
 //
 // An initializer that is a guest function, or calls one, can only reach the
 // guest from an import that lends the store. A first read from one that does
-// not (napi_coerce_to_string, for one) gets undefined from the guest function,
-// as any getter would, and V8 keeps that as the property's value.
+// not makes the guest function throw, as it would from any getter, and the
+// property stays lazy.
 #[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_define_lazy_data_properties(
     mut env: FunctionEnvMut<NapiEnv>,
@@ -1048,17 +1051,20 @@ fn guest_unofficial_napi_get_hash_seed(
     status
 }
 
+// Formatting an error's source line calls the env's source-map callback, if
+// one is configured, and that callback may call guest functions.
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_get_error_metadata(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     error: u32,
     mode: i32,
     metadata_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     // The whole 28-byte metadata struct must lie below 4 GiB, so the field
     // offsets below cannot wrap.
     if metadata_ptr != 0 && u64::from(metadata_ptr) + 28 > 1u64 << 32 {
-        return 1;
+        return Ok(1);
     }
     let env_handle = snapi_env(&env, napi_env);
     let error_id = error;
@@ -1069,7 +1075,7 @@ fn guest_unofficial_napi_get_error_metadata(
     let mut line_number = 0i32;
     let mut start_column = 0i32;
     let mut end_column = 0i32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_get_error_metadata(
             env_handle,
             error_id,
@@ -1082,9 +1088,9 @@ fn guest_unofficial_napi_get_error_metadata(
             &mut start_column,
             &mut end_column,
         )
-    };
+    })?;
     if status != 0 {
-        return status;
+        return Ok(status);
     }
     if metadata_ptr != 0 {
         write_guest_u32(&mut env, metadata_ptr, source_line_id);
@@ -1095,7 +1101,7 @@ fn guest_unofficial_napi_get_error_metadata(
         write_guest_i32(&mut env, metadata_ptr + 20, start_column);
         write_guest_i32(&mut env, metadata_ptr + 24, end_column);
     }
-    0
+    Ok(0)
 }
 
 fn guest_unofficial_napi_configure_source_maps(
@@ -1109,24 +1115,32 @@ fn guest_unofficial_napi_configure_source_maps(
     unsafe { snapi_bridge_unofficial_configure_source_maps(env_handle, enabled, callback_id) }
 }
 
+// Runs the source-map callback, as unofficial_napi_get_error_metadata does.
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_preserve_error_source_message(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     error: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let env_handle = snapi_env(&env, napi_env);
-    let error_id = error;
-    unsafe { snapi_bridge_unofficial_preserve_error_source_message(env_handle, error_id) }
+    with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_preserve_error_source_message(env_handle, error)
+    })
 }
 
+// Marking a rejected promise as handled runs the env's promise-reject
+// callback, which may call guest functions.
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_mark_promise_as_handled(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     promise: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let env_handle = snapi_env(&env, napi_env);
     let promise_id = promise;
-    unsafe { snapi_bridge_unofficial_mark_promise_as_handled(env_handle, promise_id) }
+    with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_mark_promise_as_handled(env_handle, promise_id)
+    })
 }
 
 fn guest_unofficial_napi_get_heap_statistics(
@@ -1468,7 +1482,7 @@ fn guest_unofficial_napi_contextify_run_script(
 /// Deprecated (use unofficial_napi_compile_function), kept for older
 /// guests. The parsing context names the realm; 0, undefined or null is the
 /// current realm.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
 fn guest_unofficial_napi_contextify_compile_function(
     env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
@@ -1481,14 +1495,14 @@ fn guest_unofficial_napi_contextify_compile_function(
     params_or_undefined: u32,
     host_defined_option_id: u32,
     result_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let realm = match compat::realm_from_context(
         snapi_env(&env, napi_env),
         parsing_context_or_undefined,
         true,
     ) {
         Ok(realm) => realm,
-        Err(status) => return status,
+        Err(status) => return Ok(status),
     };
     guest_unofficial_napi_compile_function(
         env,
@@ -1639,7 +1653,8 @@ fn guest_unofficial_napi_run_script(
     Ok(status)
 }
 
-#[allow(clippy::too_many_arguments)]
+// Reading context extensions and parameters can run their array getters.
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
 fn guest_unofficial_napi_compile_function(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
@@ -1652,13 +1667,13 @@ fn guest_unofficial_napi_compile_function(
     params_or_undefined: u32,
     host_defined_option_id: u32,
     result_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let Some((source_text, source_bytecode)) = abi::read_js_source(&mut env, source) else {
-        return 1;
+        return Ok(1);
     };
     let env_handle = snapi_env(&env, napi_env);
     let mut result_id = 0u32;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_compile_function(
             env_handle,
             realm,
@@ -1672,37 +1687,39 @@ fn guest_unofficial_napi_compile_function(
             host_defined_option_id,
             &mut result_id,
         )
-    };
+    })?;
     if status == 0 && result_ptr != 0 {
         write_guest_u32(&mut env, result_ptr, result_id);
     }
-    status
+    Ok(status)
 }
 
+// Opening bytecode also reads the parameter array through V8.
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_bytecode_open(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     options_ptr: u32,
     result_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let Some(options) = abi::read_bytecode_open(&mut env, options_ptr) else {
-        return 1;
+        return Ok(1);
     };
     // The whole 6-byte result must lie below 4 GiB (checked before
     // anything is created), so the field offsets below cannot wrap.
     if result_ptr == 0 || u64::from(result_ptr) + 6 > 1u64 << 32 {
-        return 1;
+        return Ok(1);
     }
     let env_handle = snapi_env(&env, napi_env);
     let realm =
         match compat::bytecode_open_realm(env_handle, options.version, options.realm_or_null) {
             Ok(realm) => realm,
-            Err(status) => return status,
+            Err(status) => return Ok(status),
         };
     let mut bytecode_id = 0u32;
     let mut cache_rejected = 0u8;
     let mut can_parse_as_module = 0u8;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_bytecode_open(
             env_handle,
             realm,
@@ -1725,11 +1742,11 @@ fn guest_unofficial_napi_bytecode_open(
             &mut cache_rejected,
             &mut can_parse_as_module,
         )
-    };
+    })?;
     write_guest_u32(&mut env, result_ptr, bytecode_id);
     write_guest_u8(&mut env, result_ptr + 4, cache_rejected);
     write_guest_u8(&mut env, result_ptr + 5, can_parse_as_module);
-    status
+    Ok(status)
 }
 
 #[allow(clippy::result_large_err)]
@@ -1760,19 +1777,22 @@ fn guest_unofficial_napi_bytecode_release(
     unsafe { snapi_bridge_unofficial_bytecode_release(env_handle, bytecode) }
 }
 
+// A module that fails to compile gets its source line formatted, which runs
+// the source-map callback (see unofficial_napi_get_error_metadata).
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_module_wrap_create(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     options_ptr: u32,
     result_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let Some(options) = abi::read_module_create(&mut env, options_ptr) else {
-        return 1;
+        return Ok(1);
     };
     // The whole 9-byte result must lie below 4 GiB (checked before
     // anything is created), so the field offsets below cannot wrap.
     if result_ptr == 0 || u64::from(result_ptr) + 9 > 1u64 << 32 {
-        return 1;
+        return Ok(1);
     }
     let env_handle = snapi_env(&env, napi_env);
     let realm = match compat::module_create_realm(
@@ -1782,12 +1802,12 @@ fn guest_unofficial_napi_module_wrap_create(
         options.realm_or_null,
     ) {
         Ok(realm) => realm,
-        Err(status) => return status,
+        Err(status) => return Ok(status),
     };
     let mut handle_id = 0u32;
     let mut requests_id = 0u32;
     let mut has_top_level_await = 0u8;
-    let status = unsafe {
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_module_wrap_create(
             env_handle,
             options.kind,
@@ -1805,13 +1825,13 @@ fn guest_unofficial_napi_module_wrap_create(
             &mut requests_id,
             &mut has_top_level_await,
         )
-    };
+    })?;
     if status == 0 {
         write_guest_u32(&mut env, result_ptr, handle_id);
         write_guest_u32(&mut env, result_ptr + 4, requests_id);
         write_guest_bytes(&mut env, result_ptr + 8, &[has_top_level_await]);
     }
-    status
+    Ok(status)
 }
 
 fn guest_unofficial_napi_module_wrap_destroy(
@@ -1850,13 +1870,18 @@ fn guest_unofficial_napi_module_wrap_link(
     }
 }
 
+// A module that fails to instantiate gets its source line formatted, which
+// runs the source-map callback (see unofficial_napi_get_error_metadata).
+#[allow(clippy::result_large_err)]
 fn guest_unofficial_napi_module_wrap_instantiate(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     handle: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let env_handle = snapi_env(&env, napi_env);
-    unsafe { snapi_bridge_unofficial_module_wrap_instantiate(env_handle, handle) }
+    with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_unofficial_module_wrap_instantiate(env_handle, handle)
+    })
 }
 
 #[allow(clippy::result_large_err)]
@@ -1981,22 +2006,24 @@ fn guest_unofficial_napi_module_wrap_check_unsettled_top_level_await(
     handle: u32,
     warnings: i32,
     settled_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let env_handle = snapi_env(&env, napi_env);
     let handle_id = handle;
     let mut settled = 0i32;
-    let status = unsafe {
+    // Printing a stalled await formats its source line, which runs the
+    // source-map callback (see unofficial_napi_get_error_metadata).
+    let status = with_cb_context(&mut env, napi_env, || unsafe {
         snapi_bridge_unofficial_module_wrap_check_unsettled_top_level_await(
             env_handle,
             handle_id,
             warnings,
             &mut settled,
         )
-    };
+    })?;
     if status == 0 && settled_ptr != 0 {
         write_guest_u8(&mut env, settled_ptr, (settled != 0) as u8);
     }
-    status
+    Ok(status)
 }
 
 fn guest_unofficial_napi_module_wrap_set_export(
@@ -3004,12 +3031,30 @@ fn guest_napi_get_prototype(mut env: FunctionEnvMut<NapiEnv>, e: u32, o: u32, rp
     s
 }
 
-fn guest_napi_object_freeze(env: FunctionEnvMut<NapiEnv>, e: u32, o: u32) -> i32 {
-    unsafe { snapi_bridge_object_freeze(snapi_env(&env, e), o) }
+// Freezing or sealing a Proxy runs its traps, so both run in the callback
+// context.
+#[allow(clippy::result_large_err)]
+fn guest_napi_object_freeze(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: u32,
+    o: u32,
+) -> Result<i32, WasiError> {
+    let snapi = snapi_env(&env, e);
+    with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_object_freeze(snapi, o)
+    })
 }
 
-fn guest_napi_object_seal(env: FunctionEnvMut<NapiEnv>, e: u32, o: u32) -> i32 {
-    unsafe { snapi_bridge_object_seal(snapi_env(&env, e), o) }
+#[allow(clippy::result_large_err)]
+fn guest_napi_object_seal(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: u32,
+    o: u32,
+) -> Result<i32, WasiError> {
+    let snapi = snapi_env(&env, e);
+    with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_object_seal(snapi, o)
+    })
 }
 
 // --- Comparison ---
@@ -3128,40 +3173,77 @@ fn guest_napi_is_exception_pending(mut env: FunctionEnvMut<NapiEnv>, e: u32, rp:
     s
 }
 
+// Taking the exception formats its source line, which runs the source-map
+// callback (see unofficial_napi_get_error_metadata).
+#[allow(clippy::result_large_err)]
 fn guest_napi_get_and_clear_last_exception(
     mut env: FunctionEnvMut<NapiEnv>,
     e: u32,
     rp: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let mut out: u32 = 0;
-    let s = unsafe { snapi_bridge_get_and_clear_last_exception(snapi_env(&env, e), &mut out) };
+    let snapi = snapi_env(&env, e);
+    let s = with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_get_and_clear_last_exception(snapi, &mut out)
+    })?;
     if s == 0 {
         write_guest_u32(&mut env, rp, out);
     }
-    s
+    Ok(s)
 }
 
 // --- Promise ---
 
-fn guest_napi_create_promise(mut env: FunctionEnvMut<NapiEnv>, e: u32, dp: u32, rp: u32) -> i32 {
+// Creating a promise runs the env's promise init hook, if one is set, and
+// that hook may call guest functions.
+#[allow(clippy::result_large_err)]
+fn guest_napi_create_promise(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: u32,
+    dp: u32,
+    rp: u32,
+) -> Result<i32, WasiError> {
     let mut deferred_id: u32 = 0;
     let mut promise_id: u32 = 0;
-    let s = unsafe {
-        snapi_bridge_create_promise(snapi_env(&env, e), &mut deferred_id, &mut promise_id)
-    };
+    let snapi = snapi_env(&env, e);
+    let s = with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_create_promise(snapi, &mut deferred_id, &mut promise_id)
+    })?;
     if s == 0 {
         write_guest_u32(&mut env, dp, deferred_id);
         write_guest_u32(&mut env, rp, promise_id);
     }
-    s
+    Ok(s)
 }
 
-fn guest_napi_resolve_deferred(env: FunctionEnvMut<NapiEnv>, e: u32, d: u32, v: u32) -> i32 {
-    unsafe { snapi_bridge_resolve_deferred(snapi_env(&env, e), d, v) }
+// Resolving reads the value's `then` at once, which can run a getter or a
+// Proxy trap, so this runs in the callback context.
+#[allow(clippy::result_large_err)]
+fn guest_napi_resolve_deferred(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: u32,
+    d: u32,
+    v: u32,
+) -> Result<i32, WasiError> {
+    let snapi = snapi_env(&env, e);
+    with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_resolve_deferred(snapi, d, v)
+    })
 }
 
-fn guest_napi_reject_deferred(env: FunctionEnvMut<NapiEnv>, e: u32, d: u32, v: u32) -> i32 {
-    unsafe { snapi_bridge_reject_deferred(snapi_env(&env, e), d, v) }
+// Rejecting a promise that has no handler runs the env's promise-reject
+// callback before returning, and that callback may call guest functions.
+#[allow(clippy::result_large_err)]
+fn guest_napi_reject_deferred(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: u32,
+    d: u32,
+    v: u32,
+) -> Result<i32, WasiError> {
+    let snapi = snapi_env(&env, e);
+    with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_reject_deferred(snapi, d, v)
+    })
 }
 
 // --- ArrayBuffer ---
@@ -3426,17 +3508,21 @@ fn guest_node_api_create_sharedarraybuffer(
     s
 }
 
+// Setting a Proxy's prototype runs its `setPrototypeOf` trap, so this runs in
+// the callback context.
+#[allow(clippy::result_large_err)]
 fn guest_node_api_set_prototype(
-    env: FunctionEnvMut<NapiEnv>,
+    mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     object: u32,
     prototype: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let object_id = object;
     let prototype_id = prototype;
-    unsafe {
-        snapi_bridge_node_api_set_prototype(snapi_env(&env, napi_env), object_id, prototype_id)
-    }
+    let snapi = snapi_env(&env, napi_env);
+    with_cb_context(&mut env, napi_env, || unsafe {
+        snapi_bridge_node_api_set_prototype(snapi, object_id, prototype_id)
+    })
 }
 
 // --- TypedArray ---
@@ -4190,17 +4276,20 @@ fn guest_napi_define_class(
     0
 }
 
+// Defining a property on a Proxy runs its `defineProperty` trap, so the
+// definition runs in the callback context.
+#[allow(clippy::result_large_err)]
 fn guest_napi_define_properties(
     mut env: FunctionEnvMut<NapiEnv>,
     e: u32,
     obj: u32,
     prop_count: u32,
     props_ptr: u32,
-) -> i32 {
+) -> Result<i32, WasiError> {
     let snapi = snapi_env(&env, e);
     let pc = prop_count;
     if pc == 0 {
-        return unsafe {
+        return Ok(unsafe {
             snapi_bridge_define_properties(
                 snapi,
                 obj,
@@ -4214,18 +4303,18 @@ fn guest_napi_define_properties(
                 std::ptr::null(),
                 std::ptr::null(),
             )
-        };
+        });
     }
 
     let total_bytes = pc as usize * PROP_DESC_SIZE;
     let Some(raw) = read_guest_bytes(&mut env, props_ptr, total_bytes) else {
-        return 1;
+        return Ok(1);
     };
     // The per-property arrays below and every name, however short, stay
     // charged until the bridge call returns.
     let mut names_charge = TransientCharge::default();
     if !names_charge.add(&env.data().budget, pc as usize * PROP_SCRATCH_BYTES) {
-        return 1;
+        return Ok(1);
     }
 
     let mut prop_names_c: Vec<CString> = Vec::with_capacity(pc as usize);
@@ -4280,7 +4369,7 @@ fn guest_napi_define_properties(
         let pname = if utf8name_guest != 0 {
             match try_read_guest_c_string_max(&mut env, utf8name_guest, V8_MAX_STRING_BYTES) {
                 Ok(name) => name.unwrap_or_default(),
-                Err(CopyRefused) => return 9,
+                Err(CopyRefused) => return Ok(9),
             }
         } else {
             HostCopy::default()
@@ -4290,7 +4379,7 @@ fn guest_napi_define_properties(
         if pname.len() < UNCHARGED_HOST_COPY_BYTES
             && !names_charge.add(&env.data().budget, pname.len() + 1)
         {
-            return 1;
+            return Ok(1);
         }
         let c_pname = CString::new(pname).unwrap_or_default();
         prop_name_ids.push(name_id);
@@ -4298,7 +4387,7 @@ fn guest_napi_define_properties(
         if method_ptr != 0 {
             let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
             if reg_id == 0 {
-                return 9; // the bookkeeping budget refused the registration
+                return Ok(9); // the bookkeeping budget refused the registration
             }
             unsafe {
                 snapi_bridge_register_callback(snapi, reg_id, e, method_ptr, data_ptr as u64)
@@ -4311,7 +4400,7 @@ fn guest_napi_define_properties(
         } else if getter_ptr != 0 && setter_ptr != 0 {
             let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
             if reg_id == 0 {
-                return 9; // the bookkeeping budget refused the registration
+                return Ok(9); // the bookkeeping budget refused the registration
             }
             unsafe {
                 snapi_bridge_register_callback_pair(
@@ -4331,7 +4420,7 @@ fn guest_napi_define_properties(
         } else if getter_ptr != 0 {
             let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
             if reg_id == 0 {
-                return 9; // the bookkeeping budget refused the registration
+                return Ok(9); // the bookkeeping budget refused the registration
             }
             unsafe {
                 snapi_bridge_register_callback(snapi, reg_id, e, getter_ptr, data_ptr as u64)
@@ -4344,7 +4433,7 @@ fn guest_napi_define_properties(
         } else if setter_ptr != 0 {
             let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id(snapi) };
             if reg_id == 0 {
-                return 9; // the bookkeeping budget refused the registration
+                return Ok(9); // the bookkeeping budget refused the registration
             }
             unsafe {
                 snapi_bridge_register_callback(snapi, reg_id, e, setter_ptr, data_ptr as u64)
@@ -4370,7 +4459,7 @@ fn guest_napi_define_properties(
         prop_names_ptrs.push(cn.as_ptr());
     }
 
-    unsafe {
+    with_cb_context(&mut env, e, || unsafe {
         snapi_bridge_define_properties(
             snapi,
             obj,
@@ -4384,7 +4473,7 @@ fn guest_napi_define_properties(
             prop_setter_reg_ids.as_ptr(),
             prop_attributes.as_ptr(),
         )
-    }
+    })
 }
 
 // --- Script execution ---

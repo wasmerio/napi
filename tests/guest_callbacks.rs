@@ -1,7 +1,10 @@
 //! JavaScript calling guest functions through real Wasmer dispatch, the
 //! bridge and V8: nested callbacks, scopes a callback leaves open, return
-//! values created in them, argument counts, missing arguments, and envs
-//! created one after another on one thread.
+//! values created in them, argument counts, missing arguments, settling a
+//! deferred (and settling it again from inside), Proxy traps, promise hooks
+//! and the source-map callback run by an import, a call that cannot reach the
+//! guest, raw return values, and envs created one after another on one
+//! thread.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -42,9 +45,41 @@ const WAT: &str = r#"(module
     (func $open_esc (param i32 i32) (result i32)))
   (import "napi" "napi_escape_handle" (func $escape (param i32 i32 i32 i32) (result i32)))
   (import "napi" "napi_typeof" (func $typeof (param i32 i32 i32) (result i32)))
+  (import "napi" "napi_create_promise" (func $create_promise (param i32 i32 i32) (result i32)))
+  (import "napi" "napi_resolve_deferred"
+    (func $resolve_deferred (param i32 i32 i32) (result i32)))
+  (import "napi" "napi_reject_deferred"
+    (func $reject_deferred (param i32 i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_set_promise_reject_callback"
+    (func $set_reject_callback (param i32 i32) (result i32)))
+  (import "napi" "napi_get_undefined" (func $get_undefined (param i32 i32) (result i32)))
+  (import "napi" "napi_create_error" (func $create_error (param i32 i32 i32 i32) (result i32)))
+  (import "napi" "napi_get_prototype" (func $get_prototype (param i32 i32 i32) (result i32)))
+  (import "napi" "node_api_set_prototype"
+    (func $set_prototype (param i32 i32 i32) (result i32)))
+  (import "napi" "napi_object_freeze" (func $freeze (param i32 i32) (result i32)))
+  (import "napi" "napi_object_seal" (func $seal (param i32 i32) (result i32)))
+  (import "napi" "napi_define_properties"
+    (func $define_properties (param i32 i32 i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_get_own_non_index_properties"
+    (func $own_non_index (param i32 i32 i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_mark_promise_as_handled"
+    (func $mark_handled (param i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_set_promise_hooks"
+    (func $set_promise_hooks (param i32 i32 i32 i32 i32) (result i32)))
+  (import "napi" "napi_get_and_clear_last_exception"
+    (func $take_exception (param i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_configure_source_maps"
+    (func $configure_source_maps (param i32 i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_preserve_error_source_message"
+    (func $preserve_source_message (param i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_get_error_metadata"
+    (func $get_error_metadata (param i32 i32 i32 i32) (result i32)))
 
   ;; 8 env, 12 scope, 28 string, 32 script result, 48 global, 52 function,
-  ;; 72 int out, 200..228 callback scratch, 432..439 coercion scratch.
+  ;; 72 int out, 200..251 callback scratch, 432..439 coercion scratch,
+  ;; 440 deferred, 444 promise, 448 import result, 560..591 property
+  ;; descriptor, 656..683 error metadata.
   ;; Callbacks take 64- or 256-byte frames from a stack starting at 32768
   ;; so nested calls keep their own out-slots.
   (memory (export "memory") 2)
@@ -62,9 +97,17 @@ const WAT: &str = r#"(module
   (data (i32.const 156) "many16\00")
   (data (i32.const 164) "undef\00")
   (data (i32.const 172) "badret\00")
+  (data (i32.const 180) "resettle\00")
+  (data (i32.const 192) "raw\00")
+  (data (i32.const 624) "mapper\00")
+  (data (i32.const 640) "thrown\00")
   (data (i32.const 480) "coercionInput\00")
   (data (i32.const 496) "coercionResult\00")
   (data (i32.const 512) "InstanceCheck\00")
+  (data (i32.const 528) "rejectHook\00")
+  (data (i32.const 544) "settleValue\00")
+  (data (i32.const 592) "p\00")
+  (data (i32.const 608) "initHook\00")
 
   ;; Records the first failing step; the host reads it through `err`.
   (func $fail (param $code i32)
@@ -92,7 +135,9 @@ const WAT: &str = r#"(module
     (call $define (i32.const 132) (i32.const 5))
     (call $define (i32.const 156) (i32.const 6))
     (call $define (i32.const 164) (i32.const 7))
-    (call $define (i32.const 172) (i32.const 8)))
+    (call $define (i32.const 172) (i32.const 8))
+    (call $define (i32.const 180) (i32.const 9))
+    (call $define (i32.const 192) (i32.const 10)))
 
   (func (export "release") (result i32)
     (call $release_env (global.get $scope) (i32.const 0)))
@@ -130,6 +175,93 @@ const WAT: &str = r#"(module
           (call $global_value (i32.const 512)) (i32.const 436))
       (then (return (i32.const -1))))
     (i32.load8_u (i32.const 436)))
+
+  ;; Makes the global `rejectHook` the env's promise-reject callback.
+  (func (export "watch_rejections") (result i32)
+    (call $set_reject_callback (global.get $env) (call $global_value (i32.const 528))))
+
+  ;; Creates a promise and rejects or resolves it with the global
+  ;; `settleValue`.
+  (func (export "settle") (param $reject i32) (result i32)
+    (local $value i32)
+    (if (call $create_promise (global.get $env) (i32.const 440) (i32.const 444))
+      (then (return (i32.const -1))))
+    (local.set $value (call $global_value (i32.const 544)))
+    (if (result i32) (local.get $reject)
+      (then (call $reject_deferred (global.get $env) (i32.load (i32.const 440))
+              (local.get $value)))
+      (else (call $resolve_deferred (global.get $env) (i32.load (i32.const 440))
+              (local.get $value)))))
+
+  ;; Creates an error whose code and message are both "p".
+  (func (export "create_error") (result i32)
+    (if (call $create_string (global.get $env) (i32.const 592) (i32.const 1) (i32.const 448))
+      (then (return (i32.const -1))))
+    (call $create_error (global.get $env) (i32.load (i32.const 448))
+      (i32.load (i32.const 448)) (i32.const 440)))
+
+  ;; Makes the global `initHook` the env's promise init hook.
+  (func (export "watch_promises") (result i32)
+    (if (call $get_undefined (global.get $env) (i32.const 448)) (then (return (i32.const -1))))
+    (call $set_promise_hooks (global.get $env) (call $global_value (i32.const 608))
+      (i32.load (i32.const 448)) (i32.load (i32.const 448)) (i32.load (i32.const 448))))
+
+  ;; Makes the global `mapper` the env's source-map callback.
+  (func (export "map_sources") (result i32)
+    (call $configure_source_maps (global.get $env) (i32.const 1)
+      (call $global_value (i32.const 624))))
+
+  ;; Formats the source line of the global `thrown`:
+  ;; 0 unofficial_napi_preserve_error_source_message,
+  ;; 1 unofficial_napi_get_error_metadata in its `current` mode.
+  (func (export "format_error") (param $which i32) (result i32)
+    (local $value i32)
+    (local.set $value (call $global_value (i32.const 640)))
+    (if (result i32) (local.get $which)
+      (then (call $get_error_metadata (global.get $env) (local.get $value)
+              (i32.const 0) (i32.const 656)))
+      (else (call $preserve_source_message (global.get $env) (local.get $value)))))
+
+  ;; Takes the pending exception.
+  (func (export "take_exception") (result i32)
+    (call $take_exception (global.get $env) (i32.const 448)))
+
+  ;; Calls one import on the global `settleValue`: 0 node_api_set_prototype
+  ;; (to the global object), 1 napi_object_freeze, 2 napi_object_seal,
+  ;; 3 napi_define_properties (a data property `p`),
+  ;; 4 unofficial_napi_get_own_non_index_properties,
+  ;; 5 unofficial_napi_mark_promise_as_handled, 6 napi_get_prototype. Any
+  ;; other selector ignores the global and calls napi_create_promise.
+  (func (export "call_import") (param $which i32) (result i32)
+    (local $value i32)
+    (local.set $value (call $global_value (i32.const 544)))
+    (if (i32.eq (local.get $which) (i32.const 0))
+      (then (return (call $set_prototype (global.get $env) (local.get $value)
+                      (i32.load (i32.const 48))))))
+    (if (i32.eq (local.get $which) (i32.const 1))
+      (then (return (call $freeze (global.get $env) (local.get $value)))))
+    (if (i32.eq (local.get $which) (i32.const 2))
+      (then (return (call $seal (global.get $env) (local.get $value)))))
+    (if (i32.eq (local.get $which) (i32.const 3))
+      (then
+        (i32.store (i32.const 560) (i32.const 592))
+        (i32.store (i32.const 564) (i32.const 0))
+        (i32.store (i32.const 568) (i32.const 0))
+        (i32.store (i32.const 572) (i32.const 0))
+        (i32.store (i32.const 576) (i32.const 0))
+        (i32.store (i32.const 580) (i32.load (i32.const 48)))
+        (i32.store (i32.const 584) (i32.const 7))
+        (i32.store (i32.const 588) (i32.const 0))
+        (return (call $define_properties (global.get $env) (local.get $value)
+                  (i32.const 1) (i32.const 560)))))
+    (if (i32.eq (local.get $which) (i32.const 4))
+      (then (return (call $own_non_index (global.get $env) (local.get $value)
+                      (i32.const 0) (i32.const 448)))))
+    (if (i32.eq (local.get $which) (i32.const 5))
+      (then (return (call $mark_handled (global.get $env) (local.get $value)))))
+    (if (i32.eq (local.get $which) (i32.const 6))
+      (then (return (call $get_prototype (global.get $env) (local.get $value) (i32.const 448)))))
+    (call $create_promise (global.get $env) (i32.const 440) (i32.const 444)))
 
   ;; rec(n, step): inside its own scope, calls step(n - 1), which calls rec
   ;; again; then re-reads its own callback info after the inner callbacks
@@ -315,7 +447,33 @@ const WAT: &str = r#"(module
     (if (call $create_int32 (local.get $env) (i32.const 1234) (i32.const 304))
       (then (call $fail (i32.const 72))))
     (i32.load (i32.const 304)))
-  (elem (i32.const 1) $rec $leak $many20 $stale $probe $many16 $undef $badret)
+
+  ;; resettle(): resolves and then rejects, with undefined, the deferred that
+  ;; `settle` is settling. Returns the first status * 100 + the second.
+  (func $resettle (param $env i32) (param $info i32) (result i32)
+    (local $resolved i32) (local $rejected i32)
+    (if (call $get_undefined (local.get $env) (i32.const 232))
+      (then (call $fail (i32.const 91))))
+    (local.set $resolved (call $resolve_deferred (local.get $env) (i32.load (i32.const 440))
+      (i32.load (i32.const 232))))
+    (local.set $rejected (call $reject_deferred (local.get $env) (i32.load (i32.const 440))
+      (i32.load (i32.const 232))))
+    (if (call $create_int32 (local.get $env)
+          (i32.add (i32.mul (local.get $resolved) (i32.const 100)) (local.get $rejected))
+          (i32.const 236))
+      (then (call $fail (i32.const 92))))
+    (i32.load (i32.const 236)))
+
+  ;; raw(x): returns the number x itself where a value id is expected.
+  (func $raw (param $env i32) (param $info i32) (result i32)
+    (i32.store (i32.const 240) (i32.const 1))
+    (if (call $get_cb_info (local.get $env) (local.get $info) (i32.const 240) (i32.const 244)
+          (i32.const 0) (i32.const 0))
+      (then (call $fail (i32.const 93))))
+    (if (call $get_int32 (local.get $env) (i32.load (i32.const 244)) (i32.const 248))
+      (then (call $fail (i32.const 94))))
+    (i32.load (i32.const 248)))
+  (elem (i32.const 1) $rec $leak $many20 $stale $probe $many16 $undef $badret $resettle $raw)
 )"#;
 
 struct Guest {
@@ -470,6 +628,279 @@ fn coercion_and_instanceof_can_call_guest_functions() {
     );
     assert_eq!(instanceof.call(&mut guest.store).unwrap(), 1);
     assert_eq!(guest.eval("0"), (0, 0, 0));
+    assert_eq!(guest.release(), 0);
+}
+
+/// Settling a deferred runs JavaScript before the import returns: rejecting
+/// a promise that has no handler runs the env's promise-reject callback, and
+/// resolving reads the value's `then`. Both can call guest functions.
+#[test]
+fn settling_a_deferred_can_call_guest_functions() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    let watch: TypedFunction<(), i32> = guest.typed("watch_rejections");
+    let settle: TypedFunction<i32, i32> = guest.typed("settle");
+
+    assert_eq!(
+        guest.eval(
+            "globalThis.settled = 0; globalThis.settleValue = 1; \
+             globalThis.rejectHook = (type, promise, reason) => { \
+             settled = rec(1, () => 40) + reason; }; 0"
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(watch.call(&mut guest.store).unwrap(), 0);
+    assert_eq!(settle.call(&mut guest.store, 1).unwrap(), 0);
+    assert_eq!(guest.eval("settled"), (0, 42, 0));
+
+    assert_eq!(
+        guest.eval(
+            "globalThis.settled = 0; globalThis.settleValue = { get then() { \
+             settled = rec(1, () => 40); return undefined; } }; 0"
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(settle.call(&mut guest.store, 0).unwrap(), 0);
+    assert_eq!(guest.eval("settled"), (0, 41, 0));
+    assert_eq!(guest.release(), 0);
+}
+
+/// JavaScript that runs while a deferred settles cannot settle that deferred
+/// again: both imports refuse it (`napi_invalid_arg` is 1), the settlement
+/// in flight succeeds, and the deferred is released once.
+#[test]
+fn a_deferred_being_settled_cannot_be_settled_again() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    let watch: TypedFunction<(), i32> = guest.typed("watch_rejections");
+    let settle: TypedFunction<i32, i32> = guest.typed("settle");
+
+    assert_eq!(
+        guest.eval(
+            "globalThis.nested = -1; globalThis.settleValue = { get then() { \
+             nested = resettle(); return undefined; } }; 0"
+        ),
+        (0, 0, 0)
+    );
+    for round in 0..200 {
+        assert_eq!(
+            settle.call(&mut guest.store, 0).unwrap(),
+            0,
+            "round {round}"
+        );
+    }
+    assert_eq!(guest.eval("nested"), (0, 101, 0));
+
+    assert_eq!(
+        guest.eval(
+            "globalThis.nested = -1; globalThis.settleValue = 1; \
+             globalThis.rejectHook = () => { nested = resettle(); }; 0"
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(watch.call(&mut guest.store).unwrap(), 0);
+    for round in 0..200 {
+        assert_eq!(
+            settle.call(&mut guest.store, 1).unwrap(),
+            0,
+            "round {round}"
+        );
+    }
+    assert_eq!(guest.eval("nested"), (0, 101, 0));
+    assert_eq!(guest.release(), 0);
+}
+
+/// Imports that format an error's source line run the env's source-map
+/// callback, which can call guest functions.
+#[test]
+fn the_source_map_callback_can_call_guest_functions() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    let map_sources: TypedFunction<(), i32> = guest.typed("map_sources");
+    let format_error: TypedFunction<i32, i32> = guest.typed("format_error");
+    let take_exception: TypedFunction<(), i32> = guest.typed("take_exception");
+    assert_eq!(
+        guest.eval(
+            "globalThis.calls = 0; globalThis.mapped = 0; globalThis.mapper = () => { \
+             calls++; mapped = rec(1, () => 40); return 'mapped line'; }; 0"
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(map_sources.call(&mut guest.store).unwrap(), 0);
+    assert_eq!(
+        guest.eval(
+            "try { null.x; } catch (error) { globalThis.thrown = error; } 0\n\
+             //# sourceURL=mapped.js"
+        ),
+        (0, 0, 0)
+    );
+    for (which, name) in [
+        (0, "unofficial_napi_preserve_error_source_message"),
+        (1, "unofficial_napi_get_error_metadata"),
+    ] {
+        assert_eq!(guest.eval("calls = mapped = 0"), (0, 0, 0), "{name}");
+        assert_eq!(
+            format_error.call(&mut guest.store, which).unwrap(),
+            0,
+            "{name}"
+        );
+        assert_eq!(
+            guest.eval("calls"),
+            (0, 1, 0),
+            "{name} did not run the callback"
+        );
+        assert_eq!(guest.eval("mapped"), (0, 41, 0), "{name}");
+    }
+
+    // napi_get_and_clear_last_exception formats the exception it hands out.
+    assert_eq!(guest.eval("calls = mapped = 0"), (0, 0, 0));
+    let thrown = guest.eval("throw new Error('x');\n//# sourceURL=mapped.js");
+    assert_eq!(thrown.0, 10, "napi_pending_exception");
+    assert_eq!(take_exception.call(&mut guest.store).unwrap(), 0);
+    assert_eq!(guest.eval("calls"), (0, 1, 0));
+    assert_eq!(guest.eval("mapped"), (0, 41, 0));
+    assert_eq!(guest.release(), 0);
+}
+
+/// A guest function that returns a number that is no value id returns
+/// undefined. That includes 1, which the trampoline itself uses to report a
+/// call that could not reach the guest, and -1, the largest possible id.
+#[test]
+fn a_raw_number_returned_as_a_value_id_is_undefined() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    for raw in ["1", "-1", "0", "4095"] {
+        assert_eq!(
+            guest.eval(&format!("Number(raw({raw}) === undefined)")),
+            (0, 1, 0),
+            "raw({raw})"
+        );
+    }
+    assert_eq!(guest.release(), 0);
+}
+
+/// Defines `hit()`, which counts a call in `traps` and, if a guest function
+/// called from it ran, in `ran`; and `fresh()`, which zeroes both counters
+/// and makes `settleValue` a Proxy whose every trap calls `hit()`.
+const TRAPS: &str = r#"
+  globalThis.hit = () => { traps++; if (rec(1, () => 40) === 41) ran++; };
+  globalThis.fresh = () => {
+    globalThis.traps = globalThis.ran = 0;
+    const handler = new Proxy({}, {
+      get: (_, trap) => (...args) => { hit(); return Reflect[trap](...args); },
+    });
+    globalThis.settleValue = new Proxy({ a: 1 }, handler);
+    return 0;
+  };
+  fresh()"#;
+
+/// Imports that run a Proxy's traps can call guest functions from them.
+#[test]
+fn proxy_traps_run_by_an_import_can_call_guest_functions() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    let call_import: TypedFunction<i32, i32> = guest.typed("call_import");
+    assert_eq!(guest.eval(TRAPS), (0, 0, 0));
+    let mut lost = Vec::new();
+    for (which, name) in [
+        (0, "node_api_set_prototype"),
+        (1, "napi_object_freeze"),
+        (2, "napi_object_seal"),
+        (3, "napi_define_properties"),
+        (4, "unofficial_napi_get_own_non_index_properties"),
+    ] {
+        assert_eq!(guest.eval("fresh()"), (0, 0, 0), "{name}");
+        let status = call_import.call(&mut guest.store, which).unwrap();
+        assert_eq!(status, 0, "{name}");
+        let traps = guest.eval("traps").1;
+        assert!(traps > 0, "{name} ran no trap");
+        if guest.eval("ran").1 != traps {
+            lost.push(name);
+        }
+    }
+    assert!(lost.is_empty(), "guest calls lost in {lost:?}");
+
+    // napi_get_prototype does not lend the store: V8 reads a Proxy's
+    // prototype without running its trap.
+    assert_eq!(guest.eval("fresh()"), (0, 0, 0));
+    assert_eq!(call_import.call(&mut guest.store, 6).unwrap(), 0);
+    assert_eq!(guest.eval("traps"), (0, 0, 0));
+    assert_eq!(guest.release(), 0);
+}
+
+/// Marking a rejected promise as handled runs the promise-reject callback,
+/// which can call guest functions.
+#[test]
+fn marking_a_promise_as_handled_can_call_guest_functions() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    let call_import: TypedFunction<i32, i32> = guest.typed("call_import");
+    let watch_rejections: TypedFunction<(), i32> = guest.typed("watch_rejections");
+    assert_eq!(guest.eval(TRAPS), (0, 0, 0));
+    assert_eq!(
+        guest.eval("globalThis.rejectHook = () => hit(); 0"),
+        (0, 0, 0)
+    );
+    assert_eq!(watch_rejections.call(&mut guest.store).unwrap(), 0);
+
+    // The rejection itself reports to the callback from napi_run_script.
+    assert_eq!(
+        guest.eval("globalThis.settleValue = Promise.reject(1); ran"),
+        (0, 1, 0)
+    );
+    assert_eq!(guest.eval("traps = ran = 0"), (0, 0, 0));
+    assert_eq!(call_import.call(&mut guest.store, 5).unwrap(), 0);
+    assert_eq!(guest.eval("traps"), (0, 1, 0));
+    assert_eq!(guest.eval("ran"), (0, 1, 0));
+    assert_eq!(guest.release(), 0);
+}
+
+/// Creating a promise runs the promise init hook, which can call guest
+/// functions.
+#[test]
+fn the_promise_init_hook_can_call_guest_functions() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    let call_import: TypedFunction<i32, i32> = guest.typed("call_import");
+    let watch_promises: TypedFunction<(), i32> = guest.typed("watch_promises");
+    assert_eq!(guest.eval(TRAPS), (0, 0, 0));
+    assert_eq!(
+        guest.eval("globalThis.initHook = () => hit(); 0"),
+        (0, 0, 0)
+    );
+    assert_eq!(watch_promises.call(&mut guest.store).unwrap(), 0);
+    assert_eq!(guest.eval("traps = ran = 0"), (0, 0, 0));
+    assert_eq!(call_import.call(&mut guest.store, 7).unwrap(), 0);
+    assert_eq!(guest.eval("traps"), (0, 1, 0));
+    assert_eq!(guest.eval("ran"), (0, 1, 0));
+    assert_eq!(guest.release(), 0);
+}
+
+/// A guest function called from JavaScript that an import ran without
+/// lending the store cannot run, and throws instead of returning undefined.
+/// napi_create_error is such an import: it assigns `code`, which runs a
+/// setter on the prototype chain.
+#[test]
+fn a_call_that_cannot_reach_the_guest_throws() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    let create_error: TypedFunction<(), i32> = guest.typed("create_error");
+    assert_eq!(
+        guest.eval(
+            "globalThis.outcome = 0; \
+             Object.defineProperty(Error.prototype, 'code', { configurable: true, set() { \
+             try { outcome = rec(1, () => 40) === undefined ? 1 : 2; } catch (error) { \
+             outcome = /store is not lent/.test(error.message) ? 3 : 4; } } }); 0"
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(create_error.call(&mut guest.store).unwrap(), 0);
+    assert_eq!(
+        guest.eval("delete Error.prototype.code; outcome"),
+        (0, 3, 0)
+    );
+    // The same call from an import that lends the store runs.
+    assert_eq!(guest.eval("rec(1, () => 40)"), (0, 41, 0));
     assert_eq!(guest.release(), 0);
 }
 
