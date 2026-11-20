@@ -3315,9 +3315,13 @@ fn guest_napi_resolve_deferred(mut env: FunctionEnvMut<NapiEnv>, e: u32, d: u32,
 }
 
 fn guest_napi_reject_deferred(mut env: FunctionEnvMut<NapiEnv>, e: u32, d: u32, v: u32) -> i32 {
+    // Rejecting a promise that has no handler can run the env's
+    // promise-reject callback before returning, and that callback may call
+    // guest functions. with_cb_context publishes pending host buffer copies.
     let snapi = snapi_env(&env, e);
-    publish_pending_host_buffer_copies(&mut env, snapi);
-    unsafe { snapi_bridge_reject_deferred(snapi, d, v) }
+    with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_reject_deferred(snapi, d, v)
+    })
 }
 
 // --- ArrayBuffer ---

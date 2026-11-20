@@ -1,7 +1,7 @@
 //! JavaScript calling guest functions through real Wasmer dispatch, the
 //! bridge and V8: nested callbacks, scopes a callback leaves open, return
-//! values created in them, argument counts, missing arguments, and envs
-//! created one after another on one thread.
+//! values created in them, argument counts, missing arguments, settling a
+//! deferred, and envs created one after another on one thread.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -42,9 +42,17 @@ const WAT: &str = r#"(module
     (func $open_esc (param i32 i32) (result i32)))
   (import "napi" "napi_escape_handle" (func $escape (param i32 i32 i32 i32) (result i32)))
   (import "napi" "napi_typeof" (func $typeof (param i32 i32 i32) (result i32)))
+  (import "napi" "napi_create_promise" (func $create_promise (param i32 i32 i32) (result i32)))
+  (import "napi" "napi_resolve_deferred"
+    (func $resolve_deferred (param i32 i32 i32) (result i32)))
+  (import "napi" "napi_reject_deferred"
+    (func $reject_deferred (param i32 i32 i32) (result i32)))
+  (import "napi_extension_wasmer_v0" "unofficial_napi_set_promise_reject_callback"
+    (func $set_reject_callback (param i32 i32) (result i32)))
 
   ;; 8 env, 12 scope, 28 string, 32 script result, 48 global, 52 function,
-  ;; 72 int out, 200..228 callback scratch, 432..439 coercion scratch.
+  ;; 72 int out, 200..228 callback scratch, 432..439 coercion scratch,
+  ;; 440 deferred, 444 promise.
   ;; Callbacks take 64- or 256-byte frames from a stack starting at 32768
   ;; so nested calls keep their own out-slots.
   (memory (export "memory") 2)
@@ -65,6 +73,8 @@ const WAT: &str = r#"(module
   (data (i32.const 480) "coercionInput\00")
   (data (i32.const 496) "coercionResult\00")
   (data (i32.const 512) "InstanceCheck\00")
+  (data (i32.const 528) "rejectHook\00")
+  (data (i32.const 544) "settleValue\00")
 
   ;; Records the first failing step; the host reads it through `err`.
   (func $fail (param $code i32)
@@ -130,6 +140,23 @@ const WAT: &str = r#"(module
           (call $global_value (i32.const 512)) (i32.const 436))
       (then (return (i32.const -1))))
     (i32.load8_u (i32.const 436)))
+
+  ;; Makes the global `rejectHook` the env's promise-reject callback.
+  (func (export "watch_rejections") (result i32)
+    (call $set_reject_callback (global.get $env) (call $global_value (i32.const 528))))
+
+  ;; Creates a promise and rejects or resolves it with the global
+  ;; `settleValue`.
+  (func (export "settle") (param $reject i32) (result i32)
+    (local $value i32)
+    (if (call $create_promise (global.get $env) (i32.const 440) (i32.const 444))
+      (then (return (i32.const -1))))
+    (local.set $value (call $global_value (i32.const 544)))
+    (if (result i32) (local.get $reject)
+      (then (call $reject_deferred (global.get $env) (i32.load (i32.const 440))
+              (local.get $value)))
+      (else (call $resolve_deferred (global.get $env) (i32.load (i32.const 440))
+              (local.get $value)))))
 
   ;; rec(n, step): inside its own scope, calls step(n - 1), which calls rec
   ;; again; then re-reads its own callback info after the inner callbacks
@@ -470,6 +497,40 @@ fn coercion_and_instanceof_can_call_guest_functions() {
     );
     assert_eq!(instanceof.call(&mut guest.store).unwrap(), 1);
     assert_eq!(guest.eval("0"), (0, 0, 0));
+    assert_eq!(guest.release(), 0);
+}
+
+/// Settling a deferred runs JavaScript before the import returns: rejecting
+/// a promise that has no handler runs the env's promise-reject callback, and
+/// resolving reads the value's `then`. Both can call guest functions.
+#[test]
+fn settling_a_deferred_can_call_guest_functions() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    let watch: TypedFunction<(), i32> = guest.typed("watch_rejections");
+    let settle: TypedFunction<i32, i32> = guest.typed("settle");
+
+    assert_eq!(
+        guest.eval(
+            "globalThis.settled = 0; globalThis.settleValue = 1; \
+             globalThis.rejectHook = (type, promise, reason) => { \
+             settled = rec(1, () => 40) + reason; }; 0"
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(watch.call(&mut guest.store).unwrap(), 0);
+    assert_eq!(settle.call(&mut guest.store, 1).unwrap(), 0);
+    assert_eq!(guest.eval("settled"), (0, 42, 0));
+
+    assert_eq!(
+        guest.eval(
+            "globalThis.settled = 0; globalThis.settleValue = { get then() { \
+             settled = rec(1, () => 40); return undefined; } }; 0"
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(settle.call(&mut guest.store, 0).unwrap(), 0);
+    assert_eq!(guest.eval("settled"), (0, 41, 0));
     assert_eq!(guest.release(), 0);
 }
 

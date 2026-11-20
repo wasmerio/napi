@@ -3156,12 +3156,34 @@ fn guest_napi_create_promise(mut env: FunctionEnvMut<NapiEnv>, e: u32, dp: u32, 
     s
 }
 
-fn guest_napi_resolve_deferred(env: FunctionEnvMut<NapiEnv>, e: u32, d: u32, v: u32) -> i32 {
-    unsafe { snapi_bridge_resolve_deferred(snapi_env(&env, e), d, v) }
+// Resolving reads the value's `then` at once, which can run a getter or a
+// Proxy trap, so this runs in the callback context.
+#[allow(clippy::result_large_err)]
+fn guest_napi_resolve_deferred(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: u32,
+    d: u32,
+    v: u32,
+) -> Result<i32, WasiError> {
+    let snapi = snapi_env(&env, e);
+    with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_resolve_deferred(snapi, d, v)
+    })
 }
 
-fn guest_napi_reject_deferred(env: FunctionEnvMut<NapiEnv>, e: u32, d: u32, v: u32) -> i32 {
-    unsafe { snapi_bridge_reject_deferred(snapi_env(&env, e), d, v) }
+// Rejecting a promise that has no handler runs the env's promise-reject
+// callback before returning, and that callback may call guest functions.
+#[allow(clippy::result_large_err)]
+fn guest_napi_reject_deferred(
+    mut env: FunctionEnvMut<NapiEnv>,
+    e: u32,
+    d: u32,
+    v: u32,
+) -> Result<i32, WasiError> {
+    let snapi = snapi_env(&env, e);
+    with_cb_context(&mut env, e, || unsafe {
+        snapi_bridge_reject_deferred(snapi, d, v)
+    })
 }
 
 // --- ArrayBuffer ---
