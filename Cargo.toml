@@ -27,8 +27,7 @@ wasix = ["experimental-async", "dep:wasixv2-exec", "dep:wasixv2-host", "dep:wasi
 cli = [
   "wasix",
   "dep:wasmer-cache",
-  "dep:wasmer-c-api-imports",
-  "wasmer-c-api-imports/wasixv2",
+  "dep:wasmer-c-api-imports-wasixv2",
   "dep:tokio",
   "tokio/signal",
   "dep:wasixv2",
@@ -46,7 +45,7 @@ wasmer = { workspace = true, default-features = false }
 
 # This dependencies are ONLY needed for testing napi in Wasm locally
 wasmer-cache = { version = "=7.5.0", path = "../cache", optional = true }
-wasmer-c-api-imports = { version = "=7.5.0", path = "../c-api-imports", optional = true, default-features = false }
+wasmer-c-api-imports-wasixv2 = { version = "=7.5.0", path = "../c-api-imports-wasixv2", optional = true, default-features = false }
 wasmer-types = { workspace = true, default-features = true, optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"], optional = true }
 wasixv2 = { path = "../wasix/api", optional = true }

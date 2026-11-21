@@ -20,7 +20,7 @@ use wasmer_cache::{Cache, FileSystemCache, Hash as CacheHash};
 use wasmer_types::ModuleHash;
 
 use crate::{NapiCtx, NapiHook, budget::ResourceBudget, budget::budgeted_tunables};
-use wasmer_c_api_imports::WasmCapiRuntimeHooks;
+use wasmer_c_api_imports_wasixv2::WasmCapiInstantiationHook;
 
 #[derive(Debug, Clone)]
 pub struct GuestMount {
@@ -454,7 +454,7 @@ fn run_wasix_main_with_machine(
                 engine: engine.clone(),
             }))
             .instantiation_hook(Arc::new(NapiHook::new(ctx.clone())))
-            .instantiation_hook(Arc::new(WasmCapiRuntimeHooks::new()));
+            .instantiation_hook(Arc::new(WasmCapiInstantiationHook::default()));
         #[cfg(unix)]
         let terminal = use_system_tty.then(HostTerminal::detect).flatten();
         #[cfg(unix)]
