@@ -172,6 +172,14 @@ pub(crate) struct NapiEnv {
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) next_napi_scope_id: u32,
     pub(crate) napi_envs: IdHashMap<u32, usize>,
+    /// The env of a store that has exactly one, as `(guest id, bridge env,
+    /// heap tracker)`, so that [`resolve_napi_env`] and [`heap_tracker_for`],
+    /// which every import calls, compare an id instead of hashing one. All
+    /// zero otherwise; no env has id 0.
+    ///
+    /// [`resolve_napi_env`]: NapiEnv::resolve_napi_env
+    /// [`heap_tracker_for`]: NapiEnv::heap_tracker_for
+    single_env: (u32, usize, usize),
     pub(crate) napi_state_to_guest_env: IdHashMap<usize, u32>,
     pub(crate) napi_scopes: IdHashMap<u32, u32>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -246,6 +254,7 @@ impl NapiEnv {
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
             next_napi_scope_id: 0,
             napi_envs: IdHashMap::default(),
+            single_env: (0, 0, 0),
             napi_state_to_guest_env: IdHashMap::default(),
             napi_scopes: IdHashMap::default(),
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -457,6 +466,7 @@ impl NapiEnv {
                 tracker,
             },
         );
+        self.refresh_single_env();
         Ok((env_id, scope_id))
     }
 
@@ -465,7 +475,17 @@ impl NapiEnv {
     /// Every import that can run JavaScript asks, so it takes the guest's env
     /// id rather than the bridge pointer, which would need a second lookup.
     pub(crate) fn heap_tracker_for(&self, env_id: u32) -> Option<&EnvHeapCharge> {
-        let tracker = self.env_heap_charges.get(&env_id)?.tracker;
+        let tracker = if self.single_env.0 == env_id {
+            self.single_env.2
+        } else {
+            self.env_heap_charges.get(&env_id)?.tracker
+        };
+        debug_assert_eq!(
+            tracker,
+            self.env_heap_charges
+                .get(&env_id)
+                .map_or(0, |handle| handle.tracker)
+        );
         if tracker == 0 {
             return None;
         }
@@ -561,6 +581,7 @@ impl NapiEnv {
         };
 
         self.napi_envs.insert(env_id, env as usize);
+        self.refresh_single_env();
         self.napi_state_to_guest_env.insert(env as usize, env_id);
         self.napi_scopes.insert(scope_id, env_id);
         (env_id, scope_id)
@@ -681,6 +702,8 @@ impl NapiEnv {
         }
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
         let _ = registered;
+        // The tracker is freed below: forget it first.
+        self.single_env = (0, 0, 0);
         // Release the heap ceiling + any callback-granted growth + isolate slot
         // this env reserved.
         if let Some(handle) = self.env_heap_charges.remove(&env_id) {
@@ -698,6 +721,7 @@ impl NapiEnv {
             self.budget.release_env(handle.ceiling);
         }
         self.napi_envs.remove(&env_id);
+        self.refresh_single_env();
         // The release cleared the agent's pointer to it.
         #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
         self.native_callback_contexts.remove(&env_id);
@@ -722,10 +746,31 @@ impl NapiEnv {
         if guest_env == 0 {
             return std::ptr::null_mut();
         }
+        if self.single_env.0 == guest_env {
+            debug_assert_eq!(self.napi_envs.get(&guest_env), Some(&self.single_env.1));
+            return self.single_env.1 as SnapiEnv;
+        }
         self.napi_envs
             .get(&guest_env)
             .map(|env| *env as SnapiEnv)
             .unwrap_or(std::ptr::null_mut())
+    }
+
+    /// Recomputes [`single_env`] after the store's envs or their heap
+    /// charges changed.
+    ///
+    /// [`single_env`]: NapiEnv::single_env
+    fn refresh_single_env(&mut self) {
+        self.single_env = match self.napi_envs.iter().next() {
+            Some((&env_id, &env)) if self.napi_envs.len() == 1 => {
+                let tracker = self
+                    .env_heap_charges
+                    .get(&env_id)
+                    .map_or(0, |handle| handle.tracker);
+                (env_id, env, tracker)
+            }
+            _ => (0, 0, 0),
+        };
     }
 }
 
