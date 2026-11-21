@@ -3359,11 +3359,12 @@ mod memory_grow_callback_tests {
                 panic!("retired grow did not abort")
             };
             let expected = expected.borrow_mut().take().unwrap();
-            assert!(error.is_host_abort());
-            assert!(std::ptr::eq(
-                error.downcast_ref::<std::io::Error>().unwrap(),
-                expected.downcast_ref::<std::io::Error>().unwrap()
-            ));
+            assert!(wasixv2::is_host_abort(&error));
+            let payload = |error: &wasmer::RuntimeError| {
+                let abort = error.downcast_ref::<wasixv2::Abort>().unwrap();
+                std::ptr::from_ref(abort.downcast_ref::<std::io::Error>().unwrap())
+            };
+            assert!(std::ptr::eq(payload(&error), payload(&expected)));
             let continued = {
                 let guard = store.store().write();
                 continuation(&instance, &guard)
