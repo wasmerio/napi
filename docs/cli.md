@@ -1,7 +1,7 @@
 # Standalone WASIX runner
 
-`cargo-standalone.sh` builds against the immutable Wasmer revision in
-`Cargo.standalone.toml`. Use the repository's Rust toolchain and lockfile:
+`cargo-standalone.sh` builds against the immutable wasmer-runtime and WASIX
+revisions in `Cargo.standalone.toml`. Use the repository's Rust toolchain and lockfile:
 
 ```sh
 ./cargo-standalone.sh build --locked --release --features cli --bin napi_wasmer
