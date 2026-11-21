@@ -86,9 +86,12 @@ impl<S: LoaderControl + Send + Sync + 'static> InstanceAttachment for Attachment
         #[cfg(not(target_arch = "wasm32"))]
         {
             let budget = self.context.budget();
+            #[cfg(feature = "host-memory")]
             let accounted = memory
                 .host_memory_access(&*store)
                 .is_ok_and(|access| access.is_accounted_by(&budget.accounting_identity()));
+            #[cfg(not(feature = "host-memory"))]
+            let accounted = false;
             let arena = self
                 .context
                 .native_guest_arena(&*store, memory)

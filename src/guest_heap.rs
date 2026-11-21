@@ -85,6 +85,16 @@ const UNIT: u32 = 16;
 
 const WASM_PAGE: u32 = wasmer::WASM_PAGE_SIZE as u32;
 
+#[cfg(feature = "host-memory")]
+type HostAllocation = wasmer::sys::HostMemoryAllocation;
+#[cfg(feature = "host-memory")]
+type HostAccess = wasmer::sys::HostMemoryAccess;
+// Without `host-memory` no owner can exist, so every heap constructor declines.
+#[cfg(not(feature = "host-memory"))]
+type HostAllocation = std::convert::Infallible;
+#[cfg(not(feature = "host-memory"))]
+type HostAccess = std::convert::Infallible;
+
 /// Minimum bytes claimed per grow, to amortize grow calls and chunk overhead.
 const MIN_CHUNK_BYTES: u32 = 1024 * 1024;
 
@@ -148,9 +158,9 @@ pub(crate) struct GuestHeap {
     inner: Mutex<HeapInner>,
     leased: bool,
     // Legacy heaps retain only the mapping/accounting, not a Store or VM metadata.
-    allocation_owner: Option<wasmer::sys::HostMemoryAllocation>,
+    allocation_owner: Option<HostAllocation>,
     // Leased range owners drop before their detached native allocation access.
-    _memory_owner: Option<wasmer::sys::HostMemoryAccess>,
+    _memory_owner: Option<HostAccess>,
 }
 
 // SAFETY: leased heaps retain the allocation independently and every chunk's
@@ -272,6 +282,12 @@ pub struct NativeGuestArena {
 }
 
 impl NativeGuestArena {
+    #[cfg(not(feature = "host-memory"))]
+    pub(crate) fn new(_: &impl AsStoreRef, _: &Memory, _: Arc<ResourceBudget>) -> Option<Self> {
+        None
+    }
+
+    #[cfg(feature = "host-memory")]
     pub(crate) fn new(
         store: &impl AsStoreRef,
         memory: &Memory,
@@ -365,6 +381,12 @@ impl NativeGuestArena {
         Ok(())
     }
 
+    #[cfg(not(feature = "host-memory"))]
+    pub(crate) fn matches(&self, _: &impl AsStoreRef, _: &Memory, _: &Arc<ResourceBudget>) -> bool {
+        false
+    }
+
+    #[cfg(feature = "host-memory")]
     pub(crate) fn matches(
         &self,
         store: &impl AsStoreRef,
@@ -503,7 +525,10 @@ impl GuestHeap {
         // This owned capability does not fund or grow the heap. It is needed
         // even when advisory prefunding fails: external buffers may refer to
         // guest-owned bytes outside every allocator chunk.
+        #[cfg(feature = "host-memory")]
         let allocation_owner = memory.retain_host_allocation(store).ok()?;
+        #[cfg(not(feature = "host-memory"))]
+        let allocation_owner = None::<HostAllocation>?;
         let ty = memory.ty(store);
         let base = {
             let view = memory.view(store);
@@ -824,7 +849,13 @@ impl GuestHeap {
         let end = start + delta_bytes;
         // Exact range admission happens outside the heap mutex and before any
         // V8 pointer can be allocated from this new chunk.
+        #[cfg(feature = "host-memory")]
         let Ok(pin) = memory.pin_host_range(&*store, start..end) else {
+            return false;
+        };
+        #[cfg(not(feature = "host-memory"))]
+        let Some(pin) = None::<HostAllocation> else {
+            let _ = (start, end);
             return false;
         };
         let mut owner: Option<Box<dyn Send + Sync>> = Some(Box::new(pin));
@@ -1864,10 +1895,12 @@ mod tests {
         Store::new(engine)
     }
 
+    #[cfg(feature = "host-memory")]
     struct ArenaPinOwner {
         _pin: wasmer::sys::HostMemoryPin,
         drops: Arc<std::sync::atomic::AtomicUsize>,
     }
+    #[cfg(feature = "host-memory")]
     impl Drop for ArenaPinOwner {
         fn drop(&mut self) {
             self.drops.fetch_add(1, Ordering::SeqCst);
@@ -1903,6 +1936,7 @@ mod tests {
         assert_eq!(Arc::strong_count(&arena.heap), before);
     }
 
+    #[cfg(feature = "host-memory")]
     #[test]
     fn leased_arenas_start_empty_and_return_rejected_owners_without_growing() {
         use std::sync::atomic::AtomicUsize;
@@ -1957,6 +1991,7 @@ mod tests {
         assert!(shared.begin_host_mapping_change(65536..131072).is_ok());
     }
 
+    #[cfg(feature = "host-memory")]
     #[test]
     fn leased_allocator_and_finalizer_owners_keep_pins_after_store_drop() {
         use std::sync::atomic::AtomicUsize;

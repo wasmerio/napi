@@ -1,3 +1,4 @@
+#![cfg(feature = "native-invocation")]
 #![cfg(all(
     feature = "experimental-async",
     any(

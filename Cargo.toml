@@ -24,6 +24,9 @@ js = [
 ]
 # Implements the WASIX v2 runtime's per-instance hook.
 wasix = ["experimental-async", "dep:wasixv2-exec", "dep:wasixv2-host", "dep:wasixv2-syscalls"]
+# Engine APIs that runtime `main` does not provide yet; see `wasixv2-exec`.
+native-invocation = ["wasixv2-exec?/native-invocation"]
+host-memory = ["wasixv2-exec?/host-memory"]
 cli = [
   "wasix",
   "dep:wasmer-cache",

@@ -1298,8 +1298,18 @@ fn over_budget_to_memory_error(err: OverBudget) -> MemoryError {
     MemoryError::Generic(err.to_string())
 }
 
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "host-memory")))]
+use wasmer::sys::vm::on_host_stack as on_memory_grow;
+#[cfg(all(not(target_arch = "wasm32"), feature = "host-memory"))]
+use wasmer::sys::with_memory_grow_callback as on_memory_grow;
+#[cfg(all(not(target_arch = "wasm32"), feature = "host-memory"))]
+type DefinitionLocation<T> = wasmer::sys::vm::VMDefinitionLocation<T>;
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "host-memory")))]
+type DefinitionLocation<T> = std::ptr::NonNull<T>;
+
 #[cfg(not(target_arch = "wasm32"))]
 impl LinearMemory for BudgetedMemory {
+    #[cfg(feature = "host-memory")]
     fn host_memory_access(&self) -> Result<wasmer::sys::HostMemoryAccess, MemoryError> {
         let mut access = self.inner.host_memory_access()?;
         if access.retain_owner(self.charge.clone()).is_err() {
@@ -1318,6 +1328,7 @@ impl LinearMemory for BudgetedMemory {
         Ok(access)
     }
 
+    #[cfg(feature = "host-memory")]
     fn retain_host_allocation(&self) -> Result<wasmer::sys::HostMemoryAllocation, MemoryError> {
         let mut allocation = self.inner.retain_host_allocation()?;
         if allocation.retain_owner(self.charge.clone()).is_err() {
@@ -1328,6 +1339,7 @@ impl LinearMemory for BudgetedMemory {
         Ok(allocation)
     }
 
+    #[cfg(feature = "host-memory")]
     fn pin_host_range(
         &self,
         range: std::ops::Range<u64>,
@@ -1353,6 +1365,7 @@ impl LinearMemory for BudgetedMemory {
         self.inner.style()
     }
 
+    #[cfg(feature = "host-memory")]
     fn begin_host_mapping_change(
         &self,
         range: std::ops::Range<u64>,
@@ -1362,7 +1375,7 @@ impl LinearMemory for BudgetedMemory {
 
     fn grow(&mut self, delta: Pages) -> Result<Pages, MemoryError> {
         let charge = Arc::clone(&self.charge);
-        wasmer::sys::with_memory_grow_callback(|| {
+        on_memory_grow(|| {
             if delta == Pages(0) {
                 return self.inner.grow(delta);
             }
@@ -1597,7 +1610,7 @@ impl<T: Tunables> Tunables for BudgetedTunables<T> {
         &self,
         ty: &MemoryType,
         style: &MemoryStyle,
-        vm_definition_location: wasmer::sys::vm::VMDefinitionLocation<VMMemoryDefinition>,
+        vm_definition_location: DefinitionLocation<VMMemoryDefinition>,
     ) -> Result<VMMemory, MemoryError> {
         let adjusted = self.adjust_memory(ty);
         self.validate_memory(&adjusted)?;
@@ -1624,7 +1637,7 @@ impl<T: Tunables> Tunables for BudgetedTunables<T> {
         &self,
         ty: &TableType,
         style: &TableStyle,
-        vm_definition_location: wasmer::sys::vm::VMDefinitionLocation<VMTableDefinition>,
+        vm_definition_location: DefinitionLocation<VMTableDefinition>,
     ) -> Result<VMTable, String> {
         // SAFETY: contract forwarded to base.
         unsafe { self.base.create_vm_table(ty, style, vm_definition_location) }
@@ -1751,6 +1764,7 @@ mod tests {
         assert_eq!(budget.memory_charged(), 0);
     }
 
+    #[cfg(feature = "host-memory")]
     #[test]
     fn native_access_identifies_the_actual_shared_funding_source() {
         struct Accountant(AtomicU64);
@@ -1797,6 +1811,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "host-memory")]
     #[test]
     fn detached_native_access_and_derived_pins_retain_exact_allocation_charges() {
         use std::sync::atomic::AtomicUsize;
@@ -1835,6 +1850,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "host-memory")]
     #[test]
     fn detached_native_copy_charges_and_reset_are_independent() {
         for shared in [false, true] {
@@ -1865,6 +1881,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "host-memory")]
     #[test]
     fn a_native_pin_retains_its_memory_charge_after_store_and_shared_handles_drop() {
         use std::sync::atomic::AtomicUsize;
@@ -1902,6 +1919,7 @@ mod tests {
         assert_eq!(budget.memory_charged(), 0);
     }
 
+    #[cfg(feature = "host-memory")]
     #[test]
     fn budgeted_memory_forwards_mapping_change_exclusion() {
         let budget = ResourceBudget::with_memory_limit(4 * PAGE);
@@ -3316,6 +3334,7 @@ mod memory_grow_callback_tests {
         }
     }
 
+    #[cfg(feature = "native-invocation")]
     #[cfg(feature = "experimental-async")]
     #[test]
     fn retired_builtin_budgeted_growth_stops_before_guest_store() {

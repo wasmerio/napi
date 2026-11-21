@@ -1659,7 +1659,7 @@ fn native_creation_accountant_reenters_an_existing_provider_with_fresh_borrows()
     assert_eq!(ctx.budget().snapshot().v8_heap_reserved, 0);
 }
 
-#[cfg(feature = "experimental-async")]
+#[cfg(all(feature = "experimental-async", feature = "native-invocation"))]
 mod native_frame_tests {
     use super::*;
     use std::{

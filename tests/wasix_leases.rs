@@ -1,5 +1,9 @@
 //! Real V8 backing stores remain protected kernel leases through guest access and GC.
-#![cfg(all(feature = "wasix", not(target_arch = "wasm32")))]
+#![cfg(all(
+    feature = "wasix",
+    feature = "host-memory",
+    not(target_arch = "wasm32")
+))]
 
 use std::sync::{
     Arc, Mutex,
