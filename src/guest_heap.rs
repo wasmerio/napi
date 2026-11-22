@@ -1674,6 +1674,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "host-memory")]
     #[test]
     fn legacy_allocation_receipt_outlives_store_without_funded_chunks() {
         let budget = ResourceBudget::with_memory_limit(8 * 1024 * 1024);
