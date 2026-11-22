@@ -11,7 +11,7 @@ use wasmer::{AsStoreMut, AsStoreRef, Function, FunctionEnv, FunctionEnvMut, Impo
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use wasm_bindgen::JsValue;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
-use wasmer::AsyncFunctionEnvMut;
+use wasmer::AsyncEnv;
 
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv,
@@ -707,7 +707,7 @@ async fn event_loop_checkpoint(
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 async fn guest_unofficial_napi_event_loop_checkpoint(
-    mut env: AsyncFunctionEnvMut<NapiEnv>,
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     mode: i32,
     has_runnable_work: i32,
@@ -715,48 +715,42 @@ async fn guest_unofficial_napi_event_loop_checkpoint(
 ) -> i32 {
     // The host JavaScript realm owns its Promise and task queues. One explicit
     // JSPI suspension is the only async scheduling primitive exposed to Edge.
-    let env_handle = {
-        let env = env.read().await;
-        env.data().resolve_napi_env(napi_env)
-    };
-    let (status, checkpoint_state) =
-        with_callback_state_async(env.as_mut(), env_handle, async move {
-            if mode != 0 && mode != 1 {
-                return (1, 0);
-            }
-            if event_loop_checkpoint(mode == 1, has_runnable_work != 0)
-                .await
-                .is_err()
-            {
-                return (9, 0);
-            }
-            let status = unsafe { snapi_bridge_drain_pending_callbacks(env_handle) };
-            if status != 0 {
-                return (status, 0);
-            }
-            let mut checkpoint_state = 0;
-            let status = unsafe {
-                snapi_bridge_unofficial_event_loop_checkpoint(
-                    env_handle,
-                    mode,
-                    has_runnable_work,
-                    &mut checkpoint_state,
-                )
-            };
-            if status == 0 && mode == 1 {
-                checkpoint_state |= 1 << 1;
-            }
-            (status, checkpoint_state)
-        })
-        .await;
-    {
-        let mut locked = env.write().await;
-        let mut sync_env = locked.as_function_env_mut();
+    let env_handle = cx.with(|env| env.data().resolve_napi_env(napi_env));
+    let (status, checkpoint_state) = with_callback_state_async(cx, env_handle, async move {
+        if mode != 0 && mode != 1 {
+            return (1, 0);
+        }
+        if event_loop_checkpoint(mode == 1, has_runnable_work != 0)
+            .await
+            .is_err()
+        {
+            return (9, 0);
+        }
+        let status = unsafe { snapi_bridge_drain_pending_callbacks(env_handle) };
+        if status != 0 {
+            return (status, 0);
+        }
+        let mut checkpoint_state = 0;
+        let status = unsafe {
+            snapi_bridge_unofficial_event_loop_checkpoint(
+                env_handle,
+                mode,
+                has_runnable_work,
+                &mut checkpoint_state,
+            )
+        };
+        if status == 0 && mode == 1 {
+            checkpoint_state |= 1 << 1;
+        }
+        (status, checkpoint_state)
+    })
+    .await;
+    cx.with(|mut sync_env| {
         drain_ready_guest_buffers(&mut sync_env, napi_env, env_handle, false);
         if checkpoint_state_ptr != 0 {
             write_guest_u32(&mut sync_env, checkpoint_state_ptr, checkpoint_state);
         }
-    }
+    });
     status
 }
 
@@ -765,7 +759,7 @@ fn event_loop_checkpoint_import(
     store: &mut impl AsStoreMut,
     fe: &FunctionEnv<NapiEnv>,
 ) -> Function {
-    Function::new_typed_with_env_async(store, fe, guest_unofficial_napi_event_loop_checkpoint)
+    Function::new_typed_async(store, fe, guest_unofficial_napi_event_loop_checkpoint)
 }
 
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
@@ -1123,18 +1117,17 @@ fn guest_unofficial_napi_message_create(
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 async fn guest_unofficial_napi_message_take_async(
-    mut env: AsyncFunctionEnvMut<NapiEnv>,
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     payload: u32,
     result_out_ptr: u32,
 ) -> i32 {
-    let (owned, env_handle) = {
-        let env = env.read().await;
+    let (owned, env_handle) = cx.with(|env| {
         (
             env.data().messages.remove(payload),
             env.data().resolve_napi_env(napi_env),
         )
-    };
+    });
     // Only a message of this context.
     let Some(_queued) = owned else {
         return 1;
@@ -1143,7 +1136,7 @@ async fn guest_unofficial_napi_message_take_async(
         unsafe { snapi_bridge_unofficial_message_drop(payload) };
         return 1;
     }
-    let (status, value) = with_callback_state_async(env.as_mut(), env_handle, async move {
+    let (status, value) = with_callback_state_async(cx, env_handle, async move {
         if crate::snapi_js::wait_for_message(payload).await.is_err() {
             unsafe { snapi_bridge_unofficial_message_drop(payload) };
             return (9, 0);
@@ -1155,9 +1148,7 @@ async fn guest_unofficial_napi_message_take_async(
     })
     .await;
     if status == 0 && result_out_ptr != 0 {
-        let mut locked = env.write().await;
-        let mut sync_env = locked.as_function_env_mut();
-        write_guest_u32(&mut sync_env, result_out_ptr, value);
+        cx.with(|mut sync_env| write_guest_u32(&mut sync_env, result_out_ptr, value));
     }
     status
 }
@@ -1188,7 +1179,7 @@ fn guest_unofficial_napi_message_take_sync(
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 fn message_take_import(store: &mut impl AsStoreMut, fe: &FunctionEnv<NapiEnv>) -> Function {
-    Function::new_typed_with_env_async(store, fe, guest_unofficial_napi_message_take_async)
+    Function::new_typed_async(store, fe, guest_unofficial_napi_message_take_async)
 }
 
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
@@ -3388,8 +3379,7 @@ fn guest_napi_create_arraybuffer(
         if let (Some(malloc_fn), Some(memory)) = (malloc_fn, memory) {
             // Allocate memory in the guest's linear memory
             let guest_ptr: u32 = {
-                let (_, mut store_ref) = env.data_and_store_mut();
-                match malloc_fn.call(&mut store_ref, byte_length as i32) {
+                match malloc_fn.call(&mut env.as_store_mut(), byte_length as i32) {
                     Ok(ptr) if ptr != 0 => ptr as u32,
                     _ => return 1, // allocation failed
                 }
@@ -3397,7 +3387,7 @@ fn guest_napi_create_arraybuffer(
 
             // Get host pointer corresponding to the guest allocation
             let host_addr: u64 = {
-                let (_, store_ref) = env.data_and_store_mut();
+                let (_, store_ref) = env.data_and_store();
                 let view = memory.view(&store_ref);
                 let host_base = view.data_ptr() as u64;
                 host_base + guest_ptr as u64
@@ -3513,7 +3503,7 @@ fn guest_napi_create_external_arraybuffer(
         };
 
         let host_addr: u64 = {
-            let (_, store_ref) = env.data_and_store_mut();
+            let (_, store_ref) = env.data_and_store();
             let view = memory.view(&store_ref);
             let host_base = view.data_ptr() as u64;
             host_base + external_data as u64
@@ -3606,7 +3596,7 @@ fn guest_napi_create_external_buffer(
         };
 
         let host_addr: u64 = {
-            let (_, store_ref) = env.data_and_store_mut();
+            let (_, store_ref) = env.data_and_store();
             let view = memory.view(&store_ref);
             let host_base = view.data_ptr() as u64;
             host_base + external_data as u64
@@ -5032,8 +5022,7 @@ fn guest_napi_create_buffer(
         if let (Some(malloc_fn), Some(memory)) = (malloc_fn, memory) {
             // Allocate memory in the guest's linear memory
             let guest_ptr: u32 = {
-                let (_, mut store_ref) = env.data_and_store_mut();
-                match malloc_fn.call(&mut store_ref, length as i32) {
+                match malloc_fn.call(&mut env.as_store_mut(), length as i32) {
                     Ok(ptr) if ptr != 0 => ptr as u32,
                     _ => return 1,
                 }
@@ -5041,7 +5030,7 @@ fn guest_napi_create_buffer(
 
             // Get host pointer corresponding to the guest allocation
             let host_addr: u64 = {
-                let (_, store_ref) = env.data_and_store_mut();
+                let (_, store_ref) = env.data_and_store();
                 let view = memory.view(&store_ref);
                 let host_base = view.data_ptr() as u64;
                 host_base + guest_ptr as u64
@@ -5181,8 +5170,7 @@ fn guest_napi_create_buffer_copy(
         if let (Some(malloc_fn), Some(memory)) = (malloc_fn, memory) {
             // Allocate memory in the guest's linear memory
             let guest_ptr: u32 = {
-                let (_, mut store_ref) = env.data_and_store_mut();
-                match malloc_fn.call(&mut store_ref, length as i32) {
+                match malloc_fn.call(&mut env.as_store_mut(), length as i32) {
                     Ok(ptr) if ptr != 0 => ptr as u32,
                     _ => return 1,
                 }
@@ -5193,7 +5181,7 @@ fn guest_napi_create_buffer_copy(
 
             // Get host pointer corresponding to the guest allocation
             let host_addr: u64 = {
-                let (_, store_ref) = env.data_and_store_mut();
+                let (_, store_ref) = env.data_and_store();
                 let view = memory.view(&store_ref);
                 let host_base = view.data_ptr() as u64;
                 host_base + guest_ptr as u64
@@ -5551,8 +5539,7 @@ fn guest_napi_get_node_version(mut env: FunctionEnvMut<NapiEnv>, e: u32, rp: u32
         let struct_size = 16u32; // 4 * u32 = 16 (release is a pointer)
         let total = struct_size + release_str.len() as u32;
         let guest_ptr: u32 = {
-            let (_, mut store_ref) = env.data_and_store_mut();
-            match malloc_fn.call(&mut store_ref, total as i32) {
+            match malloc_fn.call(&mut env.as_store_mut(), total as i32) {
                 Ok(ptr) if ptr != 0 => ptr as u32,
                 _ => return 1,
             }

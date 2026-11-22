@@ -13,10 +13,34 @@ use std::sync::mpsc::Sender;
 
 use wasmer::{
     AsStoreMut, Engine, Function, Imports, Instance, Memory, MemoryType, Module, Pages,
-    SharedMemory, Store, TypedFunction, WasmTypeList,
+    RuntimeError, SharedMemory, Store, TypedFunction, WasmTypeList,
 };
 use wasmer_napi::NapiCtx;
-use wasmer_wasix::WasiError;
+
+/// The exit of a guest's process, as its runtime raises it from an import: an
+/// error of the runtime's own type, which carries no trap code.
+#[derive(Debug)]
+pub struct GuestExit(pub i32);
+
+impl std::fmt::Display for GuestExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the guest exited with status {}", self.0)
+    }
+}
+
+impl std::error::Error for GuestExit {}
+
+impl GuestExit {
+    /// The error an import returns to unwind its guest with this exit.
+    pub fn raise(status: i32) -> RuntimeError {
+        RuntimeError::user(Box::new(Self(status)))
+    }
+
+    /// The status `error` exited with, if it is one of these.
+    pub fn status(error: &RuntimeError) -> Option<i32> {
+        error.downcast_ref::<Self>().map(|exit| exit.0)
+    }
+}
 
 /// `napi_invalid_arg`.
 pub const NAPI_INVALID_ARG: i32 = 1;
@@ -366,7 +390,7 @@ impl Guest {
         ctx: &NapiCtx,
         engine: &Engine,
         module: &Module,
-        signal: impl Fn() -> Result<(), WasiError> + Send + Sync + 'static,
+        signal: impl Fn() -> Result<(), RuntimeError> + Send + Sync + 'static,
     ) -> Self {
         Self::instantiate(ctx, engine, module, signal, None)
     }
@@ -404,7 +428,7 @@ impl Guest {
         ctx: &NapiCtx,
         engine: &Engine,
         module: &Module,
-        signal: impl Fn() -> Result<(), WasiError> + Send + Sync + 'static,
+        signal: impl Fn() -> Result<(), RuntimeError> + Send + Sync + 'static,
         shared: Option<Option<SharedMemory>>,
     ) -> Self {
         let mut store = Store::new(engine.clone());

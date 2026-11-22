@@ -1,47 +1,73 @@
-use std::{cell::Cell, ffi::c_void, sync::Arc};
+use std::{cell::RefCell, ffi::c_void, sync::Arc};
 
-use wasmer::{AsStoreMut, FunctionEnv, FunctionEnvMut, Store, StoreMut, Table, Value};
-use wasmer_wasix::WasiError;
-use wasmer_wasix::wasmer_wasix_types::wasi::ExitCode;
+use wasmer::sys::vm::TrapCode;
+use wasmer::{
+    AsStoreMut, FunctionEnv, FunctionEnvMut, RuntimeError, Store, StoreMut, Table, Value,
+};
 
 use super::callback_cache::CachedGuestCallback;
 use crate::{NapiEnv, snapi::SnapiEnv};
 
 thread_local! {
-    /// A guest instance exit that trapped out of a callback. The trampoline
-    /// cannot propagate a WASI trap through V8's native frames. The enclosing
-    /// N-API import retrieves the exit and returns it to Wasmer.
-    static PENDING_GUEST_EXIT: Cell<Option<ExitCode>> = const { Cell::new(None) };
+    /// The error that ended a guest callback and that its guest must unwind
+    /// with: the exit of its process, an abort by the host. The trampoline
+    /// cannot propagate an error through V8's native frames. The enclosing
+    /// N-API import retrieves it and returns it to Wasmer.
+    static PENDING_GUEST_UNWIND: RefCell<Option<RuntimeError>> = const { RefCell::new(None) };
 }
 
 /// Lends the store across the bridge call so V8 callbacks and the guest-heap
 /// allocator can recover it with [`Store::with_current`]. Wasmer coordinates
 /// nested parks and decides whether the active store can be borrowed.
-/// Returns any guest exit the bridge call must propagate.
+/// Returns any error the bridge call must unwind its guest with.
 pub(crate) fn lend_store<R>(
     env: &mut FunctionEnvMut<NapiEnv>,
     f: impl FnOnce() -> R,
-) -> (R, Option<ExitCode>) {
+) -> (R, Option<RuntimeError>) {
     let result = env.as_store_mut().parked(f);
-    (result, take_pending_guest_exit())
+    (result, take_pending_guest_unwind())
 }
 
-/// If a guest callback trapped with a WASI process exit, stash the exit code so
-/// the enclosing import boundary can re-raise it, and report whether it did.
-/// Non-exit traps return `false` and are left for the caller to log.
-fn stash_guest_exit(err: &wasmer::RuntimeError) -> bool {
-    if let Some(WasiError::Exit(code)) = err.downcast_ref::<WasiError>() {
-        PENDING_GUEST_EXIT.with(|exit| exit.set(Some(*code)));
-        return true;
+/// Whether an error that ended a guest callback has to unwind the guest that
+/// called into JavaScript, too.
+///
+/// A fault in the callback's own code (an out-of-bounds access, `unreachable`,
+/// an exception it does not catch) ends only the callback: the trampoline
+/// reports it and JavaScript goes on. Every other error is the host ending
+/// the guest: its WASIX process exited, its thread was interrupted, the host
+/// aborted it. Those carry no trap code, except the interrupt.
+fn unwinds_guest(err: &RuntimeError) -> bool {
+    if err.is_exception() {
+        return false;
     }
-    false
+    match err.clone().to_trap() {
+        None => true,
+        Some(code) => code == TrapCode::HostInterrupt,
+    }
 }
 
-/// Take a pending guest instance exit stashed by a callback trampoline, if
-/// any. For an import boundary that did not lend its store; [`lend_store`]
-/// hands the exit to one that did.
-pub(crate) fn take_pending_guest_exit() -> Option<ExitCode> {
-    PENDING_GUEST_EXIT.with(Cell::take)
+/// If a guest callback ended with an error its guest must unwind with, stash
+/// it so the enclosing import boundary can re-raise it, and report whether it
+/// did. Other errors return `false` and are left for the caller to log.
+///
+/// The first error wins: a callback that runs while one is already stashed
+/// (JavaScript went on after the bridge reported the first as an exception)
+/// must not replace the error its guest ends with.
+fn stash_guest_unwind(err: &RuntimeError) -> bool {
+    if !unwinds_guest(err) {
+        return false;
+    }
+    PENDING_GUEST_UNWIND.with(|pending| {
+        pending.borrow_mut().get_or_insert_with(|| err.clone());
+    });
+    true
+}
+
+/// Take the pending error stashed by a callback trampoline, if any. For an
+/// import boundary that did not lend its store; [`lend_store`] hands the
+/// error to one that did.
+pub(crate) fn take_pending_guest_unwind() -> Option<RuntimeError> {
+    PENDING_GUEST_UNWIND.with(|pending| pending.borrow_mut().take())
 }
 
 /// What [`snapi_host_invoke_wasm_callback`] returns in place of a value id
@@ -130,7 +156,7 @@ fn call_guest_callback(
     match func.call(store, guest_env, callback_arg) {
         Ok(result) => result,
         Err(err) => {
-            if stash_guest_exit(&err) {
+            if stash_guest_unwind(&err) {
                 return 0;
             }
             eprintln!("[callback trampoline] error calling function: {err}");
@@ -173,7 +199,7 @@ fn call_guest_callback2(
     match func.call_finalizer(store, guest_env, arg0, arg1) {
         Ok(result) => result,
         Err(err) => {
-            if stash_guest_exit(&err) {
+            if stash_guest_unwind(&err) {
                 return 0;
             }
             eprintln!("[finalizer trampoline] error calling guest finalizer: {err}");
@@ -391,18 +417,28 @@ mod tests {
         INNER_IMPORT.with(|slot| slot.borrow_mut().take());
     }
 
-    #[test]
-    fn lending_respects_async_store_borrow_tracking() {
+    /// Polls `future` once, which is all a call that never waits needs.
+    fn ready<T>(future: impl std::future::Future<Output = T>) -> T {
         use std::{
-            future::Future,
             pin::pin,
             task::{Context, Poll, Waker},
         };
 
-        let mut store = Store::default();
-        let env = FunctionEnv::new(&mut store, napi_env());
-        let import = Function::new_typed_with_env(
-            &mut store,
+        let mut future = pin!(future);
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("the call suspended"),
+        }
+    }
+
+    /// An import that reports whether Wasmer and N-API can lend its store.
+    fn lending_probe(store: &mut Store) -> Function {
+        let env = FunctionEnv::new(store, napi_env());
+        Function::new_typed_with_env(
+            store,
             &env,
             |mut env: FunctionEnvMut<NapiEnv>| -> (i32, i32) {
                 let ctx = CallbackInvocationCtx {
@@ -417,20 +453,104 @@ mod tests {
                 let (napi_can_lend, _) = lend_store(&mut env, || ctx.with_store(|_| ()).is_some());
                 (i32::from(wasmer_can_lend), i32::from(napi_can_lend))
             },
-        );
+        )
+    }
 
-        let store = store.into_async();
-        let mut call = pin!(import.call_async(&store, Vec::new()));
-        let Poll::Ready(result) = call.as_mut().poll(&mut Context::from_waker(Waker::noop()))
-        else {
-            panic!("the import suspended while checking whether its store was lent");
-        };
-        let results = result.expect("the import trapped");
+    #[test]
+    fn an_async_call_lends_its_store_as_a_sync_one_does() {
+        let mut store = Store::default();
+        let import = lending_probe(&mut store);
+        let results = ready(import.call_async(&mut store, &[])).expect("the import trapped");
         assert_eq!(
-            results[1].unwrap_i32(),
-            results[0].unwrap_i32(),
-            "N-API callback dispatch must respect whether Wasmer can lend the async store"
+            (results[0].unwrap_i32(), results[1].unwrap_i32()),
+            (1, 1),
+            "an import of an async call lends its store to a callback"
         );
+    }
+
+    #[test]
+    fn a_task_of_a_shared_store_lends_it_as_a_sync_call_does() {
+        // How a WASIX v2 machine runs its guests: every task has a handle to
+        // its store and takes the store for the slice it runs.
+        let mut store = Store::default();
+        let import = lending_probe(&mut store);
+        let mut shared = store.into_shared();
+        let results = ready(import.call_async(&mut shared, &[])).expect("the import trapped");
+        assert_eq!(
+            (results[0].unwrap_i32(), results[1].unwrap_i32()),
+            (1, 1),
+            "an import of a shared store's task lends the store to a callback"
+        );
+    }
+
+    #[test]
+    fn a_callback_waits_for_an_async_import_of_its_guest() {
+        // A guest function that JavaScript calls reaches an async import that
+        // another thread completes: a WASIX v2 guest reading a file. The
+        // trampoline stays in the call until the import is done.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut store = Store::default();
+        let waited = Arc::new(AtomicBool::new(false));
+        let slow = {
+            let waited = waited.clone();
+            let unit = FunctionEnv::new(&mut store, ());
+            Function::new_typed_async(
+                &mut store,
+                &unit,
+                async move |_: &mut wasmer::AsyncEnv<()>| -> i32 {
+                    let (sender, receiver) = std::sync::mpsc::channel::<std::task::Waker>();
+                    let done = Arc::new(AtomicBool::new(false));
+                    {
+                        let done = done.clone();
+                        std::thread::spawn(move || {
+                            let waker = receiver.recv().unwrap();
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            done.store(true, Ordering::SeqCst);
+                            waker.wake();
+                        });
+                    }
+                    let mut sender = Some(sender);
+                    std::future::poll_fn(|cx| {
+                        if done.load(Ordering::SeqCst) {
+                            return std::task::Poll::Ready(());
+                        }
+                        if let Some(sender) = sender.take() {
+                            sender.send(cx.waker().clone()).unwrap();
+                        }
+                        std::task::Poll::Pending
+                    })
+                    .await;
+                    waited.store(true, Ordering::SeqCst);
+                    17
+                },
+            )
+        };
+        let module = wasmer::Module::new(
+            &store,
+            r#"(module
+              (import "host" "slow" (func $slow (result i32)))
+              (table (export "table") 1 1 funcref)
+              (elem (i32.const 0) $callback)
+              (func $callback (param i32 i32) (result i32) call $slow))"#,
+        )
+        .unwrap();
+        let instance = wasmer::Instance::new(
+            &mut store,
+            &module,
+            &wasmer::imports! { "host" => { "slow" => slow } },
+        )
+        .unwrap();
+        let mut env = napi_env();
+        env.table = Some(instance.exports.get_table("table").unwrap().clone());
+        let func_env = FunctionEnv::new(&mut store, env);
+        let mut ctx = CallbackInvocationCtx {
+            func_env,
+            store_id: store.objects_mut().id().as_raw().get(),
+        };
+        let invoke = || snapi_host_invoke_wasm_callback((&raw mut ctx).cast(), 0, 0, 0);
+        assert_eq!(store.as_store_mut().parked(invoke), 17);
+        assert!(waited.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -476,20 +596,31 @@ mod tests {
         assert_eq!(after, 1, "the outer store is lent again after the park");
     }
 
+    #[derive(Debug)]
+    struct Exit(i32);
+
+    impl std::fmt::Display for Exit {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "exit {}", self.0)
+        }
+    }
+
+    impl std::error::Error for Exit {}
+
     #[test]
-    fn a_lend_hands_back_a_stashed_exit_and_ends_on_unwind() {
+    fn a_lend_hands_back_a_stashed_error_and_ends_on_unwind() {
         let mut store = Store::default();
         let env = FunctionEnv::new(&mut store, napi_env());
         let import = Function::new_typed_with_env(
             &mut store,
             &env,
             |mut env: FunctionEnvMut<NapiEnv>| -> i32 {
-                let exited =
-                    wasmer::RuntimeError::user(Box::new(WasiError::Exit(ExitCode::from(7u16))));
-                let (stashed, exit) = lend_store(&mut env, || stash_guest_exit(&exited));
-                let handed_back = matches!(exit, Some(code) if code.raw() == 7);
+                let exited = RuntimeError::user(Box::new(Exit(7)));
+                let (stashed, unwind) = lend_store(&mut env, || stash_guest_unwind(&exited));
+                let handed_back = unwind
+                    .is_some_and(|error| matches!(error.downcast_ref::<Exit>(), Some(Exit(7))));
                 // Taken, not copied.
-                let taken = take_pending_guest_exit().is_none();
+                let taken = take_pending_guest_unwind().is_none();
 
                 // resume_unwind raises a panic without the hook's message.
                 let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -504,6 +635,31 @@ mod tests {
             },
         );
         assert_eq!(call_import(&mut store, &import), 0b11111);
+    }
+
+    #[test]
+    fn only_what_ends_the_guest_is_stashed() {
+        // The host ending the guest: stashed, and the first one is kept.
+        assert!(stash_guest_unwind(&RuntimeError::user(Box::new(Exit(1)))));
+        assert!(stash_guest_unwind(&RuntimeError::user(Box::new(Exit(2)))));
+        assert!(stash_guest_unwind(&RuntimeError::new("the host gave up")));
+        let first = take_pending_guest_unwind().expect("an error was stashed");
+        assert!(matches!(first.downcast_ref::<Exit>(), Some(Exit(1))));
+        assert!(take_pending_guest_unwind().is_none());
+
+        // A fault of the callback's own code ends only the callback.
+        let mut store = Store::default();
+        let module =
+            wasmer::Module::new(&store, r#"(module (func (export "fault") unreachable))"#).unwrap();
+        let instance = wasmer::Instance::new(&mut store, &module, &wasmer::imports! {}).unwrap();
+        let fault = instance
+            .exports
+            .get_function("fault")
+            .unwrap()
+            .call(&mut store, &[])
+            .unwrap_err();
+        assert!(!stash_guest_unwind(&fault));
+        assert!(take_pending_guest_unwind().is_none());
     }
 
     #[test]

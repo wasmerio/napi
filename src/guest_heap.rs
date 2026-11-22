@@ -212,20 +212,25 @@ impl GuestHeap {
     /// the same shared linear memory receive the same `Arc<GuestHeap>`. Returns
     /// `None` when the memory cannot support host-side allocation with a stable
     /// base, in which case callers must treat guest allocation as unavailable.
+    ///
+    /// `limit` is how far, in bytes, the heap may grow the memory: a runtime
+    /// that keeps the top of the guest's address space for itself passes where
+    /// that starts. The first env to reach a shared memory sets it.
     pub(crate) fn get_or_create(
         store: &mut StoreMut<'_>,
         memory: &wasmer::Memory,
         budget: Arc<ResourceBudget>,
+        limit: Option<u64>,
     ) -> Option<Arc<Self>> {
         let base = memory.view(store).data_ptr() as usize;
         if base == 0 {
-            return Self::new(store, memory, budget);
+            return Self::new(store, memory, budget, limit);
         }
         // Shared memories: one heap per base, reused across threads/envs.
         // Non-shared memories are single-threaded (conformance lane) — a fresh
         // heap each time is fine and avoids cross-instance base-key collisions.
         if !memory.ty(store).shared {
-            return Self::new(store, memory, budget);
+            return Self::new(store, memory, budget, limit);
         }
         let mut reg = shared_registry()
             .lock()
@@ -237,7 +242,7 @@ impl GuestHeap {
             existing.register_memory(store, memory);
             return Some(existing);
         }
-        let heap = Self::new(store, memory, budget)?;
+        let heap = Self::new(store, memory, budget, limit)?;
         reg.insert(base, Arc::downgrade(&heap));
         // Opportunistically drop dead entries so the map cannot grow unbounded
         // across many short-lived instances that reuse addresses.
@@ -266,6 +271,7 @@ impl GuestHeap {
         store: &mut StoreMut<'_>,
         memory: &wasmer::Memory,
         budget: Arc<ResourceBudget>,
+        limit: Option<u64>,
     ) -> Option<Arc<Self>> {
         let ty = memory.ty(store);
         let view = memory.view(store);
@@ -275,7 +281,9 @@ impl GuestHeap {
             return None;
         }
         let max_pages = ty.maximum.map(|p| p.0).unwrap_or(65536).min(65536);
-        let max_bytes = u64::from(max_pages) * u64::from(WASM_PAGE);
+        // Whole pages only: the heap claims by growing the memory.
+        let limit_pages = limit.map_or(65536, |bytes| bytes / u64::from(WASM_PAGE));
+        let max_bytes = u64::from(max_pages).min(limit_pages) * u64::from(WASM_PAGE);
 
         // The base can only be stable if the whole range is reserved up
         // front. On 64-bit hosts this is always the case for wasm32.
@@ -818,7 +826,7 @@ mod tests {
         let memory = Memory::new(&mut *store, ty).expect("create shared memory");
         let heap = {
             let mut store_mut = store.as_store_mut();
-            GuestHeap::new(&mut store_mut, &memory, budget).expect("guest heap")
+            GuestHeap::new(&mut store_mut, &memory, budget, None).expect("guest heap")
         };
         (memory, heap)
     }
@@ -1108,7 +1116,7 @@ mod tests {
         let memory = Memory::new(&mut store, ty).expect("create owned memory");
         let heap = {
             let mut store_mut = store.as_store_mut();
-            GuestHeap::new(&mut store_mut, &memory, ResourceBudget::unlimited())
+            GuestHeap::new(&mut store_mut, &memory, ResourceBudget::unlimited(), None)
                 .expect("guest heap")
         };
 

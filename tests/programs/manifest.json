@@ -199,6 +199,16 @@
       "name": "test_trusted_script",
       "description": "unofficial_napi_create_trusted_script and unofficial_napi_is_executing_js through the guest imports",
       "expected_stdout": "TEST_TRUSTED_SCRIPT_OK=1\n"
+    },
+    {
+      "name": "test_callback_syscalls",
+      "description": "Syscalls that wait (sleep, file I/O, stdout) inside guest functions called from JavaScript, also nested",
+      "expected_stdout": "in callback: slept\nin callback: wrote and read 13 bytes\nin callback: wrote and read 13 bytes\nin callback: slept\nTEST_CALLBACK_SYSCALLS_OK=1\n"
+    },
+    {
+      "name": "test_exit_in_callback",
+      "description": "exit() in a guest function called from JavaScript ends the process with its status",
+      "expected_stdout": "TEST_EXIT_IN_CALLBACK_OK=1\n"
     }
   ]
 }

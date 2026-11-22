@@ -8,6 +8,11 @@ pub mod callback;
 pub(crate) mod callback_cache;
 pub(crate) mod compat;
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+mod drive;
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+mod import;
+pub(crate) mod imports;
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 pub mod napi;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 #[path = "napi_js.rs"]

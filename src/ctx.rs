@@ -9,6 +9,7 @@ use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_EXTENSION_WASMER_MODULE_PREFIX, NAPI_MODULE_NAME,
     NapiEnv, NapiVersion, NapiWasmerExtensionVersion,
     budget::{NapiMemoryAccountant, ResourceBudget},
+    guest::imports::{is_known_env_import, is_known_extension_import},
     guest::napi::{is_known_napi_import, register_env_imports, register_napi_imports},
 };
 
@@ -111,8 +112,29 @@ pub struct NapiSession {
 ///
 /// Pass it back, unmodified, to [`NapiRuntimeHooks::configure_instance`] for
 /// the instance created with those imports.
+#[derive(Clone)]
 pub struct NapiInstantiationState {
     session: Option<NapiSession>,
+}
+
+impl NapiInstantiationState {
+    /// Whether the module asked for N-API imports, so that its instance has
+    /// to be configured.
+    pub fn has_session(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// Releases the N-API environments the instance still holds, on the
+    /// thread that owns them, without calling into the guest.
+    ///
+    /// Dropping the instance's store does the same, so only a runtime that
+    /// ends an instance before it drops the store needs this. `store` must be
+    /// the store the imports were made in. Safe to call more than once.
+    pub fn release_envs(&self, store: &mut StoreMut<'_>) {
+        if let Some(session) = &self.session {
+            session.release_envs(store);
+        }
+    }
 }
 
 /// Runtime hooks that provide N-API imports for WASIX guests.
@@ -440,6 +462,18 @@ impl NapiCtx {
         (napi_version, napi_extension_version)
     }
 
+    /// Whether these hooks provide the import `name` of `namespace`: an N-API
+    /// function, one of the Wasmer extension's, or one of the `env` functions
+    /// registered with them.
+    pub fn provides_import(namespace: &str, name: &str) -> bool {
+        match namespace {
+            NAPI_MODULE_NAME => is_known_napi_import(name),
+            NAPI_EXTENSION_WASMER_MODULE_NAME => is_known_extension_import(name),
+            "env" => is_known_env_import(name),
+            _ => false,
+        }
+    }
+
     pub fn runtime_hooks(&self) -> NapiRuntimeHooks {
         NapiRuntimeHooks { ctx: self.clone() }
     }
@@ -569,6 +603,23 @@ impl NapiRuntimeHooks {
         imported_memory: Option<&wasmer::Memory>,
         state: NapiInstantiationState,
     ) -> Result<()> {
+        self.configure_instance_within(module, store, instance, imported_memory, state, None)
+    }
+
+    /// [`Self::configure_instance`] for a runtime that keeps part of the
+    /// guest's address space for itself: the host never grows the guest's
+    /// memory past `memory_limit` bytes for its own allocations (the backing
+    /// stores of buffers and array buffers). `None` leaves it the whole
+    /// memory.
+    pub fn configure_instance_within(
+        &self,
+        module: &Module,
+        store: &mut StoreMut<'_>,
+        instance: &Instance,
+        imported_memory: Option<&wasmer::Memory>,
+        state: NapiInstantiationState,
+        memory_limit: Option<u64>,
+    ) -> Result<()> {
         let (napi_version, napi_extension_version) = NapiCtx::module_needs_napi(module);
         if napi_version.is_none() && napi_extension_version.is_none() {
             return Ok(());
@@ -578,7 +629,7 @@ impl NapiRuntimeHooks {
             "missing N-API session for module instance setup \
              (the state was not created for this module's imports)",
         )?;
-        session.configure_instance(store, instance, imported_memory)
+        session.configure_instance_within(store, instance, imported_memory, memory_limit)
     }
 }
 
@@ -654,6 +705,33 @@ impl NapiSession {
         instance: &Instance,
         imported_memory: Option<&wasmer::Memory>,
     ) -> Result<()> {
+        self.configure_instance_within(store, instance, imported_memory, None)
+    }
+
+    /// Releases the session's N-API environments; see
+    /// [`NapiInstantiationState::release_envs`].
+    pub fn release_envs(&self, store: &mut StoreMut<'_>) {
+        let func_env = self
+            .inner
+            .func_env
+            .lock()
+            .expect("poisoned NapiSession mutex")
+            .clone();
+        if let Some(func_env) = func_env {
+            func_env.as_mut(store).release_envs();
+        }
+    }
+
+    /// [`Self::configure_instance`] with a limit on how far the host grows
+    /// the guest's memory; see [`NapiRuntimeHooks::configure_instance_within`].
+    #[cfg_attr(all(target_arch = "wasm32", feature = "js"), allow(unused_variables))]
+    pub fn configure_instance_within(
+        &self,
+        store: &mut StoreMut<'_>,
+        instance: &Instance,
+        imported_memory: Option<&wasmer::Memory>,
+        memory_limit: Option<u64>,
+    ) -> Result<()> {
         let func_env = {
             let guard = self
                 .inner
@@ -687,10 +765,15 @@ impl NapiSession {
                 .clone()
                 .context("N-API imports require the guest to have linear memory")?;
             let budget = Arc::clone(&func_env.as_ref(&*store).budget);
-            let heap = crate::guest_heap::GuestHeap::get_or_create(&mut *store, &memory, budget)
-                .context(
-                    "failed to initialize the guest-heap allocator over the guest's linear memory",
-                )?;
+            let heap = crate::guest_heap::GuestHeap::get_or_create(
+                &mut *store,
+                &memory,
+                budget,
+                memory_limit,
+            )
+            .context(
+                "failed to initialize the guest-heap allocator over the guest's linear memory",
+            )?;
             func_env.as_mut(&mut *store).guest_heap = Some(heap);
         }
 

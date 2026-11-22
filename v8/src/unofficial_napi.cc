@@ -2777,6 +2777,13 @@ extern "C" napi_status NAPI_CDECL snapi_private_create_env(
     ReleaseRuntime();
     return napi_generic_failure;
   }
+  if (options != nullptr && options->stack_limit != nullptr) {
+    // V8 takes the limit from the constraints and then, still inside
+    // Isolate::Initialize, gives the creating thread its default stack guard
+    // again, which is --stack-size below where the thread's stack starts.
+    // Setting it once the isolate exists is what keeps it.
+    isolate->SetStackLimit(reinterpret_cast<uintptr_t>(options->stack_limit));
+  }
   auto* scope = new (std::nothrow) UnofficialEnvScope(isolate, allocator);
   if (scope == nullptr) {
     DisposeIsolateAndWait(platform, isolate);

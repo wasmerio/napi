@@ -6,7 +6,7 @@ use wasmer::{AsStoreMut, AsStoreRef, FunctionEnv, FunctionEnvMut, Store, Table, 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use std::future::Future;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
-use wasmer::{AsStoreAsync, AsyncFunctionEnvMut, StoreAsync};
+use wasmer::{AsyncEnv, WeakSharedStore};
 
 use crate::{NapiEnv, snapi::SnapiEnv};
 
@@ -46,27 +46,26 @@ enum CallbackEnv {
     Async(AsyncCallbackOwner),
 }
 
+/// How a callback reaches its env while no import of the guest lends the
+/// store: through the store's shared handle. The handle is weak. The context
+/// lives in the store's own state, so a strong one would keep the store alive
+/// for ever.
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
+#[derive(Clone)]
 pub(crate) struct AsyncCallbackOwner {
     env: FunctionEnv<NapiEnv>,
-    store: StoreAsync,
+    store: WeakSharedStore,
+    store_id: usize,
 }
 
+/// The owner for `env`'s store, if the store is shared (see
+/// `Store::into_shared`): only then can a callback take it between imports.
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
-impl Clone for AsyncCallbackOwner {
-    fn clone(&self) -> Self {
-        Self {
-            env: self.env.clone(),
-            store: self.store.store(),
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "js"))]
-fn async_callback_owner(env: &FunctionEnvMut<NapiEnv>) -> Option<AsyncCallbackOwner> {
+fn async_callback_owner(env: &mut FunctionEnvMut<NapiEnv>) -> Option<AsyncCallbackOwner> {
     Some(AsyncCallbackOwner {
         env: env.as_ref(),
-        store: env.as_store_async()?.store(),
+        store: env.shared()?.downgrade(),
+        store_id: env.objects_mut().id().as_raw().get(),
     })
 }
 
@@ -78,7 +77,7 @@ impl CallbackEnv {
         let (env, store_id) = match self {
             Self::Sync { env, store_id } => (env, *store_id),
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
-            Self::Async(owner) => (&owner.env, owner.store.store_id().as_raw().get()),
+            Self::Async(owner) => (&owner.env, owner.store_id),
         };
         // A synchronous bridge call explicitly lends its store. Never recover
         // a different store merely because it happens to be current.
@@ -95,9 +94,11 @@ impl CallbackEnv {
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
         if let Self::Async(owner) = self {
             // A busy JSPI store defers the callback to a guest checkpoint.
-            if let Some(mut store) = owner.store.try_write_lock() {
-                return Some(callback(&mut owner.env.clone().into_mut(&mut store)));
-            }
+            return owner
+                .store
+                .upgrade()?
+                .try_with(|mut store| callback(&mut owner.env.clone().into_mut(&mut store)))
+                .ok();
         }
         None
     }
@@ -123,8 +124,8 @@ pub(crate) fn install_persistent_callback_state(
 }
 
 /// Gives a new env its persistent callback context, owned by the store's JSPI
-/// shared `StoreAsync` handle. A synchronous store has no such owner yet; some
-/// embedders promote it to an async store later. Until then the env waits:
+/// shared handle. A store that is not shared has no such owner yet; some
+/// embedders share it later. Until then the env waits:
 /// the next callback state installed once the store is async, synchronous or
 /// async (a checkpoint, a message wait), installs the context.
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -139,15 +140,10 @@ pub(crate) fn install_async_owner(
     }
 }
 
-/// Installs the persistent callback context of an env created from a
-/// synchronous store, once that store has become async. An async import
-/// passes the owner it holds; otherwise it is looked up.
+/// Installs the persistent callback context of an env created from a store
+/// that was not shared, once that store is.
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
-fn install_awaited_async_owner(
-    env: &mut FunctionEnvMut<NapiEnv>,
-    snapi_env: SnapiEnv,
-    owner: Option<AsyncCallbackOwner>,
-) {
+fn install_awaited_async_owner(env: &mut FunctionEnvMut<NapiEnv>, snapi_env: SnapiEnv) {
     let Some(&env_id) = env
         .data()
         .napi_state_to_guest_env
@@ -158,7 +154,7 @@ fn install_awaited_async_owner(
     if !env.data().envs_awaiting_async_owner.contains(&env_id) {
         return;
     }
-    if let Some(async_env) = owner.or_else(|| async_callback_owner(env)) {
+    if let Some(async_env) = async_callback_owner(env) {
         install_persistent_callback_state(env, env_id, snapi_env, async_env);
     }
 }
@@ -200,7 +196,7 @@ fn install_callback_state(
     // Empty unless an env was created from a synchronous store.
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     if !env.data().envs_awaiting_async_owner.is_empty() {
-        install_awaited_async_owner(env, snapi_env, None);
+        install_awaited_async_owner(env, snapi_env);
     }
 
     let env_ptr = (env as *mut FunctionEnvMut<'_, NapiEnv>).cast::<RawFunctionEnvMut>();
@@ -588,7 +584,7 @@ pub fn with_callback_state<R>(
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub async fn with_callback_state_async<R, F>(
-    env: AsyncFunctionEnvMut<NapiEnv>,
+    cx: &mut AsyncEnv<NapiEnv>,
     snapi_env: SnapiEnv,
     future: F,
 ) -> R
@@ -602,40 +598,28 @@ where
     // An env created from a synchronous store gets its persistent context
     // here at the latest, before the import suspends and host jobs (Promise
     // jobs, message deliveries) call into the guest.
-    let owner_id = {
-        let mut locked = env.write().await;
-        let mut sync_env = locked.as_function_env_mut();
+    let owner_id = cx.with(|mut sync_env| {
         if !sync_env.data().envs_awaiting_async_owner.is_empty() {
-            let owner = AsyncCallbackOwner {
-                env: env.as_ref(),
-                store: env.as_store_async().store(),
-            };
-            install_awaited_async_owner(&mut sync_env, snapi_env, Some(owner));
+            install_awaited_async_owner(&mut sync_env, snapi_env);
         }
         let owner_id = sync_env.data_mut().next_host_buffer_owner();
         sync_env.data_mut().host_buffer_copy_frames.push(owner_id);
         owner_id
-    };
+    });
     // The environment's persistent Async callback context is the owner of
     // host-to-guest re-entry while a JSPI import is suspended. Do not replace
     // it with a future-local context: multiple suspended imports can overlap
     // and complete out of order, so stack-style save/restore would eventually
     // restore a pointer to a context owned by an already-completed future.
     let result = future.await;
-    {
-        // Keep this guard in an explicit scope. A completed Rust future may
-        // remain owned by its JavaScript Promise until a later GC cycle; if the
-        // guard stays in the generator state, it also keeps the async Store
-        // shared after the guest entrypoint has returned.
-        let mut locked = env.write().await;
-        let mut sync_env = locked.as_function_env_mut();
+    cx.with(|mut sync_env| {
         flush_host_buffer_copies(&mut sync_env, owner_id);
         if sync_env.data().host_buffer_copy_frames.is_empty() {
             flush_pending_host_buffer_copies(&mut sync_env, snapi_env);
         } else {
             publish_pending_host_buffer_copies(&mut sync_env, snapi_env);
         }
-    }
+    });
     result
 }
 
@@ -765,14 +749,16 @@ mod tests {
         assert!(callback.with_env(|_| ()).is_none());
     }
 
-    #[wasm_bindgen_test(async)]
-    async fn asynchronous_callbacks_defer_busy_stores_without_retaining_waiters() {
+    #[wasm_bindgen_test]
+    fn asynchronous_callbacks_defer_busy_stores_without_keeping_them() {
         let mut store = Store::default();
         let function_env = FunctionEnv::new(&mut store, callback_state());
-        let store = store.into_async();
+        let store_id = store.id().as_raw().get();
+        let store = store.into_shared();
         let callback = CallbackEnv::Async(AsyncCallbackOwner {
             env: function_env.clone(),
-            store: store.store(),
+            store: store.downgrade(),
+            store_id,
         });
         assert_eq!(
             callback.with_env(|env| {
@@ -781,14 +767,15 @@ mod tests {
             }),
             Some(42)
         );
-        let locked = store.write_lock().await;
-        assert!(callback.with_env(|_| ()).is_none());
-        drop(locked);
+        // While a slice of the store runs, the callback is deferred.
+        store
+            .try_with(|_| assert!(callback.with_env(|_| ()).is_none()))
+            .unwrap();
         assert_eq!(
             callback.with_env(|env| env.data().default_napi_env_id),
             Some(Some(17))
         );
-        drop(callback);
+        // The callback's handle does not keep the store shared.
         assert!(store.into_store().is_ok());
     }
 }

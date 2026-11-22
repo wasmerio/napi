@@ -136,7 +136,7 @@ fn guest_range(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, len: usize) ->
     if len == 0 {
         return None;
     }
-    let (state, store) = env.data_and_store_mut();
+    let (state, store) = env.data_and_store();
     let heap = state.guest_heap.as_ref()?;
     let memory = state.memory.as_ref()?;
     heap.host_range(guest_ptr as u64, len as u64, || {
@@ -213,7 +213,7 @@ pub fn write_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32, data
         unsafe { copy_to_guest(data.as_ptr(), dst, data.len()) };
         return true;
     }
-    let (state, store) = env.data_and_store_mut();
+    let (state, store) = env.data_and_store();
     let Some(memory) = state.memory.clone() else {
         return false;
     };
@@ -289,7 +289,7 @@ pub fn read_guest_bytes(
     }
     let charge = TransientCharge::for_copy(env, len)?;
     let mut out = vec![0u8; len];
-    let (state, store) = env.data_and_store_mut();
+    let (state, store) = env.data_and_store();
     state
         .memory
         .as_ref()?
@@ -307,7 +307,7 @@ pub fn read_guest_u32(env: &mut FunctionEnvMut<NapiEnv>, guest_ptr: u32) -> Opti
         unsafe { copy_from_guest(src, bytes.as_mut_ptr(), 4) };
         return Some(u32::from_le_bytes(bytes));
     }
-    let (state, store) = env.data_and_store_mut();
+    let (state, store) = env.data_and_store();
     let memory = state.memory.clone()?;
     let mut bytes = [0u8; 4];
     memory
@@ -324,7 +324,7 @@ pub fn guest_data_size(env: &mut FunctionEnvMut<NapiEnv>) -> u64 {
     let Some(memory) = env.data().memory.clone() else {
         return 0;
     };
-    let (_, store) = env.data_and_store_mut();
+    let (_, store) = env.data_and_store();
     memory.view(&store).data_size()
 }
 
@@ -357,7 +357,7 @@ pub fn allocate_guest_bytes(env: &mut FunctionEnvMut<NapiEnv>, data: &[u8]) -> O
 
 pub fn host_ptr_to_guest_ptr(env: &mut FunctionEnvMut<NapiEnv>, host_addr: u64) -> Option<u32> {
     let memory = env.data().memory.clone()?;
-    let (_, store_ref) = env.data_and_store_mut();
+    let (_, store_ref) = env.data_and_store();
     let view = memory.view(&store_ref);
     let host_base = view.data_ptr() as u64;
     let memory_len = view.data_size();
@@ -548,7 +548,7 @@ pub fn try_read_guest_c_string_max(
     }
     // No guest heap: through the `MemoryView`. Find the NUL a block at a
     // time, then read the string once.
-    let (state, store) = env.data_and_store_mut();
+    let (state, store) = env.data_and_store();
     let Some(memory) = state.memory.clone() else {
         return Ok(None);
     };
@@ -721,6 +721,7 @@ mod tests {
             &mut store.as_store_mut(),
             &memory,
             ResourceBudget::unlimited(),
+            None,
         )
         .expect("guest heap");
         for heap in [Some(heap), None] {
@@ -736,7 +737,7 @@ mod tests {
             let mut env = FunctionEnv::new(&mut store, state).into_mut(&mut store);
             let size = u32::try_from(guest_data_size(&mut env)).unwrap();
             let put = |env: &mut FunctionEnvMut<NapiEnv>, ptr: u32, bytes: &[u8]| {
-                let (state, store) = env.data_and_store_mut();
+                let (state, store) = env.data_and_store();
                 let view = state.memory.as_ref().unwrap().view(&store);
                 view.write(u64::from(ptr), bytes).unwrap();
             };
@@ -817,6 +818,7 @@ mod tests {
             &mut store.as_store_mut(),
             &memory,
             ResourceBudget::unlimited(),
+            None,
         )
         .expect("guest heap");
         for heap in [Some(heap), None] {
@@ -832,7 +834,7 @@ mod tests {
             let mut env = FunctionEnv::new(&mut store, state).into_mut(&mut store);
             let size = u32::try_from(guest_data_size(&mut env)).unwrap();
             let put = |env: &mut FunctionEnvMut<NapiEnv>, ptr: u32, bytes: &[u8]| {
-                let (state, store) = env.data_and_store_mut();
+                let (state, store) = env.data_and_store();
                 let view = state.memory.as_ref().unwrap().view(&store);
                 view.write(u64::from(ptr), bytes).unwrap();
             };

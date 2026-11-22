@@ -7,25 +7,33 @@ license = "MIT"
 resolver = "2"
 
 [features]
+# Uses the browser/Node JavaScript realm as the N-API value engine when this
+# crate is compiled as part of a wasm32-unknown-unknown wasm-bindgen module.
+# On native targets this feature is inert and the V8 backend remains active.
 js = [
   "dep:js-sys",
   "dep:wasm-bindgen",
   "dep:wasm-bindgen-futures",
   "wasmer/experimental-async",
   "wasmer/js-default",
+  "wasixv2-exec?/js",
 ]
-# Implements the WASIX runtime's `InstantiationHook` for `NapiRuntimeHooks`.
-# `wasmer-wasix` is a non-optional dependency (the always-compiled guest callback
-# trampoline needs `WasiError`), so this feature only gates `mod wasix` and does
-# not activate the dependency.
-wasix = []
+# Implements the WASIX v2 runtime's `InstantiationHook` as `NapiHook`.
+#
+# With tokio: a guest function that JavaScript calls is polled from inside the
+# task that runs the guest, where tokio's cooperative budget would stop every
+# tokio future after some hundred operations (see `guest/drive.rs`).
+wasix = ["dep:wasixv2-exec", "dep:tokio", "tokio/rt"]
 cli = [
   "wasix",
   "dep:wasmer-cache",
-  "dep:wasmer-c-api-imports",
-  "wasmer-c-api-imports/wasi",
-  "dep:tokio",
-  "dep:virtual-fs",
+  "dep:wasmer-c-api-imports-wasixv2",
+  "tokio/rt-multi-thread",
+  "tokio/signal",
+  "tokio/sync",
+  "dep:wasixv2",
+  "wasixv2/terminal",
+  "dep:wasixv2-dylink",
   "dep:wasmer-types",
 ]
 
@@ -34,19 +42,25 @@ cli-llvm = ["cli", "wasmer/llvm"]
 
 [dependencies]
 anyhow = "1"
-# Pin the engine to one immutable wasmer-runtime revision. WASIX, virtual-fs and
-# the import bridges live in wasmerio/wasmer, pinned to one immutable revision;
-# the [patch] section below builds them against this same engine.
-wasmer = { git = "https://github.com/wasmerio/wasmer-runtime.git", rev = "c4e5b23a558d3d35a3b92945eba3bc105a37c3ba", default-features = false }
+# The engine is wasmer-runtime and WASIX is wasmer-next's WASIX v2, as in the
+# wasmer-next workspace that Cargo.toml builds in. wasmer-next is pinned to one
+# revision. Its crates name the engine by this same branch, and a build has
+# one engine only if this manifest names it the same way, so the revision of
+# the engine is the one Cargo.standalone.lock records.
+wasmer = { git = "https://github.com/wasmerio/wasmer-runtime", branch = "fix/sound-async-hardening", default-features = false }
 
 # This dependencies are ONLY needed for testing napi in Wasm locally
-wasmer-cache = { git = "https://github.com/wasmerio/wasmer-runtime.git", rev = "c4e5b23a558d3d35a3b92945eba3bc105a37c3ba", optional = true }
-wasmer-c-api-imports = { git = "https://github.com/wasmerio/wasmer.git", rev = "9c594d7b98fe61b1bee8d4ff700b050aede9ffbc", optional = true, default-features = false }
-wasmer-types = { git = "https://github.com/wasmerio/wasmer-runtime.git", rev = "c4e5b23a558d3d35a3b92945eba3bc105a37c3ba", optional = true }
-# Non-optional: `mod guest` (always compiled) re-raises guest WASI process
-# exits through the N-API import layers and needs the WASIX error type.
-virtual-fs = { git = "https://github.com/wasmerio/wasmer.git", rev = "9c594d7b98fe61b1bee8d4ff700b050aede9ffbc", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+wasmer-cache = { git = "https://github.com/wasmerio/wasmer-next", rev = "3e2be048fddc7cd44330fabc19499223061ddc21", optional = true }
+wasmer-c-api-imports-wasixv2 = { git = "https://github.com/wasmerio/wasmer-next", rev = "3e2be048fddc7cd44330fabc19499223061ddc21", optional = true, default-features = false, features = [
+  "sys",
+] }
+wasmer-types = { git = "https://github.com/wasmerio/wasmer-runtime", branch = "fix/sound-async-hardening", optional = true }
+wasixv2 = { git = "https://github.com/wasmerio/wasmer-next", rev = "3e2be048fddc7cd44330fabc19499223061ddc21", optional = true }
+wasixv2-dylink = { git = "https://github.com/wasmerio/wasmer-next", rev = "3e2be048fddc7cd44330fabc19499223061ddc21", default-features = false, features = [
+  "sys",
+], optional = true }
+wasixv2-exec = { git = "https://github.com/wasmerio/wasmer-next", rev = "3e2be048fddc7cd44330fabc19499223061ddc21", default-features = false, optional = true }
+tokio = { version = "1", optional = true }
 enum-iterator = "2.3.0"
 offset-allocator = "0.2.0"
 smallvec = "1.15"
@@ -55,15 +69,16 @@ smallvec = "1.15"
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen = { version = "0.2.120", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
-wasmer-wasix = { git = "https://github.com/wasmerio/wasmer.git", rev = "9c594d7b98fe61b1bee8d4ff700b050aede9ffbc", default-features = false, features = [
-  "js",
-] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-wasmer = { git = "https://github.com/wasmerio/wasmer-runtime.git", rev = "c4e5b23a558d3d35a3b92945eba3bc105a37c3ba", default-features = false, features = [
+# A guest callback that V8 calls runs to completion from inside V8's frames,
+# which takes the engine's async calls: a WASIX v2 guest's syscalls are async
+# imports, and one that has to wait would trap on a synchronous call.
+wasmer = { git = "https://github.com/wasmerio/wasmer-runtime", branch = "fix/sound-async-hardening", default-features = false, features = [
   "sys-default",
+  "experimental-async",
 ] }
-wasmer-wasix = { git = "https://github.com/wasmerio/wasmer.git", rev = "9c594d7b98fe61b1bee8d4ff700b050aede9ffbc", default-features = false, features = [
+wasixv2-exec = { git = "https://github.com/wasmerio/wasmer-next", rev = "3e2be048fddc7cd44330fabc19499223061ddc21", default-features = false, optional = true, features = [
   "sys",
 ] }
 
@@ -78,6 +93,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wat = "1"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
 
@@ -88,18 +106,6 @@ rustc-args = ["--cfg", "docsrs"]
 name = "napi_wasmer"
 path = "src/bin/napi_wasmer.rs"
 required-features = ["cli"]
-
-# wasmerio/wasmer's WASIX crates depend on its engine crates. Redirect those to
-# wasmer-runtime so the build contains exactly one engine.
-[patch."https://github.com/wasmerio/wasmer.git"]
-wasmer = { git = "https://github.com/wasmerio/wasmer-runtime.git", rev = "c4e5b23a558d3d35a3b92945eba3bc105a37c3ba" }
-wasmer-cache = { git = "https://github.com/wasmerio/wasmer-runtime.git", rev = "c4e5b23a558d3d35a3b92945eba3bc105a37c3ba" }
-wasmer-compiler = { git = "https://github.com/wasmerio/wasmer-runtime.git", rev = "c4e5b23a558d3d35a3b92945eba3bc105a37c3ba" }
-wasmer-compiler-cranelift = { git = "https://github.com/wasmerio/wasmer-runtime.git", rev = "c4e5b23a558d3d35a3b92945eba3bc105a37c3ba" }
-wasmer-compiler-llvm = { git = "https://github.com/wasmerio/wasmer-runtime.git", rev = "c4e5b23a558d3d35a3b92945eba3bc105a37c3ba" }
-wasmer-derive = { git = "https://github.com/wasmerio/wasmer-runtime.git", rev = "c4e5b23a558d3d35a3b92945eba3bc105a37c3ba" }
-wasmer-types = { git = "https://github.com/wasmerio/wasmer-runtime.git", rev = "c4e5b23a558d3d35a3b92945eba3bc105a37c3ba" }
-wasmer-vm = { git = "https://github.com/wasmerio/wasmer-runtime.git", rev = "c4e5b23a558d3d35a3b92945eba3bc105a37c3ba" }
 
 # Keep this manifest independent when cargo-standalone.sh materializes it in a
 # temporary directory below a larger checkout that also has a Cargo workspace.

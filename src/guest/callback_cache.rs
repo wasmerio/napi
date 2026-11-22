@@ -1,5 +1,7 @@
 //! Validated native callback dispatch, with generic compatibility fallback.
-use wasmer::{AsStoreMut, AsStoreRef, Function, RuntimeError, TypedFunction, Value};
+use wasmer::{AsStoreRef, Function, RuntimeError, StoreMut, TypedFunction, Value};
+
+use super::drive::run_to_completion;
 
 #[derive(Clone)]
 pub(crate) struct CachedGuestCallback {
@@ -19,42 +21,40 @@ impl CachedGuestCallback {
     }
 
     // Guest handles and pointers are u32; the wasm signature carries them as i32.
+    //
+    // The call is an async one that this thread stays in until it is done
+    // (see `drive`): the guest may wait in one of its runtime's async imports,
+    // and V8's frames below this one cannot be suspended.
     pub(crate) fn call(
         &self,
-        store: &mut impl AsStoreMut,
+        store: &mut StoreMut<'_>,
         env: u32,
         info: u32,
     ) -> Result<u32, RuntimeError> {
         if let Some(callback) = &self.napi_callback {
             // TypedFunction retains Wasmer's store, trap, and on_called guards;
-            // only per-call signature validation and heap argument/result arrays
-            // are removed. Never jump directly into compiled Wasm code.
-            return callback
-                .call(store, env as i32, info as i32)
+            // only per-call signature validation is removed. Never jump
+            // directly into compiled Wasm code.
+            return run_to_completion(callback.call_async(store, env as i32, info as i32))
                 .map(|value| value as u32);
         }
-        self.function
-            .call(store, &[Value::I32(env as i32), Value::I32(info as i32)])
-            .map(|values| result(&values))
+        let params = [Value::I32(env as i32), Value::I32(info as i32)];
+        run_to_completion(self.function.call_async(store, &params)).map(|values| result(&values))
     }
 
     pub(crate) fn call_finalizer(
         &self,
-        store: &mut impl AsStoreMut,
+        store: &mut StoreMut<'_>,
         env: u32,
         data: u32,
         hint: u32,
     ) -> Result<u32, RuntimeError> {
-        self.function
-            .call(
-                store,
-                &[
-                    Value::I32(env as i32),
-                    Value::I32(data as i32),
-                    Value::I32(hint as i32),
-                ],
-            )
-            .map(|values| result(&values))
+        let params = [
+            Value::I32(env as i32),
+            Value::I32(data as i32),
+            Value::I32(hint as i32),
+        ];
+        run_to_completion(self.function.call_async(store, &params)).map(|values| result(&values))
     }
 
     #[cfg(test)]
@@ -75,10 +75,9 @@ fn result(values: &[Value]) -> u32 {
 mod tests {
     use super::CachedGuestCallback;
     use wasmer::{
-        AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Instance, Module, Store, imports,
+        AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Instance, Module, RuntimeError, Store,
+        imports,
     };
-    use wasmer_wasix::WasiError;
-    use wasmer_wasix::wasmer_wasix_types::wasi::ExitCode;
 
     fn instance(store: &mut Store, wat: &str) -> Instance {
         let module = Module::new(store, wat::parse_str(wat).unwrap()).unwrap();
@@ -108,9 +107,14 @@ mod tests {
         let instance = fixtures(&mut store);
         let callback = cached(&store, &instance, "add");
         assert!(callback.is_typed());
-        assert_eq!(callback.call(&mut store, 10, 20).unwrap(), 30);
         assert_eq!(
-            callback.call(&mut store, 0, 0xffff_ffff).unwrap(),
+            callback.call(&mut store.as_store_mut(), 10, 20).unwrap(),
+            30
+        );
+        assert_eq!(
+            callback
+                .call(&mut store.as_store_mut(), 0, 0xffff_ffff)
+                .unwrap(),
             0xffff_ffff
         );
     }
@@ -121,7 +125,7 @@ mod tests {
         let instance = fixtures(&mut store);
         let callback = cached(&store, &instance, "void");
         assert!(!callback.is_typed());
-        assert_eq!(callback.call(&mut store, 1, 2).unwrap(), 0);
+        assert_eq!(callback.call(&mut store.as_store_mut(), 1, 2).unwrap(), 0);
     }
 
     #[test]
@@ -130,7 +134,7 @@ mod tests {
         let instance = fixtures(&mut store);
         let callback = cached(&store, &instance, "wide");
         assert!(!callback.is_typed());
-        assert_eq!(callback.call(&mut store, 1, 2).unwrap(), 2);
+        assert_eq!(callback.call(&mut store.as_store_mut(), 1, 2).unwrap(), 2);
     }
 
     #[test]
@@ -139,12 +143,12 @@ mod tests {
         let instance = fixtures(&mut store);
         assert!(
             cached(&store, &instance, "trap")
-                .call(&mut store, 1, 2)
+                .call(&mut store.as_store_mut(), 1, 2)
                 .is_err()
         );
         assert_eq!(
             cached(&store, &instance, "add")
-                .call(&mut store, 1, 2)
+                .call(&mut store.as_store_mut(), 1, 2)
                 .unwrap(),
             3
         );
@@ -155,17 +159,25 @@ mod tests {
         let mut store = Store::default();
         let instance = fixtures(&mut store);
         let finalize = cached(&store, &instance, "finalize");
-        assert_eq!(finalize.call_finalizer(&mut store, 1, 2, 3).unwrap(), 0);
+        assert_eq!(
+            finalize
+                .call_finalizer(&mut store.as_store_mut(), 1, 2, 3)
+                .unwrap(),
+            0
+        );
         let finalize_result = cached(&store, &instance, "finalize_result");
         assert_eq!(
             finalize_result
-                .call_finalizer(&mut store, 1, 2, 0xffff_ffff)
+                .call_finalizer(&mut store.as_store_mut(), 1, 2, 0xffff_ffff)
                 .unwrap(),
             0xffff_ffff
         );
         // A two-argument function called as a finalizer fails, as before.
         let add = cached(&store, &instance, "add");
-        assert!(add.call_finalizer(&mut store, 1, 2, 3).is_err());
+        assert!(
+            add.call_finalizer(&mut store.as_store_mut(), 1, 2, 3)
+                .is_err()
+        );
     }
 
     #[test]
@@ -181,15 +193,24 @@ mod tests {
         for name in ["one", "wide_params"] {
             let callback = cached(&store, &instance, name);
             assert!(!callback.is_typed());
-            assert!(callback.call(&mut store, 1, 2).is_err());
+            assert!(callback.call(&mut store.as_store_mut(), 1, 2).is_err());
         }
     }
 
     #[test]
-    fn guest_exit_stays_a_wasi_error_through_the_typed_path() {
+    fn a_host_error_keeps_its_type_through_the_typed_path() {
+        #[derive(Debug)]
+        struct Exit(i32);
+        impl std::fmt::Display for Exit {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "exit {}", self.0)
+            }
+        }
+        impl std::error::Error for Exit {}
+
         let mut store = Store::default();
-        let exit = Function::new_typed(&mut store, || -> Result<i32, WasiError> {
-            Err(WasiError::Exit(ExitCode::from(7u16)))
+        let exit = Function::new_typed(&mut store, || -> Result<i32, RuntimeError> {
+            Err(RuntimeError::user(Box::new(Exit(7))))
         });
         let module = Module::new(
             &store,
@@ -209,11 +230,8 @@ mod tests {
         .unwrap();
         let callback = cached(&store, &instance, "callback");
         assert!(callback.is_typed());
-        let err = callback.call(&mut store, 1, 2).unwrap_err();
-        assert!(matches!(
-            err.downcast_ref::<WasiError>(),
-            Some(WasiError::Exit(code)) if code.raw() == 7
-        ));
+        let err = callback.call(&mut store.as_store_mut(), 1, 2).unwrap_err();
+        assert!(matches!(err.downcast_ref::<Exit>(), Some(Exit(7))));
     }
 
     #[test]
@@ -254,7 +272,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             cached(&store, &outer, "outer")
-                .call(&mut store, 19, 23)
+                .call(&mut store.as_store_mut(), 19, 23)
                 .unwrap(),
             42
         );

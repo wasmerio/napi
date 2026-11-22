@@ -180,6 +180,7 @@ mod tests {
             &mut store.as_store_mut(),
             &memory,
             ResourceBudget::unlimited(),
+            None,
         )
         .expect("guest heap");
         (memory, heap)

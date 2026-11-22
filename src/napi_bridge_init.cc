@@ -20,6 +20,18 @@
 #include <unordered_set>
 #include <vector>
 
+#if defined(__APPLE__) || defined(__linux__)
+#include <pthread.h>
+#elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #ifndef NAPI_EXPERIMENTAL
 #define NAPI_EXPERIMENTAL
 #endif
@@ -3757,6 +3769,56 @@ extern "C" int snapi_bridge_create_function(SnapiEnvState* env_state, const char
   return napi_ok;
 }
 
+// The lowest address JavaScript may use on the stack of the thread that
+// creates an env, which is the thread that runs it.
+//
+// V8 measures its stack from where the thread's stack starts and, left alone,
+// allows itself --stack-size (984 KiB) from there: it takes whatever called it
+// to be near the top. An import of a guest that an async runtime runs is
+// called from under that runtime's executor, whose frames may already use
+// more than that, and V8 then refuses every script with a RangeError. So the
+// limit is counted from here instead: V8's usual budget below the frame that
+// creates the env, but never the last kStackReserve of the thread's stack,
+// which V8's own C++ needs below the limit. Null if the thread's stack cannot
+// be told from where this frame is: V8 then keeps its default.
+void* NativeStackLimit() {
+  constexpr uintptr_t kJsStack = 984 * 1024;
+  // What Node leaves below its limit (kStackBufferSize).
+  constexpr uintptr_t kStackReserve = 192 * 1024;
+
+  volatile char marker = 0;
+  const uintptr_t here = reinterpret_cast<uintptr_t>(&marker);
+  uintptr_t lowest = 0;
+#if defined(__APPLE__)
+  const pthread_t self = pthread_self();
+  const uintptr_t start =
+      reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(self));
+  const size_t size = pthread_get_stacksize_np(self);
+  if (start > size) lowest = start - size;
+#elif defined(__linux__)
+  pthread_attr_t attr;
+  if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+    void* base = nullptr;
+    size_t size = 0;
+    if (pthread_attr_getstack(&attr, &base, &size) == 0) {
+      lowest = reinterpret_cast<uintptr_t>(base);
+    }
+    pthread_attr_destroy(&attr);
+  }
+#elif defined(_WIN32)
+  ULONG_PTR low = 0;
+  ULONG_PTR high = 0;
+  GetCurrentThreadStackLimits(&low, &high);
+  lowest = static_cast<uintptr_t>(low);
+#endif
+  if (lowest == 0 || here <= lowest) return nullptr;
+  uintptr_t limit = here > kJsStack ? here - kJsStack : 0;
+  // With less than the reserve left, the limit is above this frame and V8
+  // refuses to run JavaScript, which beats running off the stack.
+  if (limit < lowest + kStackReserve) limit = lowest + kStackReserve;
+  return reinterpret_cast<void*>(limit);
+}
+
 // `webassembly_policy` is a NapiWebAssemblyPolicy. The guest-heap context is
 // the provider's from here on, also when the policy is refused.
 extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
@@ -3766,19 +3828,17 @@ extern "C" int snapi_bridge_unofficial_create_env(int32_t module_api_version,
                                                   SnapiEnvState** env_out) {
   napi_env env = nullptr;
   unofficial_napi_env_owner owner = nullptr;
-  napi_status s;
-  if (guest_heap_ctx != nullptr) {
-    unofficial_napi_env_create_options options{};
-    options.size = sizeof(options);
-    options.version = UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION;
-    options.guest_heap = reinterpret_cast<unofficial_napi_guest_heap>(
-        const_cast<void*>(guest_heap_ctx));
-    s = snapi_private_create_env(module_api_version, &options,
-                                 webassembly_policy, resource_limits, &env, &owner);
-  } else {
-    s = snapi_private_create_env(module_api_version, nullptr,
-                                 webassembly_policy, resource_limits, &env, &owner);
-  }
+  unofficial_napi_env_create_options options{};
+  options.size = sizeof(options);
+  options.version = UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION;
+  options.stack_limit = NativeStackLimit();
+  options.guest_heap = reinterpret_cast<unofficial_napi_guest_heap>(
+      const_cast<void*>(guest_heap_ctx));
+  const bool has_options =
+      guest_heap_ctx != nullptr || options.stack_limit != nullptr;
+  napi_status s = snapi_private_create_env(
+      module_api_version, has_options ? &options : nullptr, webassembly_policy,
+      resource_limits, &env, &owner);
   if (s != napi_ok) return s;
 
   SnapiEnvState* state = NewAgentWithPrincipalEnv(env, owner);
@@ -3809,13 +3869,17 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
     uint32_t resource_limits,
     SnapiEnvState** env_out) {
   unofficial_napi_env_create_options options{};
+  // The guest-provided stack limit is a Wasm linear-memory address, not a
+  // native stack address for the host thread running V8.
+  options.stack_limit = NativeStackLimit();
   const bool has_options =
       max_young_generation_size_in_bytes > 0 ||
       max_old_generation_size_in_bytes > 0 ||
       code_range_size_in_bytes > 0 ||
       total_memory > 0 ||
       constrained_memory > 0 ||
-      guest_heap_ctx != nullptr;
+      guest_heap_ctx != nullptr ||
+      options.stack_limit != nullptr;
   options.size = sizeof(options);
   options.version = UNOFFICIAL_NAPI_ENV_CREATE_OPTIONS_VERSION;
   options.total_memory = total_memory;
@@ -3825,9 +3889,6 @@ extern "C" int snapi_bridge_unofficial_create_env_with_options(
   options.max_old_generation_size_in_bytes =
       max_old_generation_size_in_bytes;
   options.code_range_size_in_bytes = code_range_size_in_bytes;
-  // The guest-provided stack limit is a Wasm linear-memory address, not a
-  // native stack address for the host thread running V8.
-  options.stack_limit = nullptr;
   options.guest_heap = reinterpret_cast<unofficial_napi_guest_heap>(
       const_cast<void*>(guest_heap_ctx));
   napi_env env = nullptr;

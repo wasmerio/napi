@@ -7,20 +7,19 @@
 use std::ffi::{CString, c_char};
 
 use smallvec::{SmallVec, smallvec};
-use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports, namespace};
-use wasmer_wasix::WasiError;
+use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports, RuntimeError, namespace};
 
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv, RequestedHeap,
     budget::UNCHARGED_HOST_COPY_BYTES,
     guest::{
         MAX_GUEST_CSTRING_SCAN, MAX_NAPI_BIGINT_WORDS, MAX_NAPI_CALLBACK_ARGS,
-        callback::{lend_store, take_pending_guest_exit},
+        callback::{lend_store, take_pending_guest_unwind},
     },
     snapi::*,
 };
 
-use super::{BridgeName, abi, compat, util::*};
+use super::{BridgeName, abi, compat, import::import, util::*};
 
 fn guest_napi_wasm_init_env(mut env: FunctionEnvMut<NapiEnv>) -> i32 {
     let _ = unsafe { snapi_bridge_init() };
@@ -105,23 +104,22 @@ fn guest_heap_alloc_ctx(env: &FunctionEnvMut<NapiEnv>) -> *const std::ffi::c_voi
 /// reads the env's data once to resolve the env, where `snapi_env` followed
 /// by a separate lend would read it again for each step.
 ///
-/// A guest `_exit`/`proc_exit` during a nested callback cannot unwind through the
-/// intervening host V8 (C++) frames, so the callback trampoline stashes it. This
-/// boundary — the enclosing N-API import — is the first Rust frame that can
-/// carry a trap, so it returns the exit as `Err(WasiError::Exit)`. wasmer
-/// re-raises it, and the same happens at each outer import layer until the
-/// runner handles it, terminating just this guest instance. Callers propagate
-/// with `?`.
-#[allow(clippy::result_large_err)]
+/// An error that ends the guest during a nested callback (its `_exit`, the host
+/// stopping it) cannot unwind through the intervening host V8 (C++) frames, so
+/// the callback trampoline stashes it. This boundary — the enclosing N-API
+/// import — is the first Rust frame that can carry an error, so it returns the
+/// stashed one. wasmer re-raises it, and the same happens at each outer import
+/// layer until the runner handles it, ending just this guest instance. Callers
+/// propagate with `?`.
 fn bridge<R>(
     env: &mut FunctionEnvMut<NapiEnv>,
     guest_env: u32,
     f: impl FnOnce(SnapiEnv) -> R,
-) -> Result<R, WasiError> {
+) -> Result<R, RuntimeError> {
     let snapi_env = env.data().resolve_napi_env(guest_env);
-    let (r, exit) = if snapi_env.is_null() {
+    let (r, unwind) = if snapi_env.is_null() {
         // No env, so no guest callback can fire and nothing needs the store.
-        (f(snapi_env), take_pending_guest_exit())
+        (f(snapi_env), take_pending_guest_unwind())
     } else {
         let lent = lend_store(env, || f(snapi_env));
         // JavaScript may have left memory past the heap limit that no
@@ -134,8 +132,8 @@ fn bridge<R>(
         }
         lent
     };
-    if let Some(code) = exit {
-        return Err(WasiError::Exit(code));
+    if let Some(error) = unwind {
+        return Err(error);
     }
     Ok(r)
 }
@@ -350,7 +348,7 @@ fn guest_unofficial_napi_release_env(
     mut env: FunctionEnvMut<NapiEnv>,
     scope_ptr: u32,
     loop_ptr: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let scope_id = scope_ptr;
     // Refuse before touching any of the env's bookkeeping, so the env stays
     // usable and releasable afterwards.
@@ -438,7 +436,7 @@ fn guest_unofficial_napi_event_loop_checkpoint(
     mode: i32,
     has_runnable_work: i32,
     checkpoint_state_ptr: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut checkpoint_state = 0;
     let status = bridge(&mut env, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_event_loop_checkpoint(
@@ -726,7 +724,7 @@ fn guest_unofficial_napi_request_interrupt(
     napi_env: u32,
     callback: u32,
     data: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let callback_id = callback;
     let data_val = data;
     bridge(&mut env, napi_env, |env_handle| unsafe {
@@ -741,7 +739,7 @@ fn guest_unofficial_napi_structured_clone(
     value: u32,
     transfer_list: u32,
     result_ptr: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut out = 0u32;
     let status = bridge(&mut env, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_structured_clone(env_handle, value, transfer_list, &mut out)
@@ -758,7 +756,7 @@ fn guest_unofficial_napi_message_create(
     napi_env: u32,
     value: u32,
     payload_out_ptr: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     if payload_out_ptr == 0 {
         return Ok(1);
     }
@@ -830,7 +828,7 @@ fn message_memory(
     env: &mut FunctionEnvMut<NapiEnv>,
     heap: std::sync::Arc<crate::guest_heap::GuestHeap>,
 ) -> Option<crate::message::MessageMemory> {
-    let (state, store) = env.data_and_store_mut();
+    let (state, store) = env.data_and_store();
     let memory = state.memory.clone()?;
     if !memory.ty(&store).shared {
         return Some(crate::message::MessageMemory::Owned {
@@ -850,7 +848,7 @@ fn guest_unofficial_napi_message_take(
     napi_env: u32,
     payload: u32,
     result_out_ptr: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     // Only a message of this context. The entry, which may lease the memory
     // the message points into, outlives the provider call below.
     let Some(queued) = env.data().messages.remove(payload) else {
@@ -956,7 +954,7 @@ fn guest_unofficial_napi_get_own_non_index_properties(
     value: u32,
     filter_bits: u32,
     result_out_ptr: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     if value == 0 || result_out_ptr == 0 {
         return Ok(1);
     }
@@ -990,7 +988,7 @@ fn guest_unofficial_napi_define_lazy_data_properties(
     names: u32,
     initializer: u32,
     attributes: i32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     bridge(&mut env, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_define_lazy_data_properties(
             env_handle,
@@ -1066,7 +1064,7 @@ fn guest_unofficial_napi_get_error_metadata(
     error: u32,
     mode: i32,
     metadata_ptr: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     // The whole 28-byte metadata struct must lie below 4 GiB, so the field
     // offsets below cannot wrap.
     if metadata_ptr != 0 && u64::from(metadata_ptr) + 28 > 1u64 << 32 {
@@ -1126,7 +1124,7 @@ fn guest_unofficial_napi_preserve_error_source_message(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     error: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     bridge(&mut env, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_preserve_error_source_message(env_handle, error)
     })
@@ -1139,7 +1137,7 @@ fn guest_unofficial_napi_mark_promise_as_handled(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     promise: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let promise_id = promise;
     bridge(&mut env, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_mark_promise_as_handled(env_handle, promise_id)
@@ -1460,7 +1458,7 @@ fn guest_unofficial_napi_contextify_run_script(
     break_on_first_line: i32,
     host_defined_option_id: u32,
     result_ptr: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let realm = match compat::realm_from_context(snapi_env(&env, napi_env), sandbox_or_null, true) {
         Ok(realm) => realm,
         Err(status) => return Ok(status),
@@ -1498,7 +1496,7 @@ fn guest_unofficial_napi_contextify_compile_function(
     params_or_undefined: u32,
     host_defined_option_id: u32,
     result_ptr: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let realm = match compat::realm_from_context(
         snapi_env(&env, napi_env),
         parsing_context_or_undefined,
@@ -1627,7 +1625,7 @@ fn guest_unofficial_napi_run_script(
     break_on_first_line: i32,
     host_defined_option_id: u32,
     result_ptr: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let Some((source_text, source_bytecode)) = abi::read_js_source(&mut env, source) else {
         return Ok(1);
     };
@@ -1669,7 +1667,7 @@ fn guest_unofficial_napi_compile_function(
     params_or_undefined: u32,
     host_defined_option_id: u32,
     result_ptr: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let Some((source_text, source_bytecode)) = abi::read_js_source(&mut env, source) else {
         return Ok(1);
     };
@@ -1702,7 +1700,7 @@ fn guest_unofficial_napi_bytecode_open(
     napi_env: u32,
     options_ptr: u32,
     result_ptr: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let Some(options) = abi::read_bytecode_open(&mut env, options_ptr) else {
         return Ok(1);
     };
@@ -1756,7 +1754,7 @@ fn guest_unofficial_napi_bytecode_serialize(
     napi_env: u32,
     bytecode: u32,
     buffer_ptr: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut buffer_id = 0u32;
     // Packaging cache bytes can call the guest's Buffer.from.
     let status = bridge(&mut env, napi_env, |env_handle| unsafe {
@@ -1785,7 +1783,7 @@ fn guest_unofficial_napi_module_wrap_create(
     napi_env: u32,
     options_ptr: u32,
     result_ptr: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let Some(options) = abi::read_module_create(&mut env, options_ptr) else {
         return Ok(1);
     };
@@ -1877,7 +1875,7 @@ fn guest_unofficial_napi_module_wrap_instantiate(
     mut env: FunctionEnvMut<NapiEnv>,
     napi_env: u32,
     handle: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     bridge(&mut env, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_module_wrap_instantiate(env_handle, handle)
     })
@@ -1891,7 +1889,7 @@ fn guest_unofficial_napi_module_wrap_evaluate(
     timeout: i64,
     break_on_sigint: i32,
     result_ptr: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut result_id = 0u32;
     let status = bridge(&mut env, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_module_wrap_evaluate(
@@ -1916,7 +1914,7 @@ fn guest_unofficial_napi_module_wrap_evaluate_sync(
     filename: u32,
     parent_filename: u32,
     result_ptr: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut result_id = 0u32;
     let status = bridge(&mut env, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_module_wrap_evaluate_sync(
@@ -2003,7 +2001,7 @@ fn guest_unofficial_napi_module_wrap_check_unsettled_top_level_await(
     handle: u32,
     warnings: i32,
     settled_ptr: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let handle_id = handle;
     let mut settled = 0i32;
     // Printing a stalled await formats its source line, which runs the
@@ -2083,7 +2081,7 @@ fn guest_unofficial_napi_module_wrap_create_cached_data(
     napi_env: u32,
     handle: u32,
     result_ptr: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut result_id = 0u32;
     // Packaging cache bytes can call the guest's Buffer.from.
     let status = bridge(&mut env, napi_env, |env_handle| unsafe {
@@ -2121,7 +2119,7 @@ fn guest_unofficial_napi_module_wrap_create_required_module_facade(
     napi_env: u32,
     handle: u32,
     result_ptr: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut result_id = 0u32;
     let status = bridge(&mut env, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_module_wrap_create_required_module_facade(
@@ -2656,7 +2654,7 @@ fn guest_napi_instanceof(
     obj: u32,
     ctor: u32,
     rp: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
     let s = bridge(&mut env, e, |snapi| unsafe {
         snapi_bridge_instanceof(snapi, obj, ctor, &mut r)
@@ -2679,7 +2677,7 @@ macro_rules! guest_coerce {
             e: u32,
             vh: u32,
             rp: u32,
-        ) -> Result<i32, WasiError> {
+        ) -> Result<i32, RuntimeError> {
             let mut out: u32 = 0;
             let s = bridge(&mut env, e, |snapi| unsafe { $bridge(snapi, vh, &mut out) })?;
             if s == 0 {
@@ -2715,7 +2713,7 @@ fn guest_napi_set_property(
     o: u32,
     k: u32,
     v: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     bridge(&mut env, e, |snapi| unsafe {
         snapi_bridge_set_property(snapi, o, k, v)
     })
@@ -2728,7 +2726,7 @@ fn guest_napi_get_property(
     o: u32,
     k: u32,
     rp: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
     let s = bridge(&mut env, e, |snapi| unsafe {
         snapi_bridge_get_property(snapi, o, k, &mut out)
@@ -2746,7 +2744,7 @@ fn guest_napi_has_property(
     o: u32,
     k: u32,
     rp: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
     let s = bridge(&mut env, e, |snapi| unsafe {
         snapi_bridge_has_property(snapi, o, k, &mut r)
@@ -2764,7 +2762,7 @@ fn guest_napi_has_own_property(
     o: u32,
     k: u32,
     rp: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
     let s = bridge(&mut env, e, |snapi| unsafe {
         snapi_bridge_has_own_property(snapi, o, k, &mut r)
@@ -2782,7 +2780,7 @@ fn guest_napi_delete_property(
     o: u32,
     k: u32,
     rp: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
     let s = bridge(&mut env, e, |snapi| unsafe {
         snapi_bridge_delete_property(snapi, o, k, &mut r)
@@ -2800,7 +2798,7 @@ fn guest_napi_set_named_property(
     o: u32,
     np: u32,
     v: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let Some(cn) = GuestName::read(&mut env, np) else {
         return Ok(1);
     };
@@ -2816,7 +2814,7 @@ fn guest_napi_get_named_property(
     o: u32,
     np: u32,
     rp: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let Some(cn) = GuestName::read(&mut env, np) else {
         return Ok(1);
     };
@@ -2837,7 +2835,7 @@ fn guest_napi_has_named_property(
     o: u32,
     np: u32,
     rp: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let Some(cn) = GuestName::read(&mut env, np) else {
         return Ok(1);
     };
@@ -2858,7 +2856,7 @@ fn guest_napi_set_element(
     o: u32,
     idx: u32,
     v: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     bridge(&mut env, e, |snapi| unsafe {
         snapi_bridge_set_element(snapi, o, idx, v)
     })
@@ -2871,7 +2869,7 @@ fn guest_napi_get_element(
     o: u32,
     idx: u32,
     rp: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
     let s = bridge(&mut env, e, |snapi| unsafe {
         snapi_bridge_get_element(snapi, o, idx, &mut out)
@@ -2889,7 +2887,7 @@ fn guest_napi_has_element(
     o: u32,
     idx: u32,
     rp: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
     let s = bridge(&mut env, e, |snapi| unsafe {
         snapi_bridge_has_element(snapi, o, idx, &mut r)
@@ -2941,7 +2939,7 @@ fn guest_napi_delete_element(
     o: u32,
     idx: u32,
     rp: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
     let s = bridge(&mut env, e, |snapi| unsafe {
         snapi_bridge_delete_element(snapi, o, idx, &mut r)
@@ -2967,7 +2965,7 @@ fn guest_napi_get_property_names(
     e: u32,
     o: u32,
     rp: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
     // Property enumeration can synchronously invoke a Proxy's ownKeys trap.
     let s = bridge(&mut env, e, |snapi| unsafe {
@@ -2988,7 +2986,7 @@ fn guest_napi_get_all_property_names(
     filter: i32,
     conversion: i32,
     rp: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
     // Property enumeration can synchronously invoke a Proxy's ownKeys trap.
     let s = bridge(&mut env, e, |snapi| unsafe {
@@ -3016,7 +3014,7 @@ fn guest_napi_object_freeze(
     mut env: FunctionEnvMut<NapiEnv>,
     e: u32,
     o: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     bridge(&mut env, e, |snapi| unsafe {
         snapi_bridge_object_freeze(snapi, o)
     })
@@ -3027,7 +3025,7 @@ fn guest_napi_object_seal(
     mut env: FunctionEnvMut<NapiEnv>,
     e: u32,
     o: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     bridge(&mut env, e, |snapi| unsafe {
         snapi_bridge_object_seal(snapi, o)
     })
@@ -3156,7 +3154,7 @@ fn guest_napi_get_and_clear_last_exception(
     mut env: FunctionEnvMut<NapiEnv>,
     e: u32,
     rp: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
     let s = bridge(&mut env, e, |snapi| unsafe {
         snapi_bridge_get_and_clear_last_exception(snapi, &mut out)
@@ -3177,7 +3175,7 @@ fn guest_napi_create_promise(
     e: u32,
     dp: u32,
     rp: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut deferred_id: u32 = 0;
     let mut promise_id: u32 = 0;
     let s = bridge(&mut env, e, |snapi| unsafe {
@@ -3198,7 +3196,7 @@ fn guest_napi_resolve_deferred(
     e: u32,
     d: u32,
     v: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     bridge(&mut env, e, |snapi| unsafe {
         snapi_bridge_resolve_deferred(snapi, d, v)
     })
@@ -3212,7 +3210,7 @@ fn guest_napi_reject_deferred(
     e: u32,
     d: u32,
     v: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     bridge(&mut env, e, |snapi| unsafe {
         snapi_bridge_reject_deferred(snapi, d, v)
     })
@@ -3286,7 +3284,7 @@ fn guest_napi_create_external_arraybuffer(
     };
 
     let host_addr: u64 = {
-        let (_, store_ref) = env.data_and_store_mut();
+        let (_, store_ref) = env.data_and_store();
         let view = memory.view(&store_ref);
         let host_base = view.data_ptr() as u64;
         host_base + external_data as u64
@@ -3345,7 +3343,7 @@ fn guest_napi_create_external_buffer(
     };
 
     let host_addr: u64 = {
-        let (_, store_ref) = env.data_and_store_mut();
+        let (_, store_ref) = env.data_and_store();
         let view = memory.view(&store_ref);
         let host_base = view.data_ptr() as u64;
         host_base + external_data as u64
@@ -3488,7 +3486,7 @@ fn guest_node_api_set_prototype(
     napi_env: u32,
     object: u32,
     prototype: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let object_id = object;
     let prototype_id = prototype;
     bridge(&mut env, napi_env, |snapi| unsafe {
@@ -3790,7 +3788,7 @@ fn guest_napi_call_function(
     argc: u32,
     argv_ptr: u32,
     rp: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let argc_u = argc;
     let argv_ids = if argc_u > 0 {
         let Some(ids) = read_guest_u32_array(&mut env, argv_ptr, argc_u as usize) else {
@@ -3882,8 +3880,7 @@ fn guest_napi_get_cb_info(
     // guest heap from this hot per-callback import so store-free allocations
     // (V8 backing stores) rarely find it empty. No-op for shared memories.
     if let Some(heap) = env.data().guest_heap.clone() {
-        let (_, mut store_ref) = env.data_and_store_mut();
-        heap.maybe_refill(&mut store_ref);
+        heap.maybe_refill(&mut env.as_store_mut());
     }
     // Read the caller's requested argc (size of their argv array)
     let wanted: u32 = if argc_ptr != 0 {
@@ -4255,7 +4252,7 @@ fn guest_napi_define_properties(
     obj: u32,
     prop_count: u32,
     props_ptr: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let snapi = snapi_env(&env, e);
     let pc = prop_count;
     if pc == 0 {
@@ -4454,7 +4451,7 @@ fn guest_napi_run_script(
     e: u32,
     sh: u32,
     rp: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
     let s = bridge(&mut env, e, |snapi| unsafe {
         snapi_bridge_run_script(snapi, sh, &mut out)
@@ -4993,7 +4990,7 @@ fn guest_unofficial_napi_create_uint8array(
     prototype: u32,
     data_out: u32,
     result_out: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     if data_out == 0 || result_out == 0 {
         return Ok(1);
     }
@@ -5035,7 +5032,7 @@ fn guest_unofficial_napi_create_uint8array_copy(
     length: u32,
     prototype: u32,
     result_out: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     if result_out == 0 || (length > 0 && data_ptr == 0) {
         return Ok(1);
     }
@@ -5321,7 +5318,7 @@ fn guest_napi_new_instance(
     argc: u32,
     argv_ptr: u32,
     rp: u32,
-) -> Result<i32, WasiError> {
+) -> Result<i32, RuntimeError> {
     let argc_u = argc;
     let argv_ids = if argc_u > 0 {
         let Some(ids) = read_guest_u32_array(&mut env, argv_ptr, argc_u as usize) else {
@@ -5488,218 +5485,218 @@ pub fn register_napi_imports(
     io: &mut Imports,
 ) {
     let napi_namespace = namespace! {
-        "napi_wasm_init_env" => Function::new_typed_with_env(store, fe, guest_napi_wasm_init_env),
-        "napi_get_undefined" => Function::new_typed_with_env(store, fe, guest_napi_get_undefined),
-        "napi_get_null" => Function::new_typed_with_env(store, fe, guest_napi_get_null),
-        "napi_get_boolean" => Function::new_typed_with_env(store, fe, guest_napi_get_boolean),
-        "napi_get_global" => Function::new_typed_with_env(store, fe, guest_napi_get_global),
-        "napi_create_string_utf8" => Function::new_typed_with_env(store, fe, guest_napi_create_string_utf8),
-        "napi_create_string_latin1" => Function::new_typed_with_env(store, fe, guest_napi_create_string_latin1),
-        "napi_create_int32" => Function::new_typed_with_env(store, fe, guest_napi_create_int32),
-        "napi_create_uint32" => Function::new_typed_with_env(store, fe, guest_napi_create_uint32),
-        "napi_create_double" => Function::new_typed_with_env(store, fe, guest_napi_create_double),
-        "napi_create_int64" => Function::new_typed_with_env(store, fe, guest_napi_create_int64),
-        "napi_create_object" => Function::new_typed_with_env(store, fe, guest_napi_create_object),
-        "napi_create_array" => Function::new_typed_with_env(store, fe, guest_napi_create_array),
-        "napi_create_array_with_length" => Function::new_typed_with_env(store, fe, guest_napi_create_array_with_length),
-        "napi_create_symbol" => Function::new_typed_with_env(store, fe, guest_napi_create_symbol),
-        "napi_create_error" => Function::new_typed_with_env(store, fe, guest_napi_create_error),
-        "napi_create_type_error" => Function::new_typed_with_env(store, fe, guest_napi_create_type_error),
-        "napi_create_range_error" => Function::new_typed_with_env(store, fe, guest_napi_create_range_error),
-        "napi_create_bigint_int64" => Function::new_typed_with_env(store, fe, guest_napi_create_bigint_int64),
-        "napi_create_bigint_uint64" => Function::new_typed_with_env(store, fe, guest_napi_create_bigint_uint64),
-        "napi_create_date" => Function::new_typed_with_env(store, fe, guest_napi_create_date),
-        "napi_create_external" => Function::new_typed_with_env(store, fe, guest_napi_create_external),
-        "napi_create_arraybuffer" => Function::new_typed_with_env(store, fe, guest_napi_create_arraybuffer),
-        "napi_create_external_arraybuffer" => Function::new_typed_with_env(store, fe, guest_napi_create_external_arraybuffer),
-        "napi_create_external_buffer" => Function::new_typed_with_env(store, fe, guest_napi_create_external_buffer),
-        "napi_create_typedarray" => Function::new_typed_with_env(store, fe, guest_napi_create_typedarray),
-        "napi_create_dataview" => Function::new_typed_with_env(store, fe, guest_napi_create_dataview),
-        "napi_create_promise" => Function::new_typed_with_env(store, fe, guest_napi_create_promise),
-        "napi_get_value_string_utf8" => Function::new_typed_with_env(store, fe, guest_napi_get_value_string_utf8),
-        "napi_get_value_string_latin1" => Function::new_typed_with_env(store, fe, guest_napi_get_value_string_latin1),
-        "napi_get_value_int32" => Function::new_typed_with_env(store, fe, guest_napi_get_value_int32),
-        "napi_get_value_uint32" => Function::new_typed_with_env(store, fe, guest_napi_get_value_uint32),
-        "napi_get_value_double" => Function::new_typed_with_env(store, fe, guest_napi_get_value_double),
-        "napi_get_value_int64" => Function::new_typed_with_env(store, fe, guest_napi_get_value_int64),
-        "napi_get_value_bool" => Function::new_typed_with_env(store, fe, guest_napi_get_value_bool),
-        "napi_get_value_bigint_int64" => Function::new_typed_with_env(store, fe, guest_napi_get_value_bigint_int64),
-        "napi_get_value_bigint_uint64" => Function::new_typed_with_env(store, fe, guest_napi_get_value_bigint_uint64),
-        "napi_get_date_value" => Function::new_typed_with_env(store, fe, guest_napi_get_date_value),
-        "napi_get_value_external" => Function::new_typed_with_env(store, fe, guest_napi_get_value_external),
-        "napi_typeof" => Function::new_typed_with_env(store, fe, guest_napi_typeof),
-        "napi_is_array" => Function::new_typed_with_env(store, fe, guest_napi_is_array),
-        "napi_is_error" => Function::new_typed_with_env(store, fe, guest_napi_is_error),
-        "napi_is_arraybuffer" => Function::new_typed_with_env(store, fe, guest_napi_is_arraybuffer),
-        "napi_is_typedarray" => Function::new_typed_with_env(store, fe, guest_napi_is_typedarray),
-        "napi_is_dataview" => Function::new_typed_with_env(store, fe, guest_napi_is_dataview),
-        "napi_is_date" => Function::new_typed_with_env(store, fe, guest_napi_is_date),
-        "napi_is_promise" => Function::new_typed_with_env(store, fe, guest_napi_is_promise),
-        "napi_instanceof" => Function::new_typed_with_env(store, fe, guest_napi_instanceof),
-        "napi_coerce_to_bool" => Function::new_typed_with_env(store, fe, guest_napi_coerce_to_bool),
-        "napi_coerce_to_number" => Function::new_typed_with_env(store, fe, guest_napi_coerce_to_number),
-        "napi_coerce_to_string" => Function::new_typed_with_env(store, fe, guest_napi_coerce_to_string),
-        "napi_coerce_to_object" => Function::new_typed_with_env(store, fe, guest_napi_coerce_to_object),
-        "napi_set_property" => Function::new_typed_with_env(store, fe, guest_napi_set_property),
-        "napi_get_property" => Function::new_typed_with_env(store, fe, guest_napi_get_property),
-        "napi_has_property" => Function::new_typed_with_env(store, fe, guest_napi_has_property),
-        "napi_has_own_property" => Function::new_typed_with_env(store, fe, guest_napi_has_own_property),
-        "napi_delete_property" => Function::new_typed_with_env(store, fe, guest_napi_delete_property),
-        "napi_set_named_property" => Function::new_typed_with_env(store, fe, guest_napi_set_named_property),
-        "napi_get_named_property" => Function::new_typed_with_env(store, fe, guest_napi_get_named_property),
-        "napi_has_named_property" => Function::new_typed_with_env(store, fe, guest_napi_has_named_property),
-        "napi_set_element" => Function::new_typed_with_env(store, fe, guest_napi_set_element),
-        "napi_get_element" => Function::new_typed_with_env(store, fe, guest_napi_get_element),
-        "napi_has_element" => Function::new_typed_with_env(store, fe, guest_napi_has_element),
-        "napi_delete_element" => Function::new_typed_with_env(store, fe, guest_napi_delete_element),
-        "napi_get_array_length" => Function::new_typed_with_env(store, fe, guest_napi_get_array_length),
-        "napi_get_property_names" => Function::new_typed_with_env(store, fe, guest_napi_get_property_names),
-        "napi_get_all_property_names" => Function::new_typed_with_env(store, fe, guest_napi_get_all_property_names),
-        "napi_get_prototype" => Function::new_typed_with_env(store, fe, guest_napi_get_prototype),
-        "napi_object_freeze" => Function::new_typed_with_env(store, fe, guest_napi_object_freeze),
-        "napi_object_seal" => Function::new_typed_with_env(store, fe, guest_napi_object_seal),
-        "napi_strict_equals" => Function::new_typed_with_env(store, fe, guest_napi_strict_equals),
-        "napi_throw" => Function::new_typed_with_env(store, fe, guest_napi_throw),
-        "napi_throw_error" => Function::new_typed_with_env(store, fe, guest_napi_throw_error),
-        "napi_throw_type_error" => Function::new_typed_with_env(store, fe, guest_napi_throw_type_error),
-        "napi_throw_range_error" => Function::new_typed_with_env(store, fe, guest_napi_throw_range_error),
-        "napi_is_exception_pending" => Function::new_typed_with_env(store, fe, guest_napi_is_exception_pending),
-        "napi_get_and_clear_last_exception" => Function::new_typed_with_env(store, fe, guest_napi_get_and_clear_last_exception),
-        "napi_resolve_deferred" => Function::new_typed_with_env(store, fe, guest_napi_resolve_deferred),
-        "napi_reject_deferred" => Function::new_typed_with_env(store, fe, guest_napi_reject_deferred),
-        "napi_get_arraybuffer_info" => Function::new_typed_with_env(store, fe, guest_napi_get_arraybuffer_info),
-        "napi_detach_arraybuffer" => Function::new_typed_with_env(store, fe, guest_napi_detach_arraybuffer),
-        "napi_is_detached_arraybuffer" => Function::new_typed_with_env(store, fe, guest_napi_is_detached_arraybuffer),
-        "node_api_is_sharedarraybuffer" => Function::new_typed_with_env(store, fe, guest_node_api_is_sharedarraybuffer),
-        "node_api_create_sharedarraybuffer" => Function::new_typed_with_env(store, fe, guest_node_api_create_sharedarraybuffer),
-        "node_api_set_prototype" => Function::new_typed_with_env(store, fe, guest_node_api_set_prototype),
-        "napi_get_typedarray_info" => Function::new_typed_with_env(store, fe, guest_napi_get_typedarray_info),
-        "napi_get_dataview_info" => Function::new_typed_with_env(store, fe, guest_napi_get_dataview_info),
-        "napi_create_reference" => Function::new_typed_with_env(store, fe, guest_napi_create_reference),
-        "napi_delete_reference" => Function::new_typed_with_env(store, fe, guest_napi_delete_reference),
-        "napi_reference_ref" => Function::new_typed_with_env(store, fe, guest_napi_reference_ref),
-        "napi_reference_unref" => Function::new_typed_with_env(store, fe, guest_napi_reference_unref),
-        "napi_get_reference_value" => Function::new_typed_with_env(store, fe, guest_napi_get_reference_value),
-        "napi_open_handle_scope" => Function::new_typed_with_env(store, fe, guest_napi_open_handle_scope),
-        "napi_close_handle_scope" => Function::new_typed_with_env(store, fe, guest_napi_close_handle_scope),
-        "napi_open_escapable_handle_scope" => Function::new_typed_with_env(store, fe, guest_napi_open_escapable_handle_scope),
-        "napi_close_escapable_handle_scope" => Function::new_typed_with_env(store, fe, guest_napi_close_escapable_handle_scope),
-        "napi_escape_handle" => Function::new_typed_with_env(store, fe, guest_napi_escape_handle),
-        "napi_type_tag_object" => Function::new_typed_with_env(store, fe, guest_napi_type_tag_object),
-        "napi_check_object_type_tag" => Function::new_typed_with_env(store, fe, guest_napi_check_object_type_tag),
-        "napi_call_function" => Function::new_typed_with_env(store, fe, guest_napi_call_function),
-        "napi_create_function" => Function::new_typed_with_env(store, fe, guest_napi_create_function),
-        "napi_get_cb_info" => Function::new_typed_with_env(store, fe, guest_napi_get_cb_info),
-        "napi_get_new_target" => Function::new_typed_with_env(store, fe, guest_napi_get_new_target),
-        "napi_run_script" => Function::new_typed_with_env(store, fe, guest_napi_run_script),
-        "napi_create_string_utf16" => Function::new_typed_with_env(store, fe, guest_napi_create_string_utf16),
-        "napi_get_value_string_utf16" => Function::new_typed_with_env(store, fe, guest_napi_get_value_string_utf16),
-        "napi_create_bigint_words" => Function::new_typed_with_env(store, fe, guest_napi_create_bigint_words),
-        "napi_get_value_bigint_words" => Function::new_typed_with_env(store, fe, guest_napi_get_value_bigint_words),
-        "napi_set_instance_data" => Function::new_typed_with_env(store, fe, guest_napi_set_instance_data),
-        "napi_get_instance_data" => Function::new_typed_with_env(store, fe, guest_napi_get_instance_data),
-        "napi_adjust_external_memory" => Function::new_typed_with_env(store, fe, guest_napi_adjust_external_memory),
-        "napi_create_buffer" => Function::new_typed_with_env(store, fe, guest_napi_create_buffer),
-        "napi_create_buffer_copy" => Function::new_typed_with_env(store, fe, guest_napi_create_buffer_copy),
-        "napi_is_buffer" => Function::new_typed_with_env(store, fe, guest_napi_is_buffer),
-        "napi_get_buffer_info" => Function::new_typed_with_env(store, fe, guest_napi_get_buffer_info),
-        "napi_get_node_version" => Function::new_typed_with_env(store, fe, guest_napi_get_node_version),
-        "napi_wrap" => Function::new_typed_with_env(store, fe, guest_napi_wrap),
-        "napi_unwrap" => Function::new_typed_with_env(store, fe, guest_napi_unwrap),
-        "napi_remove_wrap" => Function::new_typed_with_env(store, fe, guest_napi_remove_wrap),
-        "napi_add_finalizer" => Function::new_typed_with_env(store, fe, guest_napi_add_finalizer),
-        "napi_new_instance" => Function::new_typed_with_env(store, fe, guest_napi_new_instance),
-        "napi_define_properties" => Function::new_typed_with_env(store, fe, guest_napi_define_properties),
-        "napi_define_class" => Function::new_typed_with_env(store, fe, guest_napi_define_class),
-        "napi_fatal_error" => Function::new_typed_with_env(store, fe, guest_napi_fatal_error),
-        "napi_get_last_error_info" => Function::new_typed_with_env(store, fe, guest_napi_get_last_error_info),
-        "napi_get_version" => Function::new_typed_with_env(store, fe, guest_napi_get_version),
-        "napi_add_env_cleanup_hook" => Function::new_typed_with_env(store, fe, guest_napi_add_env_cleanup_hook),
-        "napi_remove_env_cleanup_hook" => Function::new_typed_with_env(store, fe, guest_napi_remove_env_cleanup_hook),
+        "napi_wasm_init_env" => import(store, fe, guest_napi_wasm_init_env),
+        "napi_get_undefined" => import(store, fe, guest_napi_get_undefined),
+        "napi_get_null" => import(store, fe, guest_napi_get_null),
+        "napi_get_boolean" => import(store, fe, guest_napi_get_boolean),
+        "napi_get_global" => import(store, fe, guest_napi_get_global),
+        "napi_create_string_utf8" => import(store, fe, guest_napi_create_string_utf8),
+        "napi_create_string_latin1" => import(store, fe, guest_napi_create_string_latin1),
+        "napi_create_int32" => import(store, fe, guest_napi_create_int32),
+        "napi_create_uint32" => import(store, fe, guest_napi_create_uint32),
+        "napi_create_double" => import(store, fe, guest_napi_create_double),
+        "napi_create_int64" => import(store, fe, guest_napi_create_int64),
+        "napi_create_object" => import(store, fe, guest_napi_create_object),
+        "napi_create_array" => import(store, fe, guest_napi_create_array),
+        "napi_create_array_with_length" => import(store, fe, guest_napi_create_array_with_length),
+        "napi_create_symbol" => import(store, fe, guest_napi_create_symbol),
+        "napi_create_error" => import(store, fe, guest_napi_create_error),
+        "napi_create_type_error" => import(store, fe, guest_napi_create_type_error),
+        "napi_create_range_error" => import(store, fe, guest_napi_create_range_error),
+        "napi_create_bigint_int64" => import(store, fe, guest_napi_create_bigint_int64),
+        "napi_create_bigint_uint64" => import(store, fe, guest_napi_create_bigint_uint64),
+        "napi_create_date" => import(store, fe, guest_napi_create_date),
+        "napi_create_external" => import(store, fe, guest_napi_create_external),
+        "napi_create_arraybuffer" => import(store, fe, guest_napi_create_arraybuffer),
+        "napi_create_external_arraybuffer" => import(store, fe, guest_napi_create_external_arraybuffer),
+        "napi_create_external_buffer" => import(store, fe, guest_napi_create_external_buffer),
+        "napi_create_typedarray" => import(store, fe, guest_napi_create_typedarray),
+        "napi_create_dataview" => import(store, fe, guest_napi_create_dataview),
+        "napi_create_promise" => import(store, fe, guest_napi_create_promise),
+        "napi_get_value_string_utf8" => import(store, fe, guest_napi_get_value_string_utf8),
+        "napi_get_value_string_latin1" => import(store, fe, guest_napi_get_value_string_latin1),
+        "napi_get_value_int32" => import(store, fe, guest_napi_get_value_int32),
+        "napi_get_value_uint32" => import(store, fe, guest_napi_get_value_uint32),
+        "napi_get_value_double" => import(store, fe, guest_napi_get_value_double),
+        "napi_get_value_int64" => import(store, fe, guest_napi_get_value_int64),
+        "napi_get_value_bool" => import(store, fe, guest_napi_get_value_bool),
+        "napi_get_value_bigint_int64" => import(store, fe, guest_napi_get_value_bigint_int64),
+        "napi_get_value_bigint_uint64" => import(store, fe, guest_napi_get_value_bigint_uint64),
+        "napi_get_date_value" => import(store, fe, guest_napi_get_date_value),
+        "napi_get_value_external" => import(store, fe, guest_napi_get_value_external),
+        "napi_typeof" => import(store, fe, guest_napi_typeof),
+        "napi_is_array" => import(store, fe, guest_napi_is_array),
+        "napi_is_error" => import(store, fe, guest_napi_is_error),
+        "napi_is_arraybuffer" => import(store, fe, guest_napi_is_arraybuffer),
+        "napi_is_typedarray" => import(store, fe, guest_napi_is_typedarray),
+        "napi_is_dataview" => import(store, fe, guest_napi_is_dataview),
+        "napi_is_date" => import(store, fe, guest_napi_is_date),
+        "napi_is_promise" => import(store, fe, guest_napi_is_promise),
+        "napi_instanceof" => import(store, fe, guest_napi_instanceof),
+        "napi_coerce_to_bool" => import(store, fe, guest_napi_coerce_to_bool),
+        "napi_coerce_to_number" => import(store, fe, guest_napi_coerce_to_number),
+        "napi_coerce_to_string" => import(store, fe, guest_napi_coerce_to_string),
+        "napi_coerce_to_object" => import(store, fe, guest_napi_coerce_to_object),
+        "napi_set_property" => import(store, fe, guest_napi_set_property),
+        "napi_get_property" => import(store, fe, guest_napi_get_property),
+        "napi_has_property" => import(store, fe, guest_napi_has_property),
+        "napi_has_own_property" => import(store, fe, guest_napi_has_own_property),
+        "napi_delete_property" => import(store, fe, guest_napi_delete_property),
+        "napi_set_named_property" => import(store, fe, guest_napi_set_named_property),
+        "napi_get_named_property" => import(store, fe, guest_napi_get_named_property),
+        "napi_has_named_property" => import(store, fe, guest_napi_has_named_property),
+        "napi_set_element" => import(store, fe, guest_napi_set_element),
+        "napi_get_element" => import(store, fe, guest_napi_get_element),
+        "napi_has_element" => import(store, fe, guest_napi_has_element),
+        "napi_delete_element" => import(store, fe, guest_napi_delete_element),
+        "napi_get_array_length" => import(store, fe, guest_napi_get_array_length),
+        "napi_get_property_names" => import(store, fe, guest_napi_get_property_names),
+        "napi_get_all_property_names" => import(store, fe, guest_napi_get_all_property_names),
+        "napi_get_prototype" => import(store, fe, guest_napi_get_prototype),
+        "napi_object_freeze" => import(store, fe, guest_napi_object_freeze),
+        "napi_object_seal" => import(store, fe, guest_napi_object_seal),
+        "napi_strict_equals" => import(store, fe, guest_napi_strict_equals),
+        "napi_throw" => import(store, fe, guest_napi_throw),
+        "napi_throw_error" => import(store, fe, guest_napi_throw_error),
+        "napi_throw_type_error" => import(store, fe, guest_napi_throw_type_error),
+        "napi_throw_range_error" => import(store, fe, guest_napi_throw_range_error),
+        "napi_is_exception_pending" => import(store, fe, guest_napi_is_exception_pending),
+        "napi_get_and_clear_last_exception" => import(store, fe, guest_napi_get_and_clear_last_exception),
+        "napi_resolve_deferred" => import(store, fe, guest_napi_resolve_deferred),
+        "napi_reject_deferred" => import(store, fe, guest_napi_reject_deferred),
+        "napi_get_arraybuffer_info" => import(store, fe, guest_napi_get_arraybuffer_info),
+        "napi_detach_arraybuffer" => import(store, fe, guest_napi_detach_arraybuffer),
+        "napi_is_detached_arraybuffer" => import(store, fe, guest_napi_is_detached_arraybuffer),
+        "node_api_is_sharedarraybuffer" => import(store, fe, guest_node_api_is_sharedarraybuffer),
+        "node_api_create_sharedarraybuffer" => import(store, fe, guest_node_api_create_sharedarraybuffer),
+        "node_api_set_prototype" => import(store, fe, guest_node_api_set_prototype),
+        "napi_get_typedarray_info" => import(store, fe, guest_napi_get_typedarray_info),
+        "napi_get_dataview_info" => import(store, fe, guest_napi_get_dataview_info),
+        "napi_create_reference" => import(store, fe, guest_napi_create_reference),
+        "napi_delete_reference" => import(store, fe, guest_napi_delete_reference),
+        "napi_reference_ref" => import(store, fe, guest_napi_reference_ref),
+        "napi_reference_unref" => import(store, fe, guest_napi_reference_unref),
+        "napi_get_reference_value" => import(store, fe, guest_napi_get_reference_value),
+        "napi_open_handle_scope" => import(store, fe, guest_napi_open_handle_scope),
+        "napi_close_handle_scope" => import(store, fe, guest_napi_close_handle_scope),
+        "napi_open_escapable_handle_scope" => import(store, fe, guest_napi_open_escapable_handle_scope),
+        "napi_close_escapable_handle_scope" => import(store, fe, guest_napi_close_escapable_handle_scope),
+        "napi_escape_handle" => import(store, fe, guest_napi_escape_handle),
+        "napi_type_tag_object" => import(store, fe, guest_napi_type_tag_object),
+        "napi_check_object_type_tag" => import(store, fe, guest_napi_check_object_type_tag),
+        "napi_call_function" => import(store, fe, guest_napi_call_function),
+        "napi_create_function" => import(store, fe, guest_napi_create_function),
+        "napi_get_cb_info" => import(store, fe, guest_napi_get_cb_info),
+        "napi_get_new_target" => import(store, fe, guest_napi_get_new_target),
+        "napi_run_script" => import(store, fe, guest_napi_run_script),
+        "napi_create_string_utf16" => import(store, fe, guest_napi_create_string_utf16),
+        "napi_get_value_string_utf16" => import(store, fe, guest_napi_get_value_string_utf16),
+        "napi_create_bigint_words" => import(store, fe, guest_napi_create_bigint_words),
+        "napi_get_value_bigint_words" => import(store, fe, guest_napi_get_value_bigint_words),
+        "napi_set_instance_data" => import(store, fe, guest_napi_set_instance_data),
+        "napi_get_instance_data" => import(store, fe, guest_napi_get_instance_data),
+        "napi_adjust_external_memory" => import(store, fe, guest_napi_adjust_external_memory),
+        "napi_create_buffer" => import(store, fe, guest_napi_create_buffer),
+        "napi_create_buffer_copy" => import(store, fe, guest_napi_create_buffer_copy),
+        "napi_is_buffer" => import(store, fe, guest_napi_is_buffer),
+        "napi_get_buffer_info" => import(store, fe, guest_napi_get_buffer_info),
+        "napi_get_node_version" => import(store, fe, guest_napi_get_node_version),
+        "napi_wrap" => import(store, fe, guest_napi_wrap),
+        "napi_unwrap" => import(store, fe, guest_napi_unwrap),
+        "napi_remove_wrap" => import(store, fe, guest_napi_remove_wrap),
+        "napi_add_finalizer" => import(store, fe, guest_napi_add_finalizer),
+        "napi_new_instance" => import(store, fe, guest_napi_new_instance),
+        "napi_define_properties" => import(store, fe, guest_napi_define_properties),
+        "napi_define_class" => import(store, fe, guest_napi_define_class),
+        "napi_fatal_error" => import(store, fe, guest_napi_fatal_error),
+        "napi_get_last_error_info" => import(store, fe, guest_napi_get_last_error_info),
+        "napi_get_version" => import(store, fe, guest_napi_get_version),
+        "napi_add_env_cleanup_hook" => import(store, fe, guest_napi_add_env_cleanup_hook),
+        "napi_remove_env_cleanup_hook" => import(store, fe, guest_napi_remove_env_cleanup_hook),
     };
 
     let napi_extension_wasmer_namespace = namespace! {
-        "unofficial_napi_configure_runtime" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_configure_runtime),
-        "unofficial_napi_create_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_env),
-        "unofficial_napi_attach_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_attach_env),
-        "unofficial_napi_set_env_cleanup_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_env_cleanup_callback),
-        "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),
-        "unofficial_napi_collect_garbage" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_collect_garbage),
-        "unofficial_napi_memory_pressure" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_memory_pressure),
-        "unofficial_napi_event_loop_checkpoint" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_event_loop_checkpoint),
-        "unofficial_napi_create_uninitialized_arraybuffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uninitialized_arraybuffer),
-        "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),
-        "unofficial_napi_release_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_buffer_lease),
-        "unofficial_napi_create_guest_backed_typedarray" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_guest_backed_typedarray),
-        "unofficial_napi_create_uint8array" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uint8array),
-        "unofficial_napi_create_uint8array_copy" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uint8array_copy),
-        "unofficial_napi_set_prepare_stack_trace_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_prepare_stack_trace_callback),
-        "unofficial_napi_get_promise_details" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_promise_details),
-        "unofficial_napi_get_proxy_details" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_proxy_details),
-        "unofficial_napi_preview_entries" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_preview_entries),
-        "unofficial_napi_get_call_sites" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_call_sites),
-        "unofficial_napi_arraybuffer_view_has_buffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_arraybuffer_view_has_buffer),
-        "unofficial_napi_get_constructor_name" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_constructor_name),
-        "unofficial_napi_create_private_symbol" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_private_symbol),
-        "unofficial_napi_get_continuation_preserved_embedder_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_continuation_preserved_embedder_data),
-        "unofficial_napi_set_continuation_preserved_embedder_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_continuation_preserved_embedder_data),
-        "unofficial_napi_notify_datetime_configuration_change" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_notify_datetime_configuration_change),
-        "unofficial_napi_terminate_execution" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_terminate_execution),
-        "unofficial_napi_cancel_terminate_execution" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_cancel_terminate_execution),
-        "unofficial_napi_request_interrupt" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_request_interrupt),
-        "unofficial_napi_structured_clone" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_structured_clone),
-        "unofficial_napi_message_create" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_create),
-        "unofficial_napi_message_take" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_take),
-        "unofficial_napi_message_drop" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_drop),
-        "unofficial_napi_create_trusted_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_trusted_script),
-        "unofficial_napi_is_executing_js" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_is_executing_js),
-        "unofficial_napi_enqueue_microtask" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_enqueue_microtask),
-        "unofficial_napi_set_promise_reject_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_reject_callback),
-        "unofficial_napi_get_own_non_index_properties" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_own_non_index_properties),
-        "unofficial_napi_define_lazy_data_properties" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_define_lazy_data_properties),
-        "unofficial_napi_is_lazy_data_property" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_is_lazy_data_property),
-        "unofficial_napi_set_promise_hooks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_hooks),
-        "unofficial_napi_get_hash_seed" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_hash_seed),
-        "unofficial_napi_get_error_metadata" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_error_metadata),
-        "unofficial_napi_configure_source_maps" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_configure_source_maps),
-        "unofficial_napi_preserve_error_source_message" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_preserve_error_source_message),
-        "unofficial_napi_mark_promise_as_handled" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_mark_promise_as_handled),
-        "unofficial_napi_get_heap_statistics" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_heap_statistics),
-        "unofficial_napi_get_heap_space_statistics" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_heap_space_statistics),
-        "unofficial_napi_get_heap_code_statistics" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_heap_code_statistics),
-        "unofficial_napi_configure_near_heap_limit_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_configure_near_heap_limit_callback),
-        "unofficial_napi_profile_start" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_profile_start),
-        "unofficial_napi_profile_stop" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_profile_stop),
-        "unofficial_napi_take_heap_snapshot" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_take_heap_snapshot),
-        "unofficial_napi_create_serdes_binding" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_serdes_binding),
-        "unofficial_napi_contextify_contains_module_syntax" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_contains_module_syntax),
-        "unofficial_napi_contextify_make_context" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_make_context),
-        "unofficial_napi_contextify_run_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_run_script),
-        "unofficial_napi_contextify_compile_function" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_compile_function),
-        "unofficial_napi_create_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_realm),
-        "unofficial_napi_get_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_realm),
-        "unofficial_napi_enter_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_enter_realm),
-        "unofficial_napi_leave_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_leave_realm),
-        "unofficial_napi_run_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_run_script),
-        "unofficial_napi_compile_function" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_compile_function),
-        "unofficial_napi_bytecode_open" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_bytecode_open),
-        "unofficial_napi_bytecode_serialize" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_bytecode_serialize),
-        "unofficial_napi_bytecode_release" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_bytecode_release),
-        "unofficial_napi_module_wrap_create" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create),
-        "unofficial_napi_module_wrap_destroy" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_destroy),
-        "unofficial_napi_module_wrap_link" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_link),
-        "unofficial_napi_module_wrap_instantiate" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_instantiate),
-        "unofficial_napi_module_wrap_evaluate" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_evaluate),
-        "unofficial_napi_module_wrap_evaluate_sync" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_evaluate_sync),
-        "unofficial_napi_module_wrap_get_namespace" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_get_namespace),
-        "unofficial_napi_module_wrap_get_state" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_get_state),
-        "unofficial_napi_module_wrap_check_unsettled_top_level_await" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_check_unsettled_top_level_await),
-        "unofficial_napi_module_wrap_set_export" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_set_export),
-        "unofficial_napi_module_wrap_set_module_source_object" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_set_module_source_object),
-        "unofficial_napi_module_wrap_get_module_source_object" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_get_module_source_object),
-        "unofficial_napi_module_wrap_create_cached_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_cached_data),
-        "unofficial_napi_module_wrap_set_hooks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_set_hooks),
-        "unofficial_napi_module_wrap_create_required_module_facade" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_required_module_facade),
+        "unofficial_napi_configure_runtime" => import(store, fe, guest_unofficial_napi_configure_runtime),
+        "unofficial_napi_create_env" => import(store, fe, guest_unofficial_napi_create_env),
+        "unofficial_napi_attach_env" => import(store, fe, guest_unofficial_napi_attach_env),
+        "unofficial_napi_set_env_cleanup_callback" => import(store, fe, guest_unofficial_napi_set_env_cleanup_callback),
+        "unofficial_napi_release_env" => import(store, fe, guest_unofficial_napi_release_env),
+        "unofficial_napi_collect_garbage" => import(store, fe, guest_unofficial_napi_collect_garbage),
+        "unofficial_napi_memory_pressure" => import(store, fe, guest_unofficial_napi_memory_pressure),
+        "unofficial_napi_event_loop_checkpoint" => import(store, fe, guest_unofficial_napi_event_loop_checkpoint),
+        "unofficial_napi_create_uninitialized_arraybuffer" => import(store, fe, guest_unofficial_napi_create_uninitialized_arraybuffer),
+        "unofficial_napi_acquire_buffer_lease" => import(store, fe, guest_unofficial_napi_acquire_buffer_lease),
+        "unofficial_napi_release_buffer_lease" => import(store, fe, guest_unofficial_napi_release_buffer_lease),
+        "unofficial_napi_create_guest_backed_typedarray" => import(store, fe, guest_unofficial_napi_create_guest_backed_typedarray),
+        "unofficial_napi_create_uint8array" => import(store, fe, guest_unofficial_napi_create_uint8array),
+        "unofficial_napi_create_uint8array_copy" => import(store, fe, guest_unofficial_napi_create_uint8array_copy),
+        "unofficial_napi_set_prepare_stack_trace_callback" => import(store, fe, guest_unofficial_napi_set_prepare_stack_trace_callback),
+        "unofficial_napi_get_promise_details" => import(store, fe, guest_unofficial_napi_get_promise_details),
+        "unofficial_napi_get_proxy_details" => import(store, fe, guest_unofficial_napi_get_proxy_details),
+        "unofficial_napi_preview_entries" => import(store, fe, guest_unofficial_napi_preview_entries),
+        "unofficial_napi_get_call_sites" => import(store, fe, guest_unofficial_napi_get_call_sites),
+        "unofficial_napi_arraybuffer_view_has_buffer" => import(store, fe, guest_unofficial_napi_arraybuffer_view_has_buffer),
+        "unofficial_napi_get_constructor_name" => import(store, fe, guest_unofficial_napi_get_constructor_name),
+        "unofficial_napi_create_private_symbol" => import(store, fe, guest_unofficial_napi_create_private_symbol),
+        "unofficial_napi_get_continuation_preserved_embedder_data" => import(store, fe, guest_unofficial_napi_get_continuation_preserved_embedder_data),
+        "unofficial_napi_set_continuation_preserved_embedder_data" => import(store, fe, guest_unofficial_napi_set_continuation_preserved_embedder_data),
+        "unofficial_napi_notify_datetime_configuration_change" => import(store, fe, guest_unofficial_napi_notify_datetime_configuration_change),
+        "unofficial_napi_terminate_execution" => import(store, fe, guest_unofficial_napi_terminate_execution),
+        "unofficial_napi_cancel_terminate_execution" => import(store, fe, guest_unofficial_napi_cancel_terminate_execution),
+        "unofficial_napi_request_interrupt" => import(store, fe, guest_unofficial_napi_request_interrupt),
+        "unofficial_napi_structured_clone" => import(store, fe, guest_unofficial_napi_structured_clone),
+        "unofficial_napi_message_create" => import(store, fe, guest_unofficial_napi_message_create),
+        "unofficial_napi_message_take" => import(store, fe, guest_unofficial_napi_message_take),
+        "unofficial_napi_message_drop" => import(store, fe, guest_unofficial_napi_message_drop),
+        "unofficial_napi_create_trusted_script" => import(store, fe, guest_unofficial_napi_create_trusted_script),
+        "unofficial_napi_is_executing_js" => import(store, fe, guest_unofficial_napi_is_executing_js),
+        "unofficial_napi_enqueue_microtask" => import(store, fe, guest_unofficial_napi_enqueue_microtask),
+        "unofficial_napi_set_promise_reject_callback" => import(store, fe, guest_unofficial_napi_set_promise_reject_callback),
+        "unofficial_napi_get_own_non_index_properties" => import(store, fe, guest_unofficial_napi_get_own_non_index_properties),
+        "unofficial_napi_define_lazy_data_properties" => import(store, fe, guest_unofficial_napi_define_lazy_data_properties),
+        "unofficial_napi_is_lazy_data_property" => import(store, fe, guest_unofficial_napi_is_lazy_data_property),
+        "unofficial_napi_set_promise_hooks" => import(store, fe, guest_unofficial_napi_set_promise_hooks),
+        "unofficial_napi_get_hash_seed" => import(store, fe, guest_unofficial_napi_get_hash_seed),
+        "unofficial_napi_get_error_metadata" => import(store, fe, guest_unofficial_napi_get_error_metadata),
+        "unofficial_napi_configure_source_maps" => import(store, fe, guest_unofficial_napi_configure_source_maps),
+        "unofficial_napi_preserve_error_source_message" => import(store, fe, guest_unofficial_napi_preserve_error_source_message),
+        "unofficial_napi_mark_promise_as_handled" => import(store, fe, guest_unofficial_napi_mark_promise_as_handled),
+        "unofficial_napi_get_heap_statistics" => import(store, fe, guest_unofficial_napi_get_heap_statistics),
+        "unofficial_napi_get_heap_space_statistics" => import(store, fe, guest_unofficial_napi_get_heap_space_statistics),
+        "unofficial_napi_get_heap_code_statistics" => import(store, fe, guest_unofficial_napi_get_heap_code_statistics),
+        "unofficial_napi_configure_near_heap_limit_callback" => import(store, fe, guest_unofficial_napi_configure_near_heap_limit_callback),
+        "unofficial_napi_profile_start" => import(store, fe, guest_unofficial_napi_profile_start),
+        "unofficial_napi_profile_stop" => import(store, fe, guest_unofficial_napi_profile_stop),
+        "unofficial_napi_take_heap_snapshot" => import(store, fe, guest_unofficial_napi_take_heap_snapshot),
+        "unofficial_napi_create_serdes_binding" => import(store, fe, guest_unofficial_napi_create_serdes_binding),
+        "unofficial_napi_contextify_contains_module_syntax" => import(store, fe, guest_unofficial_napi_contextify_contains_module_syntax),
+        "unofficial_napi_contextify_make_context" => import(store, fe, guest_unofficial_napi_contextify_make_context),
+        "unofficial_napi_contextify_run_script" => import(store, fe, guest_unofficial_napi_contextify_run_script),
+        "unofficial_napi_contextify_compile_function" => import(store, fe, guest_unofficial_napi_contextify_compile_function),
+        "unofficial_napi_create_realm" => import(store, fe, guest_unofficial_napi_create_realm),
+        "unofficial_napi_get_realm" => import(store, fe, guest_unofficial_napi_get_realm),
+        "unofficial_napi_enter_realm" => import(store, fe, guest_unofficial_napi_enter_realm),
+        "unofficial_napi_leave_realm" => import(store, fe, guest_unofficial_napi_leave_realm),
+        "unofficial_napi_run_script" => import(store, fe, guest_unofficial_napi_run_script),
+        "unofficial_napi_compile_function" => import(store, fe, guest_unofficial_napi_compile_function),
+        "unofficial_napi_bytecode_open" => import(store, fe, guest_unofficial_napi_bytecode_open),
+        "unofficial_napi_bytecode_serialize" => import(store, fe, guest_unofficial_napi_bytecode_serialize),
+        "unofficial_napi_bytecode_release" => import(store, fe, guest_unofficial_napi_bytecode_release),
+        "unofficial_napi_module_wrap_create" => import(store, fe, guest_unofficial_napi_module_wrap_create),
+        "unofficial_napi_module_wrap_destroy" => import(store, fe, guest_unofficial_napi_module_wrap_destroy),
+        "unofficial_napi_module_wrap_link" => import(store, fe, guest_unofficial_napi_module_wrap_link),
+        "unofficial_napi_module_wrap_instantiate" => import(store, fe, guest_unofficial_napi_module_wrap_instantiate),
+        "unofficial_napi_module_wrap_evaluate" => import(store, fe, guest_unofficial_napi_module_wrap_evaluate),
+        "unofficial_napi_module_wrap_evaluate_sync" => import(store, fe, guest_unofficial_napi_module_wrap_evaluate_sync),
+        "unofficial_napi_module_wrap_get_namespace" => import(store, fe, guest_unofficial_napi_module_wrap_get_namespace),
+        "unofficial_napi_module_wrap_get_state" => import(store, fe, guest_unofficial_napi_module_wrap_get_state),
+        "unofficial_napi_module_wrap_check_unsettled_top_level_await" => import(store, fe, guest_unofficial_napi_module_wrap_check_unsettled_top_level_await),
+        "unofficial_napi_module_wrap_set_export" => import(store, fe, guest_unofficial_napi_module_wrap_set_export),
+        "unofficial_napi_module_wrap_set_module_source_object" => import(store, fe, guest_unofficial_napi_module_wrap_set_module_source_object),
+        "unofficial_napi_module_wrap_get_module_source_object" => import(store, fe, guest_unofficial_napi_module_wrap_get_module_source_object),
+        "unofficial_napi_module_wrap_create_cached_data" => import(store, fe, guest_unofficial_napi_module_wrap_create_cached_data),
+        "unofficial_napi_module_wrap_set_hooks" => import(store, fe, guest_unofficial_napi_module_wrap_set_hooks),
+        "unofficial_napi_module_wrap_create_required_module_facade" => import(store, fe, guest_unofficial_napi_module_wrap_create_required_module_facade),
     };
 
     io.register_namespace(NAPI_MODULE_NAME, napi_namespace);
@@ -5737,10 +5734,15 @@ fn guest_env_ossl_set_max_threads(_ctx: i32, _max_threads: i64) -> i32 {
     1
 }
 
+/// Defines the `env` functions that are not defined yet: a runtime that asks
+/// for imports through a hook refuses one that replaces an import it already
+/// has.
 pub fn register_env_imports(store: &mut impl AsStoreMut, io: &mut Imports) {
     macro_rules! reg_env {
         ($name:expr, $func:expr) => {
-            io.define("env", $name, Function::new_typed(store, $func));
+            if io.get_export("env", $name).is_none() {
+                io.define("env", $name, Function::new_typed(store, $func));
+            }
         };
     }
 
