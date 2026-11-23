@@ -69,7 +69,7 @@ use std::sync::{
 
 use offset_allocator::{Allocation, Allocator as OffsetAllocator};
 use wasmer::sys::NativeEngineExt;
-use wasmer::{AsStoreRef, Memory, MemoryStyle, Pages, Store, StoreMut};
+use wasmer::{AsStoreMut, AsStoreRef, Memory, MemoryStyle, Pages, StoreMut};
 
 use crate::budget::{Pool, ResourceBudget};
 
@@ -749,8 +749,13 @@ pub extern "C" fn napi_host_guest_heap_alloc(
     let Some(heap) = ctx.heap.upgrade() else {
         return std::ptr::null_mut();
     };
-    let offset = Store::with_current(|store| heap.alloc_with_store(store, length, zero != 0))
-        .unwrap_or_else(|| heap.alloc(length, zero != 0));
+    // Growing the guest's memory takes its store, which the import that is in
+    // the bridge on this thread can reach. Without one (a V8 background
+    // thread, JavaScript outside a bridge call) the arena has to do.
+    let offset = crate::guest::callback::with_import_in_bridge(|cx| {
+        cx.with(|mut env| heap.alloc_with_store(&mut env.as_store_mut(), length, zero != 0))
+    })
+    .unwrap_or_else(|| heap.alloc(length, zero != 0));
     match offset {
         Some(offset) => heap.offset_to_host(offset).cast(),
         None => std::ptr::null_mut(),
@@ -1050,24 +1055,46 @@ mod tests {
         assert!(heap.free_offset(grown));
     }
 
-    /// The foreign V8 allocator has no Rust store argument. It may recover a
-    /// store only while an explicitly guarded bridge lends one; otherwise it
-    /// is limited to the already-prefunded arena.
+    /// The foreign V8 allocator has no Rust store argument. It reaches a store
+    /// only through an import that is in the bridge; otherwise it is limited
+    /// to the already-prefunded arena.
     #[test]
-    fn allocator_hook_grows_only_with_a_lent_store() {
+    fn allocator_hook_grows_only_from_a_bridge_call() {
+        use crate::guest::callback::in_bridge;
+        use wasmer::{AsyncEnv, Function, FunctionEnv};
+
         let mut store = Store::default();
         let (_memory, heap) = shared_heap(&mut store, ResourceBudget::unlimited());
         let ctx = heap.make_alloc_ctx();
         let past_arena = (PREFUND_BYTES as usize) * 2;
 
-        let without_guard = napi_host_guest_heap_alloc(ctx, past_arena, 0);
-        assert!(without_guard.is_null());
+        let without_import = napi_host_guest_heap_alloc(ctx, past_arena, 0);
+        assert!(without_import.is_null());
 
-        let with_guard = store
-            .as_store_mut()
-            .parked(|| napi_host_guest_heap_alloc(ctx, past_arena, 0));
-        assert!(!with_guard.is_null());
-        assert_eq!(napi_host_guest_heap_free(ctx, with_guard, past_arena), 1);
+        let env = FunctionEnv::new(
+            &mut store,
+            crate::NapiEnv::new(
+                ResourceBudget::unlimited(),
+                None,
+                Default::default(),
+                Default::default(),
+            ),
+        );
+        // Addresses, so that the import is `Send` whatever it captures.
+        let ctx_addr = ctx as usize;
+        let import = Function::new_typed_async(
+            &mut store,
+            &env,
+            async move |cx: &mut AsyncEnv<crate::NapiEnv>| -> i64 {
+                let ctx = ctx_addr as *const c_void;
+                let (data, _) = in_bridge(cx, || napi_host_guest_heap_alloc(ctx, past_arena, 0));
+                data as usize as i64
+            },
+        );
+        let from_import = import.call(&mut store, &[]).expect("the import trapped")[0].unwrap_i64()
+            as usize as *mut c_void;
+        assert!(!from_import.is_null());
+        assert_eq!(napi_host_guest_heap_free(ctx, from_import, past_arena), 1);
 
         napi_host_guest_heap_release(ctx);
     }

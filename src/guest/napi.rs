@@ -7,14 +7,16 @@
 use std::ffi::{CString, c_char};
 
 use smallvec::{SmallVec, smallvec};
-use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports, RuntimeError, namespace};
+use wasmer::{
+    AsStoreMut, AsyncEnv, Function, FunctionEnv, FunctionEnvMut, Imports, RuntimeError, namespace,
+};
 
 use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv, RequestedHeap,
     budget::UNCHARGED_HOST_COPY_BYTES,
     guest::{
         MAX_GUEST_CSTRING_SCAN, MAX_NAPI_BIGINT_WORDS, MAX_NAPI_CALLBACK_ARGS,
-        callback::{lend_store, take_pending_guest_unwind},
+        callback::{in_bridge, take_pending_guest_unwind},
     },
     snapi::*,
 };
@@ -96,13 +98,15 @@ fn guest_heap_alloc_ctx(env: &FunctionEnvMut<NapiEnv>) -> *const std::ffi::c_voi
 }
 
 /// Calls the bridge for the guest's env `guest_env`: hands `f` the bridge
-/// env, and lends the store while it runs, so that JavaScript `f` runs can
-/// call guest functions and V8's array-buffer allocator can grow guest
-/// memory. Re-raises any guest exit trapped in a callback.
+/// env, and puts the import `cx` in the bridge while it runs, so that
+/// JavaScript `f` runs can call guest functions and V8's array-buffer
+/// allocator can grow guest memory. Re-raises any guest exit trapped in a
+/// callback.
 ///
-/// This is how an import that may run JavaScript reaches the bridge. It
-/// reads the env's data once to resolve the env, where `snapi_env` followed
-/// by a separate lend would read it again for each step.
+/// This is how an import that may run JavaScript reaches the bridge. Such an
+/// import is an async host function: it holds its store only in the slices
+/// of [`AsyncEnv::with`], and none during this call, so what the bridge
+/// calls back takes the store through `cx` in slices of its own.
 ///
 /// An error that ends the guest during a nested callback (its `_exit`, the host
 /// stopping it) cannot unwind through the intervening host V8 (C++) frames, so
@@ -112,25 +116,25 @@ fn guest_heap_alloc_ctx(env: &FunctionEnvMut<NapiEnv>) -> *const std::ffi::c_voi
 /// layer until the runner handles it, ending just this guest instance. Callers
 /// propagate with `?`.
 fn bridge<R>(
-    env: &mut FunctionEnvMut<NapiEnv>,
+    cx: &mut AsyncEnv<NapiEnv>,
     guest_env: u32,
     f: impl FnOnce(SnapiEnv) -> R,
 ) -> Result<R, RuntimeError> {
-    let snapi_env = env.data().resolve_napi_env(guest_env);
+    let snapi_env = cx.with(|env| env.data().resolve_napi_env(guest_env));
     let (r, unwind) = if snapi_env.is_null() {
         // No env, so no guest callback can fire and nothing needs the store.
         (f(snapi_env), take_pending_guest_unwind())
     } else {
-        let lent = lend_store(env, || f(snapi_env));
+        let done = in_bridge(cx, || f(snapi_env));
         // JavaScript may have left memory past the heap limit that no
         // collection examined; settle it before the guest goes on (see
         // `napi_host_near_heap_limit_grant`). The check is not free, so the
         // tracker decides, lock-free, whether this return is due. Looked up
         // only now: the call may have released the env, and its tracker.
-        if env.data().heap_tracker_for(guest_env).is_some() {
+        if cx.with(|env| env.data().heap_tracker_for(guest_env).is_some()) {
             unsafe { snapi_bridge_unofficial_settle_heap(snapi_env) };
         }
-        lent
+        done
     };
     if let Some(error) = unwind {
         return Err(error);
@@ -344,31 +348,34 @@ fn guest_unofficial_napi_create_env(
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_release_env(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_release_env(
+    cx: &mut AsyncEnv<NapiEnv>,
     scope_ptr: u32,
     loop_ptr: u32,
 ) -> Result<i32, RuntimeError> {
     let scope_id = scope_ptr;
     // Refuse before touching any of the env's bookkeeping, so the env stays
     // usable and releasable afterwards.
-    if let Some(snapi_env_state) = env.data().napi_scope_env(scope_id)
+    if let Some(snapi_env_state) = cx.with(|env| env.data().napi_scope_env(scope_id))
         && unsafe { snapi_bridge_unofficial_env_release_refused(snapi_env_state) } != 0
     {
         return Ok(crate::env::RELEASE_REFUSED);
     }
-    let Some((guest_env, snapi_env_state)) = env.data_mut().begin_unregister_napi_scope(scope_id)
+    let Some((guest_env, snapi_env_state)) =
+        cx.with(|mut env| env.data_mut().begin_unregister_napi_scope(scope_id))
     else {
         return Ok(1);
     };
     let loop_id = loop_ptr;
-    let status = bridge(&mut env, guest_env, |snapi_env_state| unsafe {
+    let status = bridge(cx, guest_env, |snapi_env_state| unsafe {
         snapi_bridge_unofficial_release_env_with_loop(snapi_env_state, loop_id)
     });
     // A guest exit raised by a finalizer still means the env was torn down.
     let release_status = status.as_ref().map_or(0, |status| *status);
-    env.data_mut()
-        .finish_unregister_napi_env(guest_env, snapi_env_state, release_status);
+    cx.with(|mut env| {
+        env.data_mut()
+            .finish_unregister_napi_env(guest_env, snapi_env_state, release_status)
+    });
     status
 }
 
@@ -430,15 +437,15 @@ fn guest_unofficial_napi_memory_pressure(
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_event_loop_checkpoint(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_event_loop_checkpoint(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     mode: i32,
     has_runnable_work: i32,
     checkpoint_state_ptr: u32,
 ) -> Result<i32, RuntimeError> {
     let mut checkpoint_state = 0;
-    let status = bridge(&mut env, napi_env, |env_handle| unsafe {
+    let status = bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_event_loop_checkpoint(
             env_handle,
             mode,
@@ -447,7 +454,7 @@ fn guest_unofficial_napi_event_loop_checkpoint(
         )
     })?;
     if checkpoint_state_ptr != 0 {
-        write_guest_u32(&mut env, checkpoint_state_ptr, checkpoint_state);
+        cx.with(|mut env| write_guest_u32(&mut env, checkpoint_state_ptr, checkpoint_state));
     }
     Ok(status)
 }
@@ -719,40 +726,40 @@ fn guest_unofficial_napi_cancel_terminate_execution(
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_request_interrupt(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_request_interrupt(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     callback: u32,
     data: u32,
 ) -> Result<i32, RuntimeError> {
     let callback_id = callback;
     let data_val = data;
-    bridge(&mut env, napi_env, |env_handle| unsafe {
+    bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_request_interrupt(env_handle, napi_env, callback_id, data_val)
     })
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_structured_clone(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_structured_clone(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     value: u32,
     transfer_list: u32,
     result_ptr: u32,
 ) -> Result<i32, RuntimeError> {
     let mut out = 0u32;
-    let status = bridge(&mut env, napi_env, |env_handle| unsafe {
+    let status = bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_structured_clone(env_handle, value, transfer_list, &mut out)
     })?;
     if status == 0 && result_ptr != 0 {
-        write_guest_u32(&mut env, result_ptr, out);
+        cx.with(|mut env| write_guest_u32(&mut env, result_ptr, out));
     }
     Ok(status)
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_message_create(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_message_create(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     value: u32,
     payload_out_ptr: u32,
@@ -760,19 +767,19 @@ fn guest_unofficial_napi_message_create(
     if payload_out_ptr == 0 {
         return Ok(1);
     }
-    let env_handle = snapi_env(&env, napi_env);
+    let env_handle = cx.with(|env| snapi_env(&env, napi_env));
     // The provider charges the message to the budget before it allocates it;
     // a message that does not fit is a clone error the sender can catch.
     // Shared buffers with bytes in this store's guest heap: lease the memory
     // while the message is queued, and let only a receiver on it take it.
-    let heap = env.data().guest_heap.clone();
+    let heap = cx.with(|env| env.data().guest_heap.clone());
     let (range_begin, range_end) = heap.as_ref().map_or((0, 0), |heap| {
         let begin = heap.base() as u64;
         (begin, begin.saturating_add(heap.range_len()))
     });
     let mut message = 0u32;
     let mut in_range = 0i32;
-    let status = bridge(&mut env, napi_env, |env_handle| unsafe {
+    let status = bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_message_create(
             env_handle,
             value,
@@ -794,7 +801,7 @@ fn guest_unofficial_napi_message_create(
     }
     let memory = match heap.filter(|_| in_range != 0) {
         None => None,
-        Some(heap) => match message_memory(&mut env, heap) {
+        Some(heap) => match cx.with(|mut env| message_memory(&mut env, heap)) {
             Some(memory) => Some(memory),
             None => {
                 unsafe {
@@ -811,11 +818,11 @@ fn guest_unofficial_napi_message_create(
         },
     };
     let queued = crate::message::QueuedMessage::in_memory(memory);
-    if !env.data().messages.insert(message, queued) {
+    if !cx.with(|env| env.data().messages.insert(message, queued)) {
         return Ok(9); // the context stopped meanwhile
     }
-    if !write_guest_u32(&mut env, payload_out_ptr, message) {
-        guest_unofficial_napi_message_drop(env, message);
+    if !cx.with(|mut env| write_guest_u32(&mut env, payload_out_ptr, message)) {
+        cx.with(|env| guest_unofficial_napi_message_drop(env, message));
         return Ok(1); // napi_invalid_arg
     }
     Ok(0)
@@ -843,23 +850,23 @@ fn message_memory(
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_message_take(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_message_take(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     payload: u32,
     result_out_ptr: u32,
 ) -> Result<i32, RuntimeError> {
     // Only a message of this context. The entry, which may lease the memory
     // the message points into, outlives the provider call below.
-    let Some(queued) = env.data().messages.remove(payload) else {
+    let Some(queued) = cx.with(|env| env.data().messages.remove(payload)) else {
         return Ok(1);
     };
     if result_out_ptr == 0 {
         unsafe { snapi_bridge_unofficial_message_drop(payload) };
         return Ok(1);
     }
-    let env_handle = snapi_env(&env, napi_env);
-    if !queued.readable_by(env.data().guest_heap.as_ref()) {
+    let env_handle = cx.with(|env| snapi_env(&env, napi_env));
+    if !cx.with(|env| queued.readable_by(env.data().guest_heap.as_ref())) {
         // Its SharedArrayBuffers are in a memory this env cannot address. The
         // message is consumed, as the provider consumes a refused one.
         unsafe {
@@ -873,11 +880,11 @@ fn guest_unofficial_napi_message_take(
         return Ok(10); // napi_pending_exception
     }
     let mut value = 0u32;
-    let status = bridge(&mut env, napi_env, |env_handle| unsafe {
+    let status = bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_message_take(env_handle, payload, &mut value)
     })?;
     if status == 0 {
-        write_guest_u32(&mut env, result_out_ptr, value);
+        cx.with(|mut env| write_guest_u32(&mut env, result_out_ptr, value));
     }
     Ok(status)
 }
@@ -948,8 +955,8 @@ fn guest_unofficial_napi_set_promise_reject_callback(
 // Listing a Proxy's keys runs its `ownKeys` trap, so this runs in the callback
 // context.
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_get_own_non_index_properties(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_get_own_non_index_properties(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     value: u32,
     filter_bits: u32,
@@ -959,7 +966,7 @@ fn guest_unofficial_napi_get_own_non_index_properties(
         return Ok(1);
     }
     let mut out = 0u32;
-    let status = bridge(&mut env, napi_env, |env_handle| unsafe {
+    let status = bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_get_own_non_index_properties(
             env_handle,
             value,
@@ -968,7 +975,7 @@ fn guest_unofficial_napi_get_own_non_index_properties(
         )
     })?;
     if status == 0 {
-        write_guest_u32(&mut env, result_out_ptr, out);
+        cx.with(|mut env| write_guest_u32(&mut env, result_out_ptr, out));
     }
     Ok(status)
 }
@@ -981,15 +988,15 @@ fn guest_unofficial_napi_get_own_non_index_properties(
 // not makes the guest function throw, as it would from any getter, and the
 // property stays lazy.
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_define_lazy_data_properties(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_define_lazy_data_properties(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     object: u32,
     names: u32,
     initializer: u32,
     attributes: i32,
 ) -> Result<i32, RuntimeError> {
-    bridge(&mut env, napi_env, |env_handle| unsafe {
+    bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_define_lazy_data_properties(
             env_handle,
             object,
@@ -1058,8 +1065,8 @@ fn guest_unofficial_napi_get_hash_seed(
 // Formatting an error's source line calls the env's source-map callback, if
 // one is configured, and that callback may call guest functions.
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_get_error_metadata(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_get_error_metadata(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     error: u32,
     mode: i32,
@@ -1078,7 +1085,7 @@ fn guest_unofficial_napi_get_error_metadata(
     let mut line_number = 0i32;
     let mut start_column = 0i32;
     let mut end_column = 0i32;
-    let status = bridge(&mut env, napi_env, |env_handle| unsafe {
+    let status = bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_get_error_metadata(
             env_handle,
             error_id,
@@ -1096,13 +1103,13 @@ fn guest_unofficial_napi_get_error_metadata(
         return Ok(status);
     }
     if metadata_ptr != 0 {
-        write_guest_u32(&mut env, metadata_ptr, source_line_id);
-        write_guest_u32(&mut env, metadata_ptr + 4, script_resource_name_id);
-        write_guest_u32(&mut env, metadata_ptr + 8, stderr_line_id);
-        write_guest_u32(&mut env, metadata_ptr + 12, thrown_at_id);
-        write_guest_i32(&mut env, metadata_ptr + 16, line_number);
-        write_guest_i32(&mut env, metadata_ptr + 20, start_column);
-        write_guest_i32(&mut env, metadata_ptr + 24, end_column);
+        cx.with(|mut env| write_guest_u32(&mut env, metadata_ptr, source_line_id));
+        cx.with(|mut env| write_guest_u32(&mut env, metadata_ptr + 4, script_resource_name_id));
+        cx.with(|mut env| write_guest_u32(&mut env, metadata_ptr + 8, stderr_line_id));
+        cx.with(|mut env| write_guest_u32(&mut env, metadata_ptr + 12, thrown_at_id));
+        cx.with(|mut env| write_guest_i32(&mut env, metadata_ptr + 16, line_number));
+        cx.with(|mut env| write_guest_i32(&mut env, metadata_ptr + 20, start_column));
+        cx.with(|mut env| write_guest_i32(&mut env, metadata_ptr + 24, end_column));
     }
     Ok(0)
 }
@@ -1120,12 +1127,12 @@ fn guest_unofficial_napi_configure_source_maps(
 
 // Runs the source-map callback, as unofficial_napi_get_error_metadata does.
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_preserve_error_source_message(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_preserve_error_source_message(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     error: u32,
 ) -> Result<i32, RuntimeError> {
-    bridge(&mut env, napi_env, |env_handle| unsafe {
+    bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_preserve_error_source_message(env_handle, error)
     })
 }
@@ -1133,13 +1140,13 @@ fn guest_unofficial_napi_preserve_error_source_message(
 // Marking a rejected promise as handled runs the env's promise-reject
 // callback, which may call guest functions.
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_mark_promise_as_handled(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_mark_promise_as_handled(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     promise: u32,
 ) -> Result<i32, RuntimeError> {
     let promise_id = promise;
-    bridge(&mut env, napi_env, |env_handle| unsafe {
+    bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_mark_promise_as_handled(env_handle, promise_id)
     })
 }
@@ -1444,8 +1451,8 @@ fn guest_unofficial_napi_contextify_make_context(
 /// sandbox names the realm; 0, undefined or null is the current realm.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_contextify_run_script(
-    env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_contextify_run_script(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     sandbox_or_null: u32,
     source: u32,
@@ -1459,12 +1466,13 @@ fn guest_unofficial_napi_contextify_run_script(
     host_defined_option_id: u32,
     result_ptr: u32,
 ) -> Result<i32, RuntimeError> {
-    let realm = match compat::realm_from_context(snapi_env(&env, napi_env), sandbox_or_null, true) {
+    let snapi = cx.with(|env| snapi_env(&env, napi_env));
+    let realm = match compat::realm_from_context(snapi, sandbox_or_null, true) {
         Ok(realm) => realm,
         Err(status) => return Ok(status),
     };
     guest_unofficial_napi_run_script(
-        env,
+        cx,
         napi_env,
         realm,
         source,
@@ -1478,14 +1486,15 @@ fn guest_unofficial_napi_contextify_run_script(
         host_defined_option_id,
         result_ptr,
     )
+    .await
 }
 
 /// Deprecated (use unofficial_napi_compile_function), kept for older
 /// guests. The parsing context names the realm; 0, undefined or null is the
 /// current realm.
 #[allow(clippy::too_many_arguments, clippy::result_large_err)]
-fn guest_unofficial_napi_contextify_compile_function(
-    env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_contextify_compile_function(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     source: u32,
     filename: u32,
@@ -1497,16 +1506,13 @@ fn guest_unofficial_napi_contextify_compile_function(
     host_defined_option_id: u32,
     result_ptr: u32,
 ) -> Result<i32, RuntimeError> {
-    let realm = match compat::realm_from_context(
-        snapi_env(&env, napi_env),
-        parsing_context_or_undefined,
-        true,
-    ) {
+    let snapi = cx.with(|env| snapi_env(&env, napi_env));
+    let realm = match compat::realm_from_context(snapi, parsing_context_or_undefined, true) {
         Ok(realm) => realm,
         Err(status) => return Ok(status),
     };
     guest_unofficial_napi_compile_function(
-        env,
+        cx,
         napi_env,
         realm,
         source,
@@ -1518,6 +1524,7 @@ fn guest_unofficial_napi_contextify_compile_function(
         host_defined_option_id,
         result_ptr,
     )
+    .await
 }
 
 /// A guest realm id is the value id of the realm's global (or sandbox); 0 is
@@ -1611,8 +1618,8 @@ fn guest_unofficial_napi_leave_realm(
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_run_script(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_run_script(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     realm: u32,
     source: u32,
@@ -1626,11 +1633,13 @@ fn guest_unofficial_napi_run_script(
     host_defined_option_id: u32,
     result_ptr: u32,
 ) -> Result<i32, RuntimeError> {
-    let Some((source_text, source_bytecode)) = abi::read_js_source(&mut env, source) else {
+    let Some((source_text, source_bytecode)) =
+        cx.with(|mut env| abi::read_js_source(&mut env, source))
+    else {
         return Ok(1);
     };
     let mut result_id = 0u32;
-    let status = bridge(&mut env, napi_env, |env_handle| unsafe {
+    let status = bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_run_script(
             env_handle,
             realm,
@@ -1648,15 +1657,15 @@ fn guest_unofficial_napi_run_script(
         )
     })?;
     if status == 0 && result_ptr != 0 {
-        write_guest_u32(&mut env, result_ptr, result_id);
+        cx.with(|mut env| write_guest_u32(&mut env, result_ptr, result_id));
     }
     Ok(status)
 }
 
 // Reading context extensions and parameters can run their array getters.
 #[allow(clippy::too_many_arguments, clippy::result_large_err)]
-fn guest_unofficial_napi_compile_function(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_compile_function(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     realm: u32,
     source: u32,
@@ -1668,11 +1677,13 @@ fn guest_unofficial_napi_compile_function(
     host_defined_option_id: u32,
     result_ptr: u32,
 ) -> Result<i32, RuntimeError> {
-    let Some((source_text, source_bytecode)) = abi::read_js_source(&mut env, source) else {
+    let Some((source_text, source_bytecode)) =
+        cx.with(|mut env| abi::read_js_source(&mut env, source))
+    else {
         return Ok(1);
     };
     let mut result_id = 0u32;
-    let status = bridge(&mut env, napi_env, |env_handle| unsafe {
+    let status = bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_compile_function(
             env_handle,
             realm,
@@ -1688,20 +1699,20 @@ fn guest_unofficial_napi_compile_function(
         )
     })?;
     if status == 0 && result_ptr != 0 {
-        write_guest_u32(&mut env, result_ptr, result_id);
+        cx.with(|mut env| write_guest_u32(&mut env, result_ptr, result_id));
     }
     Ok(status)
 }
 
 // Opening bytecode also reads the parameter array through V8.
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_bytecode_open(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_bytecode_open(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     options_ptr: u32,
     result_ptr: u32,
 ) -> Result<i32, RuntimeError> {
-    let Some(options) = abi::read_bytecode_open(&mut env, options_ptr) else {
+    let Some(options) = cx.with(|mut env| abi::read_bytecode_open(&mut env, options_ptr)) else {
         return Ok(1);
     };
     // The whole 6-byte result must lie below 4 GiB (checked before
@@ -1709,7 +1720,7 @@ fn guest_unofficial_napi_bytecode_open(
     if result_ptr == 0 || u64::from(result_ptr) + 6 > 1u64 << 32 {
         return Ok(1);
     }
-    let env_handle = snapi_env(&env, napi_env);
+    let env_handle = cx.with(|env| snapi_env(&env, napi_env));
     let realm =
         match compat::bytecode_open_realm(env_handle, options.version, options.realm_or_null) {
             Ok(realm) => realm,
@@ -1718,7 +1729,7 @@ fn guest_unofficial_napi_bytecode_open(
     let mut bytecode_id = 0u32;
     let mut cache_rejected = 0u8;
     let mut can_parse_as_module = 0u8;
-    let status = bridge(&mut env, napi_env, |env_handle| unsafe {
+    let status = bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_bytecode_open(
             env_handle,
             realm,
@@ -1742,26 +1753,26 @@ fn guest_unofficial_napi_bytecode_open(
             &mut can_parse_as_module,
         )
     })?;
-    write_guest_u32(&mut env, result_ptr, bytecode_id);
-    write_guest_u8(&mut env, result_ptr + 4, cache_rejected);
-    write_guest_u8(&mut env, result_ptr + 5, can_parse_as_module);
+    cx.with(|mut env| write_guest_u32(&mut env, result_ptr, bytecode_id));
+    cx.with(|mut env| write_guest_u8(&mut env, result_ptr + 4, cache_rejected));
+    cx.with(|mut env| write_guest_u8(&mut env, result_ptr + 5, can_parse_as_module));
     Ok(status)
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_bytecode_serialize(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_bytecode_serialize(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     bytecode: u32,
     buffer_ptr: u32,
 ) -> Result<i32, RuntimeError> {
     let mut buffer_id = 0u32;
     // Packaging cache bytes can call the guest's Buffer.from.
-    let status = bridge(&mut env, napi_env, |env_handle| unsafe {
+    let status = bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_bytecode_serialize(env_handle, bytecode, &mut buffer_id)
     })?;
     if status == 0 && buffer_ptr != 0 {
-        write_guest_u32(&mut env, buffer_ptr, buffer_id);
+        cx.with(|mut env| write_guest_u32(&mut env, buffer_ptr, buffer_id));
     }
     Ok(status)
 }
@@ -1778,13 +1789,13 @@ fn guest_unofficial_napi_bytecode_release(
 // A module that fails to compile gets its source line formatted, which runs
 // the source-map callback (see unofficial_napi_get_error_metadata).
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_module_wrap_create(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_module_wrap_create(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     options_ptr: u32,
     result_ptr: u32,
 ) -> Result<i32, RuntimeError> {
-    let Some(options) = abi::read_module_create(&mut env, options_ptr) else {
+    let Some(options) = cx.with(|mut env| abi::read_module_create(&mut env, options_ptr)) else {
         return Ok(1);
     };
     // The whole 9-byte result must lie below 4 GiB (checked before
@@ -1792,7 +1803,7 @@ fn guest_unofficial_napi_module_wrap_create(
     if result_ptr == 0 || u64::from(result_ptr) + 9 > 1u64 << 32 {
         return Ok(1);
     }
-    let env_handle = snapi_env(&env, napi_env);
+    let env_handle = cx.with(|env| snapi_env(&env, napi_env));
     let realm = match compat::module_create_realm(
         env_handle,
         options.version,
@@ -1805,7 +1816,7 @@ fn guest_unofficial_napi_module_wrap_create(
     let mut handle_id = 0u32;
     let mut requests_id = 0u32;
     let mut has_top_level_await = 0u8;
-    let status = bridge(&mut env, napi_env, |env_handle| unsafe {
+    let status = bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_module_wrap_create(
             env_handle,
             options.kind,
@@ -1825,9 +1836,9 @@ fn guest_unofficial_napi_module_wrap_create(
         )
     })?;
     if status == 0 {
-        write_guest_u32(&mut env, result_ptr, handle_id);
-        write_guest_u32(&mut env, result_ptr + 4, requests_id);
-        write_guest_bytes(&mut env, result_ptr + 8, &[has_top_level_await]);
+        cx.with(|mut env| write_guest_u32(&mut env, result_ptr, handle_id));
+        cx.with(|mut env| write_guest_u32(&mut env, result_ptr + 4, requests_id));
+        cx.with(|mut env| write_guest_bytes(&mut env, result_ptr + 8, &[has_top_level_await]));
     }
     Ok(status)
 }
@@ -1871,19 +1882,19 @@ fn guest_unofficial_napi_module_wrap_link(
 // A module that fails to instantiate gets its source line formatted, which
 // runs the source-map callback (see unofficial_napi_get_error_metadata).
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_module_wrap_instantiate(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_module_wrap_instantiate(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     handle: u32,
 ) -> Result<i32, RuntimeError> {
-    bridge(&mut env, napi_env, |env_handle| unsafe {
+    bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_module_wrap_instantiate(env_handle, handle)
     })
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_module_wrap_evaluate(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_module_wrap_evaluate(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     handle: u32,
     timeout: i64,
@@ -1891,7 +1902,7 @@ fn guest_unofficial_napi_module_wrap_evaluate(
     result_ptr: u32,
 ) -> Result<i32, RuntimeError> {
     let mut result_id = 0u32;
-    let status = bridge(&mut env, napi_env, |env_handle| unsafe {
+    let status = bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_module_wrap_evaluate(
             env_handle,
             handle,
@@ -1901,14 +1912,14 @@ fn guest_unofficial_napi_module_wrap_evaluate(
         )
     })?;
     if status == 0 && result_ptr != 0 {
-        write_guest_u32(&mut env, result_ptr, result_id);
+        cx.with(|mut env| write_guest_u32(&mut env, result_ptr, result_id));
     }
     Ok(status)
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_module_wrap_evaluate_sync(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_module_wrap_evaluate_sync(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     handle: u32,
     filename: u32,
@@ -1916,7 +1927,7 @@ fn guest_unofficial_napi_module_wrap_evaluate_sync(
     result_ptr: u32,
 ) -> Result<i32, RuntimeError> {
     let mut result_id = 0u32;
-    let status = bridge(&mut env, napi_env, |env_handle| unsafe {
+    let status = bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_module_wrap_evaluate_sync(
             env_handle,
             handle,
@@ -1926,7 +1937,7 @@ fn guest_unofficial_napi_module_wrap_evaluate_sync(
         )
     })?;
     if status == 0 && result_ptr != 0 {
-        write_guest_u32(&mut env, result_ptr, result_id);
+        cx.with(|mut env| write_guest_u32(&mut env, result_ptr, result_id));
     }
     Ok(status)
 }
@@ -1995,8 +2006,8 @@ fn guest_unofficial_napi_module_wrap_get_state(
     status
 }
 
-fn guest_unofficial_napi_module_wrap_check_unsettled_top_level_await(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_module_wrap_check_unsettled_top_level_await(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     handle: u32,
     warnings: i32,
@@ -2006,7 +2017,7 @@ fn guest_unofficial_napi_module_wrap_check_unsettled_top_level_await(
     let mut settled = 0i32;
     // Printing a stalled await formats its source line, which runs the
     // source-map callback (see unofficial_napi_get_error_metadata).
-    let status = bridge(&mut env, napi_env, |env_handle| unsafe {
+    let status = bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_module_wrap_check_unsettled_top_level_await(
             env_handle,
             handle_id,
@@ -2015,7 +2026,7 @@ fn guest_unofficial_napi_module_wrap_check_unsettled_top_level_await(
         )
     })?;
     if status == 0 && settled_ptr != 0 {
-        write_guest_u8(&mut env, settled_ptr, (settled != 0) as u8);
+        cx.with(|mut env| write_guest_u8(&mut env, settled_ptr, (settled != 0) as u8));
     }
     Ok(status)
 }
@@ -2076,19 +2087,19 @@ fn guest_unofficial_napi_module_wrap_get_module_source_object(
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_module_wrap_create_cached_data(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_module_wrap_create_cached_data(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     handle: u32,
     result_ptr: u32,
 ) -> Result<i32, RuntimeError> {
     let mut result_id = 0u32;
     // Packaging cache bytes can call the guest's Buffer.from.
-    let status = bridge(&mut env, napi_env, |env_handle| unsafe {
+    let status = bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_module_wrap_create_cached_data(env_handle, handle, &mut result_id)
     })?;
     if status == 0 && result_ptr != 0 {
-        write_guest_u32(&mut env, result_ptr, result_id);
+        cx.with(|mut env| write_guest_u32(&mut env, result_ptr, result_id));
     }
     Ok(status)
 }
@@ -2114,14 +2125,14 @@ fn guest_unofficial_napi_module_wrap_set_hooks(
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_unofficial_napi_module_wrap_create_required_module_facade(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_module_wrap_create_required_module_facade(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     handle: u32,
     result_ptr: u32,
 ) -> Result<i32, RuntimeError> {
     let mut result_id = 0u32;
-    let status = bridge(&mut env, napi_env, |env_handle| unsafe {
+    let status = bridge(cx, napi_env, |env_handle| unsafe {
         snapi_bridge_unofficial_module_wrap_create_required_module_facade(
             env_handle,
             handle,
@@ -2129,7 +2140,7 @@ fn guest_unofficial_napi_module_wrap_create_required_module_facade(
         )
     })?;
     if status == 0 && result_ptr != 0 {
-        write_guest_u32(&mut env, result_ptr, result_id);
+        cx.with(|mut env| write_guest_u32(&mut env, result_ptr, result_id));
     }
     Ok(status)
 }
@@ -2648,19 +2659,19 @@ guest_is_check!(guest_napi_is_promise, snapi_bridge_is_promise);
 // Symbol.hasInstance and a proxy's getPrototypeOf trap can run author code,
 // which may call back into the guest: this lends the store.
 #[allow(clippy::result_large_err)]
-fn guest_napi_instanceof(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_instanceof(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     obj: u32,
     ctor: u32,
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
-    let s = bridge(&mut env, e, |snapi| unsafe {
+    let s = bridge(cx, e, |snapi| unsafe {
         snapi_bridge_instanceof(snapi, obj, ctor, &mut r)
     })?;
     if s == 0 {
-        write_guest_u8(&mut env, rp, r as u8);
+        cx.with(|mut env| write_guest_u8(&mut env, rp, r as u8));
     }
     Ok(s)
 }
@@ -2672,16 +2683,16 @@ macro_rules! guest_coerce {
     // which may call back into the guest.
     ($name:ident, $bridge:ident) => {
         #[allow(clippy::result_large_err)]
-        fn $name(
-            mut env: FunctionEnvMut<NapiEnv>,
+        async fn $name(
+            cx: &mut AsyncEnv<NapiEnv>,
             e: u32,
             vh: u32,
             rp: u32,
         ) -> Result<i32, RuntimeError> {
             let mut out: u32 = 0;
-            let s = bridge(&mut env, e, |snapi| unsafe { $bridge(snapi, vh, &mut out) })?;
+            let s = bridge(cx, e, |snapi| unsafe { $bridge(snapi, vh, &mut out) })?;
             if s == 0 {
-                write_guest_u32(&mut env, rp, out);
+                cx.with(|mut env| write_guest_u32(&mut env, rp, out));
             }
             Ok(s)
         }
@@ -2707,193 +2718,193 @@ guest_coerce!(no_js guest_napi_coerce_to_object, snapi_bridge_coerce_to_object);
 // --- Object operations ---
 
 #[allow(clippy::result_large_err)]
-fn guest_napi_set_property(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_set_property(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     o: u32,
     k: u32,
     v: u32,
 ) -> Result<i32, RuntimeError> {
-    bridge(&mut env, e, |snapi| unsafe {
+    bridge(cx, e, |snapi| unsafe {
         snapi_bridge_set_property(snapi, o, k, v)
     })
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_napi_get_property(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_get_property(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     o: u32,
     k: u32,
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
-    let s = bridge(&mut env, e, |snapi| unsafe {
+    let s = bridge(cx, e, |snapi| unsafe {
         snapi_bridge_get_property(snapi, o, k, &mut out)
     })?;
     if s == 0 {
-        write_guest_u32(&mut env, rp, out);
+        cx.with(|mut env| write_guest_u32(&mut env, rp, out));
     }
     Ok(s)
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_napi_has_property(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_has_property(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     o: u32,
     k: u32,
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
-    let s = bridge(&mut env, e, |snapi| unsafe {
+    let s = bridge(cx, e, |snapi| unsafe {
         snapi_bridge_has_property(snapi, o, k, &mut r)
     })?;
     if s == 0 {
-        write_guest_u8(&mut env, rp, r as u8);
+        cx.with(|mut env| write_guest_u8(&mut env, rp, r as u8));
     }
     Ok(s)
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_napi_has_own_property(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_has_own_property(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     o: u32,
     k: u32,
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
-    let s = bridge(&mut env, e, |snapi| unsafe {
+    let s = bridge(cx, e, |snapi| unsafe {
         snapi_bridge_has_own_property(snapi, o, k, &mut r)
     })?;
     if s == 0 {
-        write_guest_u8(&mut env, rp, r as u8);
+        cx.with(|mut env| write_guest_u8(&mut env, rp, r as u8));
     }
     Ok(s)
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_napi_delete_property(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_delete_property(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     o: u32,
     k: u32,
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
-    let s = bridge(&mut env, e, |snapi| unsafe {
+    let s = bridge(cx, e, |snapi| unsafe {
         snapi_bridge_delete_property(snapi, o, k, &mut r)
     })?;
     if s == 0 {
-        write_guest_u8(&mut env, rp, r as u8);
+        cx.with(|mut env| write_guest_u8(&mut env, rp, r as u8));
     }
     Ok(s)
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_napi_set_named_property(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_set_named_property(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     o: u32,
     np: u32,
     v: u32,
 ) -> Result<i32, RuntimeError> {
-    let Some(cn) = GuestName::read(&mut env, np) else {
+    let Some(cn) = cx.with(|mut env| GuestName::read(&mut env, np)) else {
         return Ok(1);
     };
-    bridge(&mut env, e, |snapi| unsafe {
+    bridge(cx, e, |snapi| unsafe {
         snapi_bridge_set_named_property(snapi, o, cn.as_ptr(), v)
     })
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_napi_get_named_property(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_get_named_property(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     o: u32,
     np: u32,
     rp: u32,
 ) -> Result<i32, RuntimeError> {
-    let Some(cn) = GuestName::read(&mut env, np) else {
+    let Some(cn) = cx.with(|mut env| GuestName::read(&mut env, np)) else {
         return Ok(1);
     };
     let mut out: u32 = 0;
-    let s = bridge(&mut env, e, |snapi| unsafe {
+    let s = bridge(cx, e, |snapi| unsafe {
         snapi_bridge_get_named_property(snapi, o, cn.as_ptr(), &mut out)
     })?;
     if s == 0 {
-        write_guest_u32(&mut env, rp, out);
+        cx.with(|mut env| write_guest_u32(&mut env, rp, out));
     }
     Ok(s)
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_napi_has_named_property(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_has_named_property(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     o: u32,
     np: u32,
     rp: u32,
 ) -> Result<i32, RuntimeError> {
-    let Some(cn) = GuestName::read(&mut env, np) else {
+    let Some(cn) = cx.with(|mut env| GuestName::read(&mut env, np)) else {
         return Ok(1);
     };
     let mut r: i32 = 0;
-    let s = bridge(&mut env, e, |snapi| unsafe {
+    let s = bridge(cx, e, |snapi| unsafe {
         snapi_bridge_has_named_property(snapi, o, cn.as_ptr(), &mut r)
     })?;
     if s == 0 {
-        write_guest_u8(&mut env, rp, r as u8);
+        cx.with(|mut env| write_guest_u8(&mut env, rp, r as u8));
     }
     Ok(s)
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_napi_set_element(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_set_element(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     o: u32,
     idx: u32,
     v: u32,
 ) -> Result<i32, RuntimeError> {
-    bridge(&mut env, e, |snapi| unsafe {
+    bridge(cx, e, |snapi| unsafe {
         snapi_bridge_set_element(snapi, o, idx, v)
     })
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_napi_get_element(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_get_element(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     o: u32,
     idx: u32,
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
-    let s = bridge(&mut env, e, |snapi| unsafe {
+    let s = bridge(cx, e, |snapi| unsafe {
         snapi_bridge_get_element(snapi, o, idx, &mut out)
     })?;
     if s == 0 {
-        write_guest_u32(&mut env, rp, out);
+        cx.with(|mut env| write_guest_u32(&mut env, rp, out));
     }
     Ok(s)
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_napi_has_element(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_has_element(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     o: u32,
     idx: u32,
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
-    let s = bridge(&mut env, e, |snapi| unsafe {
+    let s = bridge(cx, e, |snapi| unsafe {
         snapi_bridge_has_element(snapi, o, idx, &mut r)
     })?;
     if s == 0 {
-        write_guest_u8(&mut env, rp, r as u8);
+        cx.with(|mut env| write_guest_u8(&mut env, rp, r as u8));
     }
     Ok(s)
 }
@@ -2933,19 +2944,19 @@ impl GuestName {
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_napi_delete_element(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_delete_element(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     o: u32,
     idx: u32,
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
-    let s = bridge(&mut env, e, |snapi| unsafe {
+    let s = bridge(cx, e, |snapi| unsafe {
         snapi_bridge_delete_element(snapi, o, idx, &mut r)
     })?;
     if s == 0 {
-        write_guest_u8(&mut env, rp, r as u8);
+        cx.with(|mut env| write_guest_u8(&mut env, rp, r as u8));
     }
     Ok(s)
 }
@@ -2960,26 +2971,26 @@ fn guest_napi_get_array_length(mut env: FunctionEnvMut<NapiEnv>, e: u32, ah: u32
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_napi_get_property_names(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_get_property_names(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     o: u32,
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
     // Property enumeration can synchronously invoke a Proxy's ownKeys trap.
-    let s = bridge(&mut env, e, |snapi| unsafe {
+    let s = bridge(cx, e, |snapi| unsafe {
         snapi_bridge_get_property_names(snapi, o, &mut out)
     })?;
     if s == 0 {
-        write_guest_u32(&mut env, rp, out);
+        cx.with(|mut env| write_guest_u32(&mut env, rp, out));
     }
     Ok(s)
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_napi_get_all_property_names(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_get_all_property_names(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     o: u32,
     mode: i32,
@@ -2989,11 +3000,11 @@ fn guest_napi_get_all_property_names(
 ) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
     // Property enumeration can synchronously invoke a Proxy's ownKeys trap.
-    let s = bridge(&mut env, e, |snapi| unsafe {
+    let s = bridge(cx, e, |snapi| unsafe {
         snapi_bridge_get_all_property_names(snapi, o, mode, filter, conversion, &mut out)
     })?;
     if s == 0 {
-        write_guest_u32(&mut env, rp, out);
+        cx.with(|mut env| write_guest_u32(&mut env, rp, out));
     }
     Ok(s)
 }
@@ -3010,25 +3021,23 @@ fn guest_napi_get_prototype(mut env: FunctionEnvMut<NapiEnv>, e: u32, o: u32, rp
 // Freezing or sealing a Proxy runs its traps, so both run in the callback
 // context.
 #[allow(clippy::result_large_err)]
-fn guest_napi_object_freeze(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_object_freeze(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     o: u32,
 ) -> Result<i32, RuntimeError> {
-    bridge(&mut env, e, |snapi| unsafe {
+    bridge(cx, e, |snapi| unsafe {
         snapi_bridge_object_freeze(snapi, o)
     })
 }
 
 #[allow(clippy::result_large_err)]
-fn guest_napi_object_seal(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_object_seal(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     o: u32,
 ) -> Result<i32, RuntimeError> {
-    bridge(&mut env, e, |snapi| unsafe {
-        snapi_bridge_object_seal(snapi, o)
-    })
+    bridge(cx, e, |snapi| unsafe { snapi_bridge_object_seal(snapi, o) })
 }
 
 // --- Comparison ---
@@ -3150,17 +3159,17 @@ fn guest_napi_is_exception_pending(mut env: FunctionEnvMut<NapiEnv>, e: u32, rp:
 // Taking the exception formats its source line, which runs the source-map
 // callback (see unofficial_napi_get_error_metadata).
 #[allow(clippy::result_large_err)]
-fn guest_napi_get_and_clear_last_exception(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_get_and_clear_last_exception(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
-    let s = bridge(&mut env, e, |snapi| unsafe {
+    let s = bridge(cx, e, |snapi| unsafe {
         snapi_bridge_get_and_clear_last_exception(snapi, &mut out)
     })?;
     if s == 0 {
-        write_guest_u32(&mut env, rp, out);
+        cx.with(|mut env| write_guest_u32(&mut env, rp, out));
     }
     Ok(s)
 }
@@ -3170,20 +3179,20 @@ fn guest_napi_get_and_clear_last_exception(
 // Creating a promise runs the env's promise init hook, if one is set, and
 // that hook may call guest functions.
 #[allow(clippy::result_large_err)]
-fn guest_napi_create_promise(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_create_promise(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     dp: u32,
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut deferred_id: u32 = 0;
     let mut promise_id: u32 = 0;
-    let s = bridge(&mut env, e, |snapi| unsafe {
+    let s = bridge(cx, e, |snapi| unsafe {
         snapi_bridge_create_promise(snapi, &mut deferred_id, &mut promise_id)
     })?;
     if s == 0 {
-        write_guest_u32(&mut env, dp, deferred_id);
-        write_guest_u32(&mut env, rp, promise_id);
+        cx.with(|mut env| write_guest_u32(&mut env, dp, deferred_id));
+        cx.with(|mut env| write_guest_u32(&mut env, rp, promise_id));
     }
     Ok(s)
 }
@@ -3191,13 +3200,13 @@ fn guest_napi_create_promise(
 // Resolving reads the value's `then` at once, which can run a getter or a
 // Proxy trap, so this runs in the callback context.
 #[allow(clippy::result_large_err)]
-fn guest_napi_resolve_deferred(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_resolve_deferred(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     d: u32,
     v: u32,
 ) -> Result<i32, RuntimeError> {
-    bridge(&mut env, e, |snapi| unsafe {
+    bridge(cx, e, |snapi| unsafe {
         snapi_bridge_resolve_deferred(snapi, d, v)
     })
 }
@@ -3205,13 +3214,13 @@ fn guest_napi_resolve_deferred(
 // Rejecting a promise that has no handler runs the env's promise-reject
 // callback before returning, and that callback may call guest functions.
 #[allow(clippy::result_large_err)]
-fn guest_napi_reject_deferred(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_reject_deferred(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     d: u32,
     v: u32,
 ) -> Result<i32, RuntimeError> {
-    bridge(&mut env, e, |snapi| unsafe {
+    bridge(cx, e, |snapi| unsafe {
         snapi_bridge_reject_deferred(snapi, d, v)
     })
 }
@@ -3481,15 +3490,15 @@ fn guest_node_api_create_sharedarraybuffer(
 // Setting a Proxy's prototype runs its `setPrototypeOf` trap, so this runs in
 // the callback context.
 #[allow(clippy::result_large_err)]
-fn guest_node_api_set_prototype(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_node_api_set_prototype(
+    cx: &mut AsyncEnv<NapiEnv>,
     napi_env: u32,
     object: u32,
     prototype: u32,
 ) -> Result<i32, RuntimeError> {
     let object_id = object;
     let prototype_id = prototype;
-    bridge(&mut env, napi_env, |snapi| unsafe {
+    bridge(cx, napi_env, |snapi| unsafe {
         snapi_bridge_node_api_set_prototype(snapi, object_id, prototype_id)
     })
 }
@@ -3780,8 +3789,8 @@ fn guest_napi_check_object_type_tag(
 // --- Function calling ---
 
 #[allow(clippy::result_large_err)]
-fn guest_napi_call_function(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_call_function(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     recv: u32,
     func: u32,
@@ -3791,7 +3800,9 @@ fn guest_napi_call_function(
 ) -> Result<i32, RuntimeError> {
     let argc_u = argc;
     let argv_ids = if argc_u > 0 {
-        let Some(ids) = read_guest_u32_array(&mut env, argv_ptr, argc_u as usize) else {
+        let Some(ids) =
+            cx.with(|mut env| read_guest_u32_array(&mut env, argv_ptr, argc_u as usize))
+        else {
             return Ok(1);
         };
         ids
@@ -3800,12 +3811,12 @@ fn guest_napi_call_function(
     };
 
     let mut out: u32 = 0;
-    let s = bridge(&mut env, e, |snapi| unsafe {
+    let s = bridge(cx, e, |snapi| unsafe {
         snapi_bridge_call_function(snapi, recv, func, argc_u, argv_ids.as_ptr(), &mut out)
     })?;
 
     if s == 0 {
-        write_guest_u32(&mut env, rp, out);
+        cx.with(|mut env| write_guest_u32(&mut env, rp, out));
     }
     Ok(s)
 }
@@ -4246,14 +4257,14 @@ fn guest_napi_define_class(
 // Defining a property on a Proxy runs its `defineProperty` trap, so the
 // definition runs in the callback context.
 #[allow(clippy::result_large_err)]
-fn guest_napi_define_properties(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_define_properties(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     obj: u32,
     prop_count: u32,
     props_ptr: u32,
 ) -> Result<i32, RuntimeError> {
-    let snapi = snapi_env(&env, e);
+    let snapi = cx.with(|env| snapi_env(&env, e));
     let pc = prop_count;
     if pc == 0 {
         return Ok(unsafe {
@@ -4274,13 +4285,13 @@ fn guest_napi_define_properties(
     }
 
     let total_bytes = pc as usize * PROP_DESC_SIZE;
-    let Some(raw) = read_guest_bytes(&mut env, props_ptr, total_bytes) else {
+    let Some(raw) = cx.with(|mut env| read_guest_bytes(&mut env, props_ptr, total_bytes)) else {
         return Ok(1);
     };
     // The per-property arrays below and every name, however short, stay
     // charged until the bridge call returns.
     let mut names_charge = TransientCharge::default();
-    if !names_charge.add(&env.data().budget, pc as usize * PROP_SCRATCH_BYTES) {
+    if !cx.with(|env| names_charge.add(&env.data().budget, pc as usize * PROP_SCRATCH_BYTES)) {
         return Ok(1);
     }
 
@@ -4334,7 +4345,9 @@ fn guest_napi_define_properties(
         ]);
 
         let pname = if utf8name_guest != 0 {
-            match try_read_guest_c_string_max(&mut env, utf8name_guest, V8_MAX_STRING_BYTES) {
+            match cx.with(|mut env| {
+                try_read_guest_c_string_max(&mut env, utf8name_guest, V8_MAX_STRING_BYTES)
+            }) {
                 Ok(name) => name.unwrap_or_default(),
                 Err(CopyRefused) => return Ok(9),
             }
@@ -4344,7 +4357,7 @@ fn guest_napi_define_properties(
         let (pname, pname_charge) = pname.into_parts();
         names_charge.absorb(pname_charge);
         if pname.len() < UNCHARGED_HOST_COPY_BYTES
-            && !names_charge.add(&env.data().budget, pname.len() + 1)
+            && !cx.with(|env| names_charge.add(&env.data().budget, pname.len() + 1))
         {
             return Ok(1);
         }
@@ -4426,7 +4439,7 @@ fn guest_napi_define_properties(
         prop_names_ptrs.push(cn.as_ptr());
     }
 
-    bridge(&mut env, e, |snapi| unsafe {
+    bridge(cx, e, |snapi| unsafe {
         snapi_bridge_define_properties(
             snapi,
             obj,
@@ -4446,19 +4459,19 @@ fn guest_napi_define_properties(
 // --- Script execution ---
 
 #[allow(clippy::result_large_err)]
-fn guest_napi_run_script(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_run_script(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     sh: u32,
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
-    let s = bridge(&mut env, e, |snapi| unsafe {
+    let s = bridge(cx, e, |snapi| unsafe {
         snapi_bridge_run_script(snapi, sh, &mut out)
     })?;
 
     if s == 0 {
-        write_guest_u32(&mut env, rp, out);
+        cx.with(|mut env| write_guest_u32(&mut env, rp, out));
     }
     Ok(s)
 }
@@ -4983,8 +4996,8 @@ fn guest_unofficial_napi_release_buffer_lease(
 // A zero-filled Uint8Array placed as a guest-backed typed array, given
 // `prototype` (an embedder's Buffer.prototype) when that is not 0: a Node
 // Buffer in one import, without the provider knowing Buffer.
-fn guest_unofficial_napi_create_uint8array(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_create_uint8array(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     length: u32,
     prototype: u32,
@@ -5000,7 +5013,7 @@ fn guest_unofficial_napi_create_uint8array(
     // guest's memory only with the store this lends. The provider allocates
     // fallibly: at the memory's limit this is napi_generic_failure, not a
     // process abort.
-    let status = bridge(&mut env, e, |snapi| unsafe {
+    let status = bridge(cx, e, |snapi| unsafe {
         snapi_bridge_unofficial_create_uint8array(
             snapi,
             length,
@@ -5014,19 +5027,19 @@ fn guest_unofficial_napi_create_uint8array(
     }
     let guest_ptr = if length == 0 {
         0
-    } else if let Some(ptr) = host_ptr_to_guest_ptr(&mut env, host_ptr) {
+    } else if let Some(ptr) = cx.with(|mut env| host_ptr_to_guest_ptr(&mut env, host_ptr)) {
         ptr
     } else {
         return Ok(9);
     };
-    write_guest_u32(&mut env, data_out, guest_ptr);
-    write_guest_u32(&mut env, result_out, value_id);
+    cx.with(|mut env| write_guest_u32(&mut env, data_out, guest_ptr));
+    cx.with(|mut env| write_guest_u32(&mut env, result_out, value_id));
     Ok(0)
 }
 
 // A Uint8Array holding a copy of guest bytes, with no pointer back.
-fn guest_unofficial_napi_create_uint8array_copy(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_unofficial_napi_create_uint8array_copy(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     data_ptr: u32,
     length: u32,
@@ -5036,13 +5049,14 @@ fn guest_unofficial_napi_create_uint8array_copy(
     if result_out == 0 || (length > 0 && data_ptr == 0) {
         return Ok(1);
     }
-    let Some(bytes) = read_guest_bytes(&mut env, data_ptr, length as usize) else {
+    let Some(bytes) = cx.with(|mut env| read_guest_bytes(&mut env, data_ptr, length as usize))
+    else {
         return Ok(1);
     };
     let mut value_id = 0u32;
     // As unofficial_napi_create_uint8array: lend the store so the guest heap
     // can grow, and fail rather than abort at its limit.
-    let status = bridge(&mut env, e, |snapi| unsafe {
+    let status = bridge(cx, e, |snapi| unsafe {
         snapi_bridge_unofficial_create_uint8array_copy(
             snapi,
             if bytes.is_empty() {
@@ -5056,7 +5070,7 @@ fn guest_unofficial_napi_create_uint8array_copy(
         )
     })?;
     if status == 0 {
-        write_guest_u32(&mut env, result_out, value_id);
+        cx.with(|mut env| write_guest_u32(&mut env, result_out, value_id));
     }
     Ok(status)
 }
@@ -5311,8 +5325,8 @@ fn guest_napi_fatal_error(
 // --- Constructor ---
 
 #[allow(clippy::result_large_err)]
-fn guest_napi_new_instance(
-    mut env: FunctionEnvMut<NapiEnv>,
+async fn guest_napi_new_instance(
+    cx: &mut AsyncEnv<NapiEnv>,
     e: u32,
     ctor: u32,
     argc: u32,
@@ -5321,7 +5335,9 @@ fn guest_napi_new_instance(
 ) -> Result<i32, RuntimeError> {
     let argc_u = argc;
     let argv_ids = if argc_u > 0 {
-        let Some(ids) = read_guest_u32_array(&mut env, argv_ptr, argc_u as usize) else {
+        let Some(ids) =
+            cx.with(|mut env| read_guest_u32_array(&mut env, argv_ptr, argc_u as usize))
+        else {
             return Ok(1);
         };
         ids
@@ -5330,12 +5346,12 @@ fn guest_napi_new_instance(
     };
 
     let mut out: u32 = 0;
-    let s = bridge(&mut env, e, |snapi| unsafe {
+    let s = bridge(cx, e, |snapi| unsafe {
         snapi_bridge_new_instance(snapi, ctor, argc_u, argv_ids.as_ptr(), &mut out)
     })?;
 
     if s == 0 {
-        write_guest_u32(&mut env, rp, out);
+        cx.with(|mut env| write_guest_u32(&mut env, rp, out));
     }
     Ok(s)
 }
@@ -5479,10 +5495,12 @@ pub(crate) fn is_known_napi_import(name: &str) -> bool {
     )
 }
 
-/// The handlers are synchronous host functions. Wasmer runs those on the
-/// stack of whoever runs the guest's call, or polls it if it is an async one,
-/// and V8 needs that: it only runs on the stack its thread started with, and
-/// aborts anywhere else ("Check failed: IsOnCentralStack()").
+/// A handler that may run JavaScript is an async host function (see
+/// [`bridge`]), which never waits; every other one is synchronous. Wasmer
+/// runs both on the stack of whoever runs the guest's call, or polls it if
+/// it is an async one, and V8 needs that: it only runs on the stack its
+/// thread started with, and aborts anywhere else ("Check failed:
+/// IsOnCentralStack()").
 pub fn register_napi_imports(
     store: &mut impl AsStoreMut,
     fe: &FunctionEnv<NapiEnv>,
@@ -5516,7 +5534,7 @@ pub fn register_napi_imports(
         "napi_create_external_buffer" => Function::new_typed_with_env(store, fe, guest_napi_create_external_buffer),
         "napi_create_typedarray" => Function::new_typed_with_env(store, fe, guest_napi_create_typedarray),
         "napi_create_dataview" => Function::new_typed_with_env(store, fe, guest_napi_create_dataview),
-        "napi_create_promise" => Function::new_typed_with_env(store, fe, guest_napi_create_promise),
+        "napi_create_promise" => Function::new_typed_async(store, fe, guest_napi_create_promise),
         "napi_get_value_string_utf8" => Function::new_typed_with_env(store, fe, guest_napi_get_value_string_utf8),
         "napi_get_value_string_latin1" => Function::new_typed_with_env(store, fe, guest_napi_get_value_string_latin1),
         "napi_get_value_int32" => Function::new_typed_with_env(store, fe, guest_napi_get_value_int32),
@@ -5536,44 +5554,44 @@ pub fn register_napi_imports(
         "napi_is_dataview" => Function::new_typed_with_env(store, fe, guest_napi_is_dataview),
         "napi_is_date" => Function::new_typed_with_env(store, fe, guest_napi_is_date),
         "napi_is_promise" => Function::new_typed_with_env(store, fe, guest_napi_is_promise),
-        "napi_instanceof" => Function::new_typed_with_env(store, fe, guest_napi_instanceof),
+        "napi_instanceof" => Function::new_typed_async(store, fe, guest_napi_instanceof),
         "napi_coerce_to_bool" => Function::new_typed_with_env(store, fe, guest_napi_coerce_to_bool),
-        "napi_coerce_to_number" => Function::new_typed_with_env(store, fe, guest_napi_coerce_to_number),
-        "napi_coerce_to_string" => Function::new_typed_with_env(store, fe, guest_napi_coerce_to_string),
+        "napi_coerce_to_number" => Function::new_typed_async(store, fe, guest_napi_coerce_to_number),
+        "napi_coerce_to_string" => Function::new_typed_async(store, fe, guest_napi_coerce_to_string),
         "napi_coerce_to_object" => Function::new_typed_with_env(store, fe, guest_napi_coerce_to_object),
-        "napi_set_property" => Function::new_typed_with_env(store, fe, guest_napi_set_property),
-        "napi_get_property" => Function::new_typed_with_env(store, fe, guest_napi_get_property),
-        "napi_has_property" => Function::new_typed_with_env(store, fe, guest_napi_has_property),
-        "napi_has_own_property" => Function::new_typed_with_env(store, fe, guest_napi_has_own_property),
-        "napi_delete_property" => Function::new_typed_with_env(store, fe, guest_napi_delete_property),
-        "napi_set_named_property" => Function::new_typed_with_env(store, fe, guest_napi_set_named_property),
-        "napi_get_named_property" => Function::new_typed_with_env(store, fe, guest_napi_get_named_property),
-        "napi_has_named_property" => Function::new_typed_with_env(store, fe, guest_napi_has_named_property),
-        "napi_set_element" => Function::new_typed_with_env(store, fe, guest_napi_set_element),
-        "napi_get_element" => Function::new_typed_with_env(store, fe, guest_napi_get_element),
-        "napi_has_element" => Function::new_typed_with_env(store, fe, guest_napi_has_element),
-        "napi_delete_element" => Function::new_typed_with_env(store, fe, guest_napi_delete_element),
+        "napi_set_property" => Function::new_typed_async(store, fe, guest_napi_set_property),
+        "napi_get_property" => Function::new_typed_async(store, fe, guest_napi_get_property),
+        "napi_has_property" => Function::new_typed_async(store, fe, guest_napi_has_property),
+        "napi_has_own_property" => Function::new_typed_async(store, fe, guest_napi_has_own_property),
+        "napi_delete_property" => Function::new_typed_async(store, fe, guest_napi_delete_property),
+        "napi_set_named_property" => Function::new_typed_async(store, fe, guest_napi_set_named_property),
+        "napi_get_named_property" => Function::new_typed_async(store, fe, guest_napi_get_named_property),
+        "napi_has_named_property" => Function::new_typed_async(store, fe, guest_napi_has_named_property),
+        "napi_set_element" => Function::new_typed_async(store, fe, guest_napi_set_element),
+        "napi_get_element" => Function::new_typed_async(store, fe, guest_napi_get_element),
+        "napi_has_element" => Function::new_typed_async(store, fe, guest_napi_has_element),
+        "napi_delete_element" => Function::new_typed_async(store, fe, guest_napi_delete_element),
         "napi_get_array_length" => Function::new_typed_with_env(store, fe, guest_napi_get_array_length),
-        "napi_get_property_names" => Function::new_typed_with_env(store, fe, guest_napi_get_property_names),
-        "napi_get_all_property_names" => Function::new_typed_with_env(store, fe, guest_napi_get_all_property_names),
+        "napi_get_property_names" => Function::new_typed_async(store, fe, guest_napi_get_property_names),
+        "napi_get_all_property_names" => Function::new_typed_async(store, fe, guest_napi_get_all_property_names),
         "napi_get_prototype" => Function::new_typed_with_env(store, fe, guest_napi_get_prototype),
-        "napi_object_freeze" => Function::new_typed_with_env(store, fe, guest_napi_object_freeze),
-        "napi_object_seal" => Function::new_typed_with_env(store, fe, guest_napi_object_seal),
+        "napi_object_freeze" => Function::new_typed_async(store, fe, guest_napi_object_freeze),
+        "napi_object_seal" => Function::new_typed_async(store, fe, guest_napi_object_seal),
         "napi_strict_equals" => Function::new_typed_with_env(store, fe, guest_napi_strict_equals),
         "napi_throw" => Function::new_typed_with_env(store, fe, guest_napi_throw),
         "napi_throw_error" => Function::new_typed_with_env(store, fe, guest_napi_throw_error),
         "napi_throw_type_error" => Function::new_typed_with_env(store, fe, guest_napi_throw_type_error),
         "napi_throw_range_error" => Function::new_typed_with_env(store, fe, guest_napi_throw_range_error),
         "napi_is_exception_pending" => Function::new_typed_with_env(store, fe, guest_napi_is_exception_pending),
-        "napi_get_and_clear_last_exception" => Function::new_typed_with_env(store, fe, guest_napi_get_and_clear_last_exception),
-        "napi_resolve_deferred" => Function::new_typed_with_env(store, fe, guest_napi_resolve_deferred),
-        "napi_reject_deferred" => Function::new_typed_with_env(store, fe, guest_napi_reject_deferred),
+        "napi_get_and_clear_last_exception" => Function::new_typed_async(store, fe, guest_napi_get_and_clear_last_exception),
+        "napi_resolve_deferred" => Function::new_typed_async(store, fe, guest_napi_resolve_deferred),
+        "napi_reject_deferred" => Function::new_typed_async(store, fe, guest_napi_reject_deferred),
         "napi_get_arraybuffer_info" => Function::new_typed_with_env(store, fe, guest_napi_get_arraybuffer_info),
         "napi_detach_arraybuffer" => Function::new_typed_with_env(store, fe, guest_napi_detach_arraybuffer),
         "napi_is_detached_arraybuffer" => Function::new_typed_with_env(store, fe, guest_napi_is_detached_arraybuffer),
         "node_api_is_sharedarraybuffer" => Function::new_typed_with_env(store, fe, guest_node_api_is_sharedarraybuffer),
         "node_api_create_sharedarraybuffer" => Function::new_typed_with_env(store, fe, guest_node_api_create_sharedarraybuffer),
-        "node_api_set_prototype" => Function::new_typed_with_env(store, fe, guest_node_api_set_prototype),
+        "node_api_set_prototype" => Function::new_typed_async(store, fe, guest_node_api_set_prototype),
         "napi_get_typedarray_info" => Function::new_typed_with_env(store, fe, guest_napi_get_typedarray_info),
         "napi_get_dataview_info" => Function::new_typed_with_env(store, fe, guest_napi_get_dataview_info),
         "napi_create_reference" => Function::new_typed_with_env(store, fe, guest_napi_create_reference),
@@ -5588,11 +5606,11 @@ pub fn register_napi_imports(
         "napi_escape_handle" => Function::new_typed_with_env(store, fe, guest_napi_escape_handle),
         "napi_type_tag_object" => Function::new_typed_with_env(store, fe, guest_napi_type_tag_object),
         "napi_check_object_type_tag" => Function::new_typed_with_env(store, fe, guest_napi_check_object_type_tag),
-        "napi_call_function" => Function::new_typed_with_env(store, fe, guest_napi_call_function),
+        "napi_call_function" => Function::new_typed_async(store, fe, guest_napi_call_function),
         "napi_create_function" => Function::new_typed_with_env(store, fe, guest_napi_create_function),
         "napi_get_cb_info" => Function::new_typed_with_env(store, fe, guest_napi_get_cb_info),
         "napi_get_new_target" => Function::new_typed_with_env(store, fe, guest_napi_get_new_target),
-        "napi_run_script" => Function::new_typed_with_env(store, fe, guest_napi_run_script),
+        "napi_run_script" => Function::new_typed_async(store, fe, guest_napi_run_script),
         "napi_create_string_utf16" => Function::new_typed_with_env(store, fe, guest_napi_create_string_utf16),
         "napi_get_value_string_utf16" => Function::new_typed_with_env(store, fe, guest_napi_get_value_string_utf16),
         "napi_create_bigint_words" => Function::new_typed_with_env(store, fe, guest_napi_create_bigint_words),
@@ -5609,8 +5627,8 @@ pub fn register_napi_imports(
         "napi_unwrap" => Function::new_typed_with_env(store, fe, guest_napi_unwrap),
         "napi_remove_wrap" => Function::new_typed_with_env(store, fe, guest_napi_remove_wrap),
         "napi_add_finalizer" => Function::new_typed_with_env(store, fe, guest_napi_add_finalizer),
-        "napi_new_instance" => Function::new_typed_with_env(store, fe, guest_napi_new_instance),
-        "napi_define_properties" => Function::new_typed_with_env(store, fe, guest_napi_define_properties),
+        "napi_new_instance" => Function::new_typed_async(store, fe, guest_napi_new_instance),
+        "napi_define_properties" => Function::new_typed_async(store, fe, guest_napi_define_properties),
         "napi_define_class" => Function::new_typed_with_env(store, fe, guest_napi_define_class),
         "napi_fatal_error" => Function::new_typed_with_env(store, fe, guest_napi_fatal_error),
         "napi_get_last_error_info" => Function::new_typed_with_env(store, fe, guest_napi_get_last_error_info),
@@ -5624,16 +5642,16 @@ pub fn register_napi_imports(
         "unofficial_napi_create_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_env),
         "unofficial_napi_attach_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_attach_env),
         "unofficial_napi_set_env_cleanup_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_env_cleanup_callback),
-        "unofficial_napi_release_env" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_env),
+        "unofficial_napi_release_env" => Function::new_typed_async(store, fe, guest_unofficial_napi_release_env),
         "unofficial_napi_collect_garbage" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_collect_garbage),
         "unofficial_napi_memory_pressure" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_memory_pressure),
-        "unofficial_napi_event_loop_checkpoint" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_event_loop_checkpoint),
+        "unofficial_napi_event_loop_checkpoint" => Function::new_typed_async(store, fe, guest_unofficial_napi_event_loop_checkpoint),
         "unofficial_napi_create_uninitialized_arraybuffer" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uninitialized_arraybuffer),
         "unofficial_napi_acquire_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_acquire_buffer_lease),
         "unofficial_napi_release_buffer_lease" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_release_buffer_lease),
         "unofficial_napi_create_guest_backed_typedarray" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_guest_backed_typedarray),
-        "unofficial_napi_create_uint8array" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uint8array),
-        "unofficial_napi_create_uint8array_copy" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_uint8array_copy),
+        "unofficial_napi_create_uint8array" => Function::new_typed_async(store, fe, guest_unofficial_napi_create_uint8array),
+        "unofficial_napi_create_uint8array_copy" => Function::new_typed_async(store, fe, guest_unofficial_napi_create_uint8array_copy),
         "unofficial_napi_set_prepare_stack_trace_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_prepare_stack_trace_callback),
         "unofficial_napi_get_promise_details" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_promise_details),
         "unofficial_napi_get_proxy_details" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_proxy_details),
@@ -5647,24 +5665,24 @@ pub fn register_napi_imports(
         "unofficial_napi_notify_datetime_configuration_change" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_notify_datetime_configuration_change),
         "unofficial_napi_terminate_execution" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_terminate_execution),
         "unofficial_napi_cancel_terminate_execution" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_cancel_terminate_execution),
-        "unofficial_napi_request_interrupt" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_request_interrupt),
-        "unofficial_napi_structured_clone" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_structured_clone),
-        "unofficial_napi_message_create" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_create),
-        "unofficial_napi_message_take" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_take),
+        "unofficial_napi_request_interrupt" => Function::new_typed_async(store, fe, guest_unofficial_napi_request_interrupt),
+        "unofficial_napi_structured_clone" => Function::new_typed_async(store, fe, guest_unofficial_napi_structured_clone),
+        "unofficial_napi_message_create" => Function::new_typed_async(store, fe, guest_unofficial_napi_message_create),
+        "unofficial_napi_message_take" => Function::new_typed_async(store, fe, guest_unofficial_napi_message_take),
         "unofficial_napi_message_drop" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_message_drop),
         "unofficial_napi_create_trusted_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_trusted_script),
         "unofficial_napi_is_executing_js" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_is_executing_js),
         "unofficial_napi_enqueue_microtask" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_enqueue_microtask),
         "unofficial_napi_set_promise_reject_callback" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_reject_callback),
-        "unofficial_napi_get_own_non_index_properties" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_own_non_index_properties),
-        "unofficial_napi_define_lazy_data_properties" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_define_lazy_data_properties),
+        "unofficial_napi_get_own_non_index_properties" => Function::new_typed_async(store, fe, guest_unofficial_napi_get_own_non_index_properties),
+        "unofficial_napi_define_lazy_data_properties" => Function::new_typed_async(store, fe, guest_unofficial_napi_define_lazy_data_properties),
         "unofficial_napi_is_lazy_data_property" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_is_lazy_data_property),
         "unofficial_napi_set_promise_hooks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_set_promise_hooks),
         "unofficial_napi_get_hash_seed" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_hash_seed),
-        "unofficial_napi_get_error_metadata" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_error_metadata),
+        "unofficial_napi_get_error_metadata" => Function::new_typed_async(store, fe, guest_unofficial_napi_get_error_metadata),
         "unofficial_napi_configure_source_maps" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_configure_source_maps),
-        "unofficial_napi_preserve_error_source_message" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_preserve_error_source_message),
-        "unofficial_napi_mark_promise_as_handled" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_mark_promise_as_handled),
+        "unofficial_napi_preserve_error_source_message" => Function::new_typed_async(store, fe, guest_unofficial_napi_preserve_error_source_message),
+        "unofficial_napi_mark_promise_as_handled" => Function::new_typed_async(store, fe, guest_unofficial_napi_mark_promise_as_handled),
         "unofficial_napi_get_heap_statistics" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_heap_statistics),
         "unofficial_napi_get_heap_space_statistics" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_heap_space_statistics),
         "unofficial_napi_get_heap_code_statistics" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_heap_code_statistics),
@@ -5675,32 +5693,32 @@ pub fn register_napi_imports(
         "unofficial_napi_create_serdes_binding" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_serdes_binding),
         "unofficial_napi_contextify_contains_module_syntax" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_contains_module_syntax),
         "unofficial_napi_contextify_make_context" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_make_context),
-        "unofficial_napi_contextify_run_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_run_script),
-        "unofficial_napi_contextify_compile_function" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_contextify_compile_function),
+        "unofficial_napi_contextify_run_script" => Function::new_typed_async(store, fe, guest_unofficial_napi_contextify_run_script),
+        "unofficial_napi_contextify_compile_function" => Function::new_typed_async(store, fe, guest_unofficial_napi_contextify_compile_function),
         "unofficial_napi_create_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_create_realm),
         "unofficial_napi_get_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_get_realm),
         "unofficial_napi_enter_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_enter_realm),
         "unofficial_napi_leave_realm" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_leave_realm),
-        "unofficial_napi_run_script" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_run_script),
-        "unofficial_napi_compile_function" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_compile_function),
-        "unofficial_napi_bytecode_open" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_bytecode_open),
-        "unofficial_napi_bytecode_serialize" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_bytecode_serialize),
+        "unofficial_napi_run_script" => Function::new_typed_async(store, fe, guest_unofficial_napi_run_script),
+        "unofficial_napi_compile_function" => Function::new_typed_async(store, fe, guest_unofficial_napi_compile_function),
+        "unofficial_napi_bytecode_open" => Function::new_typed_async(store, fe, guest_unofficial_napi_bytecode_open),
+        "unofficial_napi_bytecode_serialize" => Function::new_typed_async(store, fe, guest_unofficial_napi_bytecode_serialize),
         "unofficial_napi_bytecode_release" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_bytecode_release),
-        "unofficial_napi_module_wrap_create" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create),
+        "unofficial_napi_module_wrap_create" => Function::new_typed_async(store, fe, guest_unofficial_napi_module_wrap_create),
         "unofficial_napi_module_wrap_destroy" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_destroy),
         "unofficial_napi_module_wrap_link" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_link),
-        "unofficial_napi_module_wrap_instantiate" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_instantiate),
-        "unofficial_napi_module_wrap_evaluate" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_evaluate),
-        "unofficial_napi_module_wrap_evaluate_sync" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_evaluate_sync),
+        "unofficial_napi_module_wrap_instantiate" => Function::new_typed_async(store, fe, guest_unofficial_napi_module_wrap_instantiate),
+        "unofficial_napi_module_wrap_evaluate" => Function::new_typed_async(store, fe, guest_unofficial_napi_module_wrap_evaluate),
+        "unofficial_napi_module_wrap_evaluate_sync" => Function::new_typed_async(store, fe, guest_unofficial_napi_module_wrap_evaluate_sync),
         "unofficial_napi_module_wrap_get_namespace" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_get_namespace),
         "unofficial_napi_module_wrap_get_state" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_get_state),
-        "unofficial_napi_module_wrap_check_unsettled_top_level_await" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_check_unsettled_top_level_await),
+        "unofficial_napi_module_wrap_check_unsettled_top_level_await" => Function::new_typed_async(store, fe, guest_unofficial_napi_module_wrap_check_unsettled_top_level_await),
         "unofficial_napi_module_wrap_set_export" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_set_export),
         "unofficial_napi_module_wrap_set_module_source_object" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_set_module_source_object),
         "unofficial_napi_module_wrap_get_module_source_object" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_get_module_source_object),
-        "unofficial_napi_module_wrap_create_cached_data" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_cached_data),
+        "unofficial_napi_module_wrap_create_cached_data" => Function::new_typed_async(store, fe, guest_unofficial_napi_module_wrap_create_cached_data),
         "unofficial_napi_module_wrap_set_hooks" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_set_hooks),
-        "unofficial_napi_module_wrap_create_required_module_facade" => Function::new_typed_with_env(store, fe, guest_unofficial_napi_module_wrap_create_required_module_facade),
+        "unofficial_napi_module_wrap_create_required_module_facade" => Function::new_typed_async(store, fe, guest_unofficial_napi_module_wrap_create_required_module_facade),
     };
 
     io.register_namespace(NAPI_MODULE_NAME, napi_namespace);

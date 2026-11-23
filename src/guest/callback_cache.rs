@@ -1,5 +1,5 @@
 //! Validated native callback dispatch, with generic compatibility fallback.
-use wasmer::{AsStoreRef, Function, RuntimeError, StoreMut, TypedFunction, Value};
+use wasmer::{AsStoreRef, AsyncCallStore, Function, RuntimeError, TypedFunction, Value};
 
 use super::drive::run_to_completion;
 
@@ -25,9 +25,12 @@ impl CachedGuestCallback {
     // The call is an async one that this thread stays in until it is done
     // (see `drive`): the guest may wait in one of its runtime's async imports,
     // and V8's frames below this one cannot be suspended.
+    //
+    // `store` is the import the bridge call belongs to (or, in a test, a
+    // store).
     pub(crate) fn call(
         &self,
-        store: &mut StoreMut<'_>,
+        store: &mut impl AsyncCallStore,
         env: u32,
         info: u32,
     ) -> Result<u32, RuntimeError> {
@@ -44,7 +47,7 @@ impl CachedGuestCallback {
 
     pub(crate) fn call_finalizer(
         &self,
-        store: &mut StoreMut<'_>,
+        store: &mut impl AsyncCallStore,
         env: u32,
         data: u32,
         hint: u32,
