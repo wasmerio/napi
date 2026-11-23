@@ -3,10 +3,15 @@
 //! values created in them, argument counts, missing arguments, settling a
 //! deferred (and settling it again from inside), Proxy traps, promise hooks
 //! and the source-map callback run by an import, a call that cannot reach the
-//! guest, raw return values, and envs created one after another on one
-//! thread.
+//! guest, raw return values, envs created one after another on one thread,
+//! and a guest that is called with `call_async`.
 
 #![cfg(not(target_arch = "wasm32"))]
+
+use std::{
+    pin::pin,
+    task::{Context, Poll, Waker},
+};
 
 use wasmer::{AsStoreMut, Engine, Imports, Instance, Memory, Module, Store, TypedFunction};
 use wasmer_napi::NapiCtx;
@@ -585,6 +590,37 @@ fn nested_callbacks_scopes_and_arguments() {
     let (ctx, engine, module) = setup();
     let mut guest = Guest::new(&ctx, &engine, &module);
     assert_eq!(guest.eval(ROUNDS), (0, 300, 0));
+    assert_eq!(guest.release(), 0);
+}
+
+/// A runtime that runs its guests with `call_async`, as a WASIX v2 machine
+/// does, still has their imports on the thread's own stack, the only one V8
+/// runs on: anywhere else it aborts the process ("Check failed:
+/// IsOnCentralStack()"). Compiling, throwing, collecting garbage and calling
+/// back into the guest all work there.
+#[test]
+fn imports_of_an_async_call_run_javascript() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    let script = "(() => { let caught = 0; try { null.x; } catch (error) { caught = 1; } \
+                  let kept; for (let i = 0; i < 200000; i++) kept = [i, {}]; \
+                  return caught + rec(40, function step(m) { return rec(m, step); }); })()";
+    guest
+        .memory
+        .view(&guest.store)
+        .write(u64::from(SOURCE_PTR), script.as_bytes())
+        .unwrap();
+    let eval: TypedFunction<(i32, i32), i32> = guest.typed("eval");
+    {
+        let call = pin!(eval.call_async(&mut guest.store, SOURCE_PTR as i32, script.len() as i32));
+        // Nothing in this guest waits: the call is over after one poll.
+        let Poll::Ready(status) = call.poll(&mut Context::from_waker(Waker::noop())) else {
+            panic!("the call suspended");
+        };
+        assert_eq!(status.expect("eval trapped"), 0);
+    }
+    let result: TypedFunction<(), i32> = guest.typed("result_int");
+    assert_eq!(result.call(&mut guest.store).unwrap(), 821);
     assert_eq!(guest.release(), 0);
 }
 
