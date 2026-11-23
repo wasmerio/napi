@@ -11,17 +11,30 @@ use wasmer::{AsStoreMut, AsyncEnv, FunctionEnv, FunctionEnvMut, RuntimeError, Ta
 use super::callback_cache::CachedGuestCallback;
 use crate::{NapiEnv, snapi::SnapiEnv};
 
+/// What a bridge call needs of its thread, in one place so that a call looks
+/// its thread up once.
+struct BridgeThread {
+    /// The import that is in the bridge, for what the bridge calls back: a
+    /// V8 callback into the guest, the guest-heap allocator. Null outside a
+    /// bridge call, and while one of those uses it.
+    import: Cell<*mut AsyncEnv<NapiEnv>>,
+    /// Whether [`PENDING_GUEST_UNWIND`] holds an error.
+    unwinding: Cell<bool>,
+}
+
 thread_local! {
+    static BRIDGE: BridgeThread = const {
+        BridgeThread {
+            import: Cell::new(ptr::null_mut()),
+            unwinding: Cell::new(false),
+        }
+    };
+
     /// The error that ended a guest callback and that its guest must unwind
     /// with: the exit of its process, an abort by the host. The trampoline
     /// cannot propagate an error through V8's native frames. The enclosing
     /// N-API import retrieves it and returns it to Wasmer.
     static PENDING_GUEST_UNWIND: RefCell<Option<RuntimeError>> = const { RefCell::new(None) };
-
-    /// The import that is in the bridge on this thread, for what the bridge
-    /// calls back: a V8 callback into the guest, the guest-heap allocator.
-    /// Null outside a bridge call, and while one of those uses it.
-    static IN_BRIDGE: Cell<*mut AsyncEnv<NapiEnv>> = const { Cell::new(ptr::null_mut()) };
 }
 
 /// Runs the bridge call `f` of the import `cx`, which holds no borrow of its
@@ -32,35 +45,45 @@ pub(crate) fn in_bridge<R>(
     cx: &mut AsyncEnv<NapiEnv>,
     f: impl FnOnce() -> R,
 ) -> (R, Option<RuntimeError>) {
-    struct Leave(*mut AsyncEnv<NapiEnv>);
-    impl Drop for Leave {
+    struct Leave<'t>(&'t BridgeThread, *mut AsyncEnv<NapiEnv>);
+    impl Drop for Leave<'_> {
         fn drop(&mut self) {
-            IN_BRIDGE.set(self.0);
+            self.0.import.set(self.1);
         }
     }
-    let _leave = Leave(IN_BRIDGE.replace(cx));
-    let result = f();
-    (result, take_pending_guest_unwind())
+    BRIDGE.with(|thread| {
+        let _leave = Leave(thread, thread.import.replace(cx));
+        let result = f();
+        let unwind = thread
+            .unwinding
+            .get()
+            .then(take_pending_guest_unwind)
+            .flatten();
+        (result, unwind)
+    })
 }
 
 /// Hands `f` the import that is in the bridge on this thread, if one is and
 /// nothing it called back is using it already.
 pub(crate) fn with_import_in_bridge<R>(f: impl FnOnce(&mut AsyncEnv<NapiEnv>) -> R) -> Option<R> {
-    let cx = IN_BRIDGE.replace(ptr::null_mut());
-    if cx.is_null() {
-        return None;
-    }
-    struct GiveBack(*mut AsyncEnv<NapiEnv>);
-    impl Drop for GiveBack {
+    struct GiveBack<'t>(&'t BridgeThread, *mut AsyncEnv<NapiEnv>);
+    impl Drop for GiveBack<'_> {
         fn drop(&mut self) {
-            IN_BRIDGE.set(self.0);
+            self.0.import.set(self.1);
         }
     }
-    let _give_back = GiveBack(cx);
-    // SAFETY: `in_bridge` holds the import's exclusive borrow for as long as
-    // the pointer is published, and waits in the bridge call. The pointer was
-    // taken out above, so nothing else reaches the import while `f` runs.
-    Some(f(unsafe { &mut *cx }))
+    BRIDGE.with(|thread| {
+        let cx = thread.import.replace(ptr::null_mut());
+        if cx.is_null() {
+            return None;
+        }
+        let _give_back = GiveBack(thread, cx);
+        // SAFETY: `in_bridge` holds the import's exclusive borrow for as long
+        // as the pointer is published, and waits in the bridge call. The
+        // pointer was taken out above, so nothing else reaches the import
+        // while `f` runs.
+        Some(f(unsafe { &mut *cx }))
+    })
 }
 
 /// Whether an error that ended a guest callback has to unwind the guest that
@@ -95,6 +118,7 @@ fn stash_guest_unwind(err: &RuntimeError) -> bool {
     PENDING_GUEST_UNWIND.with(|pending| {
         pending.borrow_mut().get_or_insert_with(|| err.clone());
     });
+    BRIDGE.with(|thread| thread.unwinding.set(true));
     true
 }
 
@@ -102,6 +126,7 @@ fn stash_guest_unwind(err: &RuntimeError) -> bool {
 /// import boundary that made no bridge call with [`in_bridge`], which hands
 /// the error to one that did.
 pub(crate) fn take_pending_guest_unwind() -> Option<RuntimeError> {
+    BRIDGE.with(|thread| thread.unwinding.set(false));
     PENDING_GUEST_UNWIND.with(|pending| pending.borrow_mut().take())
 }
 

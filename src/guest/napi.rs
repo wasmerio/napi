@@ -15,8 +15,7 @@ use crate::{
     NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME, NapiEnv, RequestedHeap,
     budget::UNCHARGED_HOST_COPY_BYTES,
     guest::{
-        MAX_GUEST_CSTRING_SCAN, MAX_NAPI_BIGINT_WORDS, MAX_NAPI_CALLBACK_ARGS,
-        callback::{in_bridge, take_pending_guest_unwind},
+        MAX_GUEST_CSTRING_SCAN, MAX_NAPI_BIGINT_WORDS, MAX_NAPI_CALLBACK_ARGS, callback::in_bridge,
     },
     snapi::*,
 };
@@ -97,49 +96,52 @@ fn guest_heap_alloc_ctx(env: &FunctionEnvMut<NapiEnv>) -> *const std::ffi::c_voi
         .unwrap_or(std::ptr::null())
 }
 
-/// Calls the bridge for the guest's env `guest_env`: hands `f` the bridge
-/// env, and puts the import `cx` in the bridge while it runs, so that
-/// JavaScript `f` runs can call guest functions and V8's array-buffer
-/// allocator can grow guest memory. Re-raises any guest exit trapped in a
-/// callback.
-///
-/// This is how an import that may run JavaScript reaches the bridge. Such an
-/// import is an async host function: it holds its store only in the slices
-/// of [`AsyncEnv::with`], and none during this call, so what the bridge
-/// calls back takes the store through `cx` in slices of its own.
-///
-/// An error that ends the guest during a nested callback (its `_exit`, the host
-/// stopping it) cannot unwind through the intervening host V8 (C++) frames, so
-/// the callback trampoline stashes it. This boundary — the enclosing N-API
-/// import — is the first Rust frame that can carry an error, so it returns the
-/// stashed one. wasmer re-raises it, and the same happens at each outer import
-/// layer until the runner handles it, ending just this guest instance. Callers
-/// propagate with `?`.
-fn bridge<R>(
-    cx: &mut AsyncEnv<NapiEnv>,
-    guest_env: u32,
-    f: impl FnOnce(SnapiEnv) -> R,
-) -> Result<R, RuntimeError> {
-    let snapi_env = cx.with(|env| env.data().resolve_napi_env(guest_env));
-    let (r, unwind) = if snapi_env.is_null() {
-        // No env, so no guest callback can fire and nothing needs the store.
-        (f(snapi_env), take_pending_guest_unwind())
-    } else {
-        let done = in_bridge(cx, || f(snapi_env));
-        // JavaScript may have left memory past the heap limit that no
-        // collection examined; settle it before the guest goes on (see
-        // `napi_host_near_heap_limit_grant`). The check is not free, so the
-        // tracker decides, lock-free, whether this return is due. Looked up
-        // only now: the call may have released the env, and its tracker.
-        if cx.with(|env| env.data().heap_tracker_for(guest_env).is_some()) {
-            unsafe { snapi_bridge_unofficial_settle_heap(snapi_env) };
+/// The env an import that may run JavaScript calls the bridge for: resolved
+/// by [`bridge_env`] in the slice that reads the import's arguments, so that
+/// the call itself needs nothing of the store.
+#[derive(Clone, Copy)]
+struct BridgeEnv {
+    /// Null if the guest named no env of its own: the bridge refuses it.
+    snapi: SnapiEnv,
+    /// The env has a heap limit: JavaScript may have left memory past it
+    /// that no collection examined, to settle before the guest goes on (see
+    /// `napi_host_near_heap_limit_grant`).
+    settle: bool,
+}
+
+fn bridge_env(env: &FunctionEnvMut<NapiEnv>, guest_env: u32) -> BridgeEnv {
+    let (snapi, settle) = env.data().bridge_env(guest_env);
+    BridgeEnv { snapi, settle }
+}
+
+impl BridgeEnv {
+    /// Calls the bridge: hands `f` the bridge env, and puts the import `cx`
+    /// in the bridge while it runs, so that JavaScript `f` runs can call
+    /// guest functions and V8's array-buffer allocator can grow guest
+    /// memory. The import holds no slice of its store meanwhile: what the
+    /// bridge calls back takes the store through `cx`.
+    ///
+    /// An error that ends the guest during a nested callback (its `_exit`,
+    /// the host stopping it) cannot unwind through the intervening host V8
+    /// (C++) frames, so the callback trampoline stashes it. This boundary,
+    /// the enclosing N-API import, is the first Rust frame that can carry an
+    /// error, so it returns the stashed one. wasmer re-raises it, and the
+    /// same happens at each outer import layer until the runner handles it,
+    /// ending just this guest instance. Callers propagate with `?`.
+    fn call<R>(
+        self,
+        cx: &mut AsyncEnv<NapiEnv>,
+        f: impl FnOnce(SnapiEnv) -> R,
+    ) -> Result<R, RuntimeError> {
+        let (result, unwind) = in_bridge(cx, || f(self.snapi));
+        if self.settle {
+            unsafe { snapi_bridge_unofficial_settle_heap(self.snapi) };
         }
-        done
-    };
-    if let Some(error) = unwind {
-        return Err(error);
+        match unwind {
+            Some(error) => Err(error),
+            None => Ok(result),
+        }
     }
-    Ok(r)
 }
 
 fn snapi_env(env: &FunctionEnvMut<NapiEnv>, guest_env: u32) -> SnapiEnv {
@@ -361,13 +363,14 @@ async fn guest_unofficial_napi_release_env(
     {
         return Ok(crate::env::RELEASE_REFUSED);
     }
-    let Some((guest_env, snapi_env_state)) =
-        cx.with(|mut env| env.data_mut().begin_unregister_napi_scope(scope_id))
-    else {
+    let Some((guest_env, snapi_env_state, target)) = cx.with(|mut env| {
+        let (guest_env, snapi_env_state) = env.data_mut().begin_unregister_napi_scope(scope_id)?;
+        Some((guest_env, snapi_env_state, bridge_env(&env, guest_env)))
+    }) else {
         return Ok(1);
     };
     let loop_id = loop_ptr;
-    let status = bridge(cx, guest_env, |snapi_env_state| unsafe {
+    let status = target.call(cx, |snapi_env_state| unsafe {
         snapi_bridge_unofficial_release_env_with_loop(snapi_env_state, loop_id)
     });
     // A guest exit raised by a finalizer still means the env was torn down.
@@ -445,7 +448,8 @@ async fn guest_unofficial_napi_event_loop_checkpoint(
     checkpoint_state_ptr: u32,
 ) -> Result<i32, RuntimeError> {
     let mut checkpoint_state = 0;
-    let status = bridge(cx, napi_env, |env_handle| unsafe {
+    let target = cx.with(|env| bridge_env(&env, napi_env));
+    let status = target.call(cx, |env_handle| unsafe {
         snapi_bridge_unofficial_event_loop_checkpoint(
             env_handle,
             mode,
@@ -734,7 +738,8 @@ async fn guest_unofficial_napi_request_interrupt(
 ) -> Result<i32, RuntimeError> {
     let callback_id = callback;
     let data_val = data;
-    bridge(cx, napi_env, |env_handle| unsafe {
+    let target = cx.with(|env| bridge_env(&env, napi_env));
+    target.call(cx, |env_handle| unsafe {
         snapi_bridge_unofficial_request_interrupt(env_handle, napi_env, callback_id, data_val)
     })
 }
@@ -748,7 +753,8 @@ async fn guest_unofficial_napi_structured_clone(
     result_ptr: u32,
 ) -> Result<i32, RuntimeError> {
     let mut out = 0u32;
-    let status = bridge(cx, napi_env, |env_handle| unsafe {
+    let target = cx.with(|env| bridge_env(&env, napi_env));
+    let status = target.call(cx, |env_handle| unsafe {
         snapi_bridge_unofficial_structured_clone(env_handle, value, transfer_list, &mut out)
     })?;
     if status == 0 && result_ptr != 0 {
@@ -779,23 +785,25 @@ async fn guest_unofficial_napi_message_create(
     });
     let mut message = 0u32;
     let mut in_range = 0i32;
-    let status = bridge(cx, napi_env, |env_handle| unsafe {
-        snapi_bridge_unofficial_message_create(
-            env_handle,
-            value,
-            range_begin,
-            range_end,
-            &mut message,
-            &mut in_range,
-        )
-    })
-    .inspect_err(|_| {
-        // A getter can exit the guest even if serialization produced a message.
-        // The queue does not own the handle yet.
-        if message != 0 {
-            unsafe { snapi_bridge_unofficial_message_drop(message) };
-        }
-    })?;
+    let target = cx.with(|env| bridge_env(&env, napi_env));
+    let status = target
+        .call(cx, |env_handle| unsafe {
+            snapi_bridge_unofficial_message_create(
+                env_handle,
+                value,
+                range_begin,
+                range_end,
+                &mut message,
+                &mut in_range,
+            )
+        })
+        .inspect_err(|_| {
+            // A getter can exit the guest even if serialization produced a message.
+            // The queue does not own the handle yet.
+            if message != 0 {
+                unsafe { snapi_bridge_unofficial_message_drop(message) };
+            }
+        })?;
     if status != 0 {
         return Ok(status);
     }
@@ -858,15 +866,19 @@ async fn guest_unofficial_napi_message_take(
 ) -> Result<i32, RuntimeError> {
     // Only a message of this context. The entry, which may lease the memory
     // the message points into, outlives the provider call below.
-    let Some(queued) = cx.with(|env| env.data().messages.remove(payload)) else {
+    let Some((_queued, target, readable)) = cx.with(|env| {
+        let queued = env.data().messages.remove(payload)?;
+        let readable = queued.readable_by(env.data().guest_heap.as_ref());
+        Some((queued, bridge_env(&env, napi_env), readable))
+    }) else {
         return Ok(1);
     };
     if result_out_ptr == 0 {
         unsafe { snapi_bridge_unofficial_message_drop(payload) };
         return Ok(1);
     }
-    let env_handle = cx.with(|env| snapi_env(&env, napi_env));
-    if !cx.with(|env| queued.readable_by(env.data().guest_heap.as_ref())) {
+    let env_handle = target.snapi;
+    if !readable {
         // Its SharedArrayBuffers are in a memory this env cannot address. The
         // message is consumed, as the provider consumes a refused one.
         unsafe {
@@ -880,7 +892,7 @@ async fn guest_unofficial_napi_message_take(
         return Ok(10); // napi_pending_exception
     }
     let mut value = 0u32;
-    let status = bridge(cx, napi_env, |env_handle| unsafe {
+    let status = target.call(cx, |env_handle| unsafe {
         snapi_bridge_unofficial_message_take(env_handle, payload, &mut value)
     })?;
     if status == 0 {
@@ -966,7 +978,8 @@ async fn guest_unofficial_napi_get_own_non_index_properties(
         return Ok(1);
     }
     let mut out = 0u32;
-    let status = bridge(cx, napi_env, |env_handle| unsafe {
+    let target = cx.with(|env| bridge_env(&env, napi_env));
+    let status = target.call(cx, |env_handle| unsafe {
         snapi_bridge_unofficial_get_own_non_index_properties(
             env_handle,
             value,
@@ -996,7 +1009,8 @@ async fn guest_unofficial_napi_define_lazy_data_properties(
     initializer: u32,
     attributes: i32,
 ) -> Result<i32, RuntimeError> {
-    bridge(cx, napi_env, |env_handle| unsafe {
+    let target = cx.with(|env| bridge_env(&env, napi_env));
+    target.call(cx, |env_handle| unsafe {
         snapi_bridge_unofficial_define_lazy_data_properties(
             env_handle,
             object,
@@ -1085,7 +1099,8 @@ async fn guest_unofficial_napi_get_error_metadata(
     let mut line_number = 0i32;
     let mut start_column = 0i32;
     let mut end_column = 0i32;
-    let status = bridge(cx, napi_env, |env_handle| unsafe {
+    let target = cx.with(|env| bridge_env(&env, napi_env));
+    let status = target.call(cx, |env_handle| unsafe {
         snapi_bridge_unofficial_get_error_metadata(
             env_handle,
             error_id,
@@ -1103,13 +1118,15 @@ async fn guest_unofficial_napi_get_error_metadata(
         return Ok(status);
     }
     if metadata_ptr != 0 {
-        cx.with(|mut env| write_guest_u32(&mut env, metadata_ptr, source_line_id));
-        cx.with(|mut env| write_guest_u32(&mut env, metadata_ptr + 4, script_resource_name_id));
-        cx.with(|mut env| write_guest_u32(&mut env, metadata_ptr + 8, stderr_line_id));
-        cx.with(|mut env| write_guest_u32(&mut env, metadata_ptr + 12, thrown_at_id));
-        cx.with(|mut env| write_guest_i32(&mut env, metadata_ptr + 16, line_number));
-        cx.with(|mut env| write_guest_i32(&mut env, metadata_ptr + 20, start_column));
-        cx.with(|mut env| write_guest_i32(&mut env, metadata_ptr + 24, end_column));
+        cx.with(|mut env| {
+            write_guest_u32(&mut env, metadata_ptr, source_line_id);
+            write_guest_u32(&mut env, metadata_ptr + 4, script_resource_name_id);
+            write_guest_u32(&mut env, metadata_ptr + 8, stderr_line_id);
+            write_guest_u32(&mut env, metadata_ptr + 12, thrown_at_id);
+            write_guest_i32(&mut env, metadata_ptr + 16, line_number);
+            write_guest_i32(&mut env, metadata_ptr + 20, start_column);
+            write_guest_i32(&mut env, metadata_ptr + 24, end_column);
+        });
     }
     Ok(0)
 }
@@ -1132,7 +1149,8 @@ async fn guest_unofficial_napi_preserve_error_source_message(
     napi_env: u32,
     error: u32,
 ) -> Result<i32, RuntimeError> {
-    bridge(cx, napi_env, |env_handle| unsafe {
+    let target = cx.with(|env| bridge_env(&env, napi_env));
+    target.call(cx, |env_handle| unsafe {
         snapi_bridge_unofficial_preserve_error_source_message(env_handle, error)
     })
 }
@@ -1146,7 +1164,8 @@ async fn guest_unofficial_napi_mark_promise_as_handled(
     promise: u32,
 ) -> Result<i32, RuntimeError> {
     let promise_id = promise;
-    bridge(cx, napi_env, |env_handle| unsafe {
+    let target = cx.with(|env| bridge_env(&env, napi_env));
+    target.call(cx, |env_handle| unsafe {
         snapi_bridge_unofficial_mark_promise_as_handled(env_handle, promise_id)
     })
 }
@@ -1633,13 +1652,17 @@ async fn guest_unofficial_napi_run_script(
     host_defined_option_id: u32,
     result_ptr: u32,
 ) -> Result<i32, RuntimeError> {
-    let Some((source_text, source_bytecode)) =
-        cx.with(|mut env| abi::read_js_source(&mut env, source))
-    else {
+    let (target, js_source) = cx.with(|mut env| {
+        (
+            bridge_env(&env, napi_env),
+            abi::read_js_source(&mut env, source),
+        )
+    });
+    let Some((source_text, source_bytecode)) = js_source else {
         return Ok(1);
     };
     let mut result_id = 0u32;
-    let status = bridge(cx, napi_env, |env_handle| unsafe {
+    let status = target.call(cx, |env_handle| unsafe {
         snapi_bridge_unofficial_run_script(
             env_handle,
             realm,
@@ -1677,13 +1700,17 @@ async fn guest_unofficial_napi_compile_function(
     host_defined_option_id: u32,
     result_ptr: u32,
 ) -> Result<i32, RuntimeError> {
-    let Some((source_text, source_bytecode)) =
-        cx.with(|mut env| abi::read_js_source(&mut env, source))
-    else {
+    let (target, js_source) = cx.with(|mut env| {
+        (
+            bridge_env(&env, napi_env),
+            abi::read_js_source(&mut env, source),
+        )
+    });
+    let Some((source_text, source_bytecode)) = js_source else {
         return Ok(1);
     };
     let mut result_id = 0u32;
-    let status = bridge(cx, napi_env, |env_handle| unsafe {
+    let status = target.call(cx, |env_handle| unsafe {
         snapi_bridge_unofficial_compile_function(
             env_handle,
             realm,
@@ -1729,7 +1756,8 @@ async fn guest_unofficial_napi_bytecode_open(
     let mut bytecode_id = 0u32;
     let mut cache_rejected = 0u8;
     let mut can_parse_as_module = 0u8;
-    let status = bridge(cx, napi_env, |env_handle| unsafe {
+    let target = cx.with(|env| bridge_env(&env, napi_env));
+    let status = target.call(cx, |env_handle| unsafe {
         snapi_bridge_unofficial_bytecode_open(
             env_handle,
             realm,
@@ -1768,7 +1796,8 @@ async fn guest_unofficial_napi_bytecode_serialize(
 ) -> Result<i32, RuntimeError> {
     let mut buffer_id = 0u32;
     // Packaging cache bytes can call the guest's Buffer.from.
-    let status = bridge(cx, napi_env, |env_handle| unsafe {
+    let target = cx.with(|env| bridge_env(&env, napi_env));
+    let status = target.call(cx, |env_handle| unsafe {
         snapi_bridge_unofficial_bytecode_serialize(env_handle, bytecode, &mut buffer_id)
     })?;
     if status == 0 && buffer_ptr != 0 {
@@ -1816,7 +1845,8 @@ async fn guest_unofficial_napi_module_wrap_create(
     let mut handle_id = 0u32;
     let mut requests_id = 0u32;
     let mut has_top_level_await = 0u8;
-    let status = bridge(cx, napi_env, |env_handle| unsafe {
+    let target = cx.with(|env| bridge_env(&env, napi_env));
+    let status = target.call(cx, |env_handle| unsafe {
         snapi_bridge_unofficial_module_wrap_create(
             env_handle,
             options.kind,
@@ -1887,7 +1917,8 @@ async fn guest_unofficial_napi_module_wrap_instantiate(
     napi_env: u32,
     handle: u32,
 ) -> Result<i32, RuntimeError> {
-    bridge(cx, napi_env, |env_handle| unsafe {
+    let target = cx.with(|env| bridge_env(&env, napi_env));
+    target.call(cx, |env_handle| unsafe {
         snapi_bridge_unofficial_module_wrap_instantiate(env_handle, handle)
     })
 }
@@ -1902,7 +1933,8 @@ async fn guest_unofficial_napi_module_wrap_evaluate(
     result_ptr: u32,
 ) -> Result<i32, RuntimeError> {
     let mut result_id = 0u32;
-    let status = bridge(cx, napi_env, |env_handle| unsafe {
+    let target = cx.with(|env| bridge_env(&env, napi_env));
+    let status = target.call(cx, |env_handle| unsafe {
         snapi_bridge_unofficial_module_wrap_evaluate(
             env_handle,
             handle,
@@ -1927,7 +1959,8 @@ async fn guest_unofficial_napi_module_wrap_evaluate_sync(
     result_ptr: u32,
 ) -> Result<i32, RuntimeError> {
     let mut result_id = 0u32;
-    let status = bridge(cx, napi_env, |env_handle| unsafe {
+    let target = cx.with(|env| bridge_env(&env, napi_env));
+    let status = target.call(cx, |env_handle| unsafe {
         snapi_bridge_unofficial_module_wrap_evaluate_sync(
             env_handle,
             handle,
@@ -2017,7 +2050,8 @@ async fn guest_unofficial_napi_module_wrap_check_unsettled_top_level_await(
     let mut settled = 0i32;
     // Printing a stalled await formats its source line, which runs the
     // source-map callback (see unofficial_napi_get_error_metadata).
-    let status = bridge(cx, napi_env, |env_handle| unsafe {
+    let target = cx.with(|env| bridge_env(&env, napi_env));
+    let status = target.call(cx, |env_handle| unsafe {
         snapi_bridge_unofficial_module_wrap_check_unsettled_top_level_await(
             env_handle,
             handle_id,
@@ -2095,7 +2129,8 @@ async fn guest_unofficial_napi_module_wrap_create_cached_data(
 ) -> Result<i32, RuntimeError> {
     let mut result_id = 0u32;
     // Packaging cache bytes can call the guest's Buffer.from.
-    let status = bridge(cx, napi_env, |env_handle| unsafe {
+    let target = cx.with(|env| bridge_env(&env, napi_env));
+    let status = target.call(cx, |env_handle| unsafe {
         snapi_bridge_unofficial_module_wrap_create_cached_data(env_handle, handle, &mut result_id)
     })?;
     if status == 0 && result_ptr != 0 {
@@ -2132,7 +2167,8 @@ async fn guest_unofficial_napi_module_wrap_create_required_module_facade(
     result_ptr: u32,
 ) -> Result<i32, RuntimeError> {
     let mut result_id = 0u32;
-    let status = bridge(cx, napi_env, |env_handle| unsafe {
+    let target = cx.with(|env| bridge_env(&env, napi_env));
+    let status = target.call(cx, |env_handle| unsafe {
         snapi_bridge_unofficial_module_wrap_create_required_module_facade(
             env_handle,
             handle,
@@ -2667,7 +2703,8 @@ async fn guest_napi_instanceof(
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
-    let s = bridge(cx, e, |snapi| unsafe {
+    let target = cx.with(|env| bridge_env(&env, e));
+    let s = target.call(cx, |snapi| unsafe {
         snapi_bridge_instanceof(snapi, obj, ctor, &mut r)
     })?;
     if s == 0 {
@@ -2690,7 +2727,8 @@ macro_rules! guest_coerce {
             rp: u32,
         ) -> Result<i32, RuntimeError> {
             let mut out: u32 = 0;
-            let s = bridge(cx, e, |snapi| unsafe { $bridge(snapi, vh, &mut out) })?;
+            let target = cx.with(|env| bridge_env(&env, e));
+            let s = target.call(cx, |snapi| unsafe { $bridge(snapi, vh, &mut out) })?;
             if s == 0 {
                 cx.with(|mut env| write_guest_u32(&mut env, rp, out));
             }
@@ -2725,7 +2763,8 @@ async fn guest_napi_set_property(
     k: u32,
     v: u32,
 ) -> Result<i32, RuntimeError> {
-    bridge(cx, e, |snapi| unsafe {
+    let target = cx.with(|env| bridge_env(&env, e));
+    target.call(cx, |snapi| unsafe {
         snapi_bridge_set_property(snapi, o, k, v)
     })
 }
@@ -2739,7 +2778,8 @@ async fn guest_napi_get_property(
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
-    let s = bridge(cx, e, |snapi| unsafe {
+    let target = cx.with(|env| bridge_env(&env, e));
+    let s = target.call(cx, |snapi| unsafe {
         snapi_bridge_get_property(snapi, o, k, &mut out)
     })?;
     if s == 0 {
@@ -2757,7 +2797,8 @@ async fn guest_napi_has_property(
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
-    let s = bridge(cx, e, |snapi| unsafe {
+    let target = cx.with(|env| bridge_env(&env, e));
+    let s = target.call(cx, |snapi| unsafe {
         snapi_bridge_has_property(snapi, o, k, &mut r)
     })?;
     if s == 0 {
@@ -2775,7 +2816,8 @@ async fn guest_napi_has_own_property(
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
-    let s = bridge(cx, e, |snapi| unsafe {
+    let target = cx.with(|env| bridge_env(&env, e));
+    let s = target.call(cx, |snapi| unsafe {
         snapi_bridge_has_own_property(snapi, o, k, &mut r)
     })?;
     if s == 0 {
@@ -2793,7 +2835,8 @@ async fn guest_napi_delete_property(
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
-    let s = bridge(cx, e, |snapi| unsafe {
+    let target = cx.with(|env| bridge_env(&env, e));
+    let s = target.call(cx, |snapi| unsafe {
         snapi_bridge_delete_property(snapi, o, k, &mut r)
     })?;
     if s == 0 {
@@ -2810,10 +2853,11 @@ async fn guest_napi_set_named_property(
     np: u32,
     v: u32,
 ) -> Result<i32, RuntimeError> {
-    let Some(cn) = cx.with(|mut env| GuestName::read(&mut env, np)) else {
+    let (target, cn) = cx.with(|mut env| (bridge_env(&env, e), GuestName::read(&mut env, np)));
+    let Some(cn) = cn else {
         return Ok(1);
     };
-    bridge(cx, e, |snapi| unsafe {
+    target.call(cx, |snapi| unsafe {
         snapi_bridge_set_named_property(snapi, o, cn.as_ptr(), v)
     })
 }
@@ -2826,11 +2870,12 @@ async fn guest_napi_get_named_property(
     np: u32,
     rp: u32,
 ) -> Result<i32, RuntimeError> {
-    let Some(cn) = cx.with(|mut env| GuestName::read(&mut env, np)) else {
+    let (target, cn) = cx.with(|mut env| (bridge_env(&env, e), GuestName::read(&mut env, np)));
+    let Some(cn) = cn else {
         return Ok(1);
     };
     let mut out: u32 = 0;
-    let s = bridge(cx, e, |snapi| unsafe {
+    let s = target.call(cx, |snapi| unsafe {
         snapi_bridge_get_named_property(snapi, o, cn.as_ptr(), &mut out)
     })?;
     if s == 0 {
@@ -2847,11 +2892,12 @@ async fn guest_napi_has_named_property(
     np: u32,
     rp: u32,
 ) -> Result<i32, RuntimeError> {
-    let Some(cn) = cx.with(|mut env| GuestName::read(&mut env, np)) else {
+    let (target, cn) = cx.with(|mut env| (bridge_env(&env, e), GuestName::read(&mut env, np)));
+    let Some(cn) = cn else {
         return Ok(1);
     };
     let mut r: i32 = 0;
-    let s = bridge(cx, e, |snapi| unsafe {
+    let s = target.call(cx, |snapi| unsafe {
         snapi_bridge_has_named_property(snapi, o, cn.as_ptr(), &mut r)
     })?;
     if s == 0 {
@@ -2868,7 +2914,8 @@ async fn guest_napi_set_element(
     idx: u32,
     v: u32,
 ) -> Result<i32, RuntimeError> {
-    bridge(cx, e, |snapi| unsafe {
+    let target = cx.with(|env| bridge_env(&env, e));
+    target.call(cx, |snapi| unsafe {
         snapi_bridge_set_element(snapi, o, idx, v)
     })
 }
@@ -2882,7 +2929,8 @@ async fn guest_napi_get_element(
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
-    let s = bridge(cx, e, |snapi| unsafe {
+    let target = cx.with(|env| bridge_env(&env, e));
+    let s = target.call(cx, |snapi| unsafe {
         snapi_bridge_get_element(snapi, o, idx, &mut out)
     })?;
     if s == 0 {
@@ -2900,7 +2948,8 @@ async fn guest_napi_has_element(
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
-    let s = bridge(cx, e, |snapi| unsafe {
+    let target = cx.with(|env| bridge_env(&env, e));
+    let s = target.call(cx, |snapi| unsafe {
         snapi_bridge_has_element(snapi, o, idx, &mut r)
     })?;
     if s == 0 {
@@ -2952,7 +3001,8 @@ async fn guest_napi_delete_element(
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut r: i32 = 0;
-    let s = bridge(cx, e, |snapi| unsafe {
+    let target = cx.with(|env| bridge_env(&env, e));
+    let s = target.call(cx, |snapi| unsafe {
         snapi_bridge_delete_element(snapi, o, idx, &mut r)
     })?;
     if s == 0 {
@@ -2979,7 +3029,8 @@ async fn guest_napi_get_property_names(
 ) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
     // Property enumeration can synchronously invoke a Proxy's ownKeys trap.
-    let s = bridge(cx, e, |snapi| unsafe {
+    let target = cx.with(|env| bridge_env(&env, e));
+    let s = target.call(cx, |snapi| unsafe {
         snapi_bridge_get_property_names(snapi, o, &mut out)
     })?;
     if s == 0 {
@@ -3000,7 +3051,8 @@ async fn guest_napi_get_all_property_names(
 ) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
     // Property enumeration can synchronously invoke a Proxy's ownKeys trap.
-    let s = bridge(cx, e, |snapi| unsafe {
+    let target = cx.with(|env| bridge_env(&env, e));
+    let s = target.call(cx, |snapi| unsafe {
         snapi_bridge_get_all_property_names(snapi, o, mode, filter, conversion, &mut out)
     })?;
     if s == 0 {
@@ -3026,9 +3078,8 @@ async fn guest_napi_object_freeze(
     e: u32,
     o: u32,
 ) -> Result<i32, RuntimeError> {
-    bridge(cx, e, |snapi| unsafe {
-        snapi_bridge_object_freeze(snapi, o)
-    })
+    let target = cx.with(|env| bridge_env(&env, e));
+    target.call(cx, |snapi| unsafe { snapi_bridge_object_freeze(snapi, o) })
 }
 
 #[allow(clippy::result_large_err)]
@@ -3037,7 +3088,8 @@ async fn guest_napi_object_seal(
     e: u32,
     o: u32,
 ) -> Result<i32, RuntimeError> {
-    bridge(cx, e, |snapi| unsafe { snapi_bridge_object_seal(snapi, o) })
+    let target = cx.with(|env| bridge_env(&env, e));
+    target.call(cx, |snapi| unsafe { snapi_bridge_object_seal(snapi, o) })
 }
 
 // --- Comparison ---
@@ -3165,7 +3217,8 @@ async fn guest_napi_get_and_clear_last_exception(
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
-    let s = bridge(cx, e, |snapi| unsafe {
+    let target = cx.with(|env| bridge_env(&env, e));
+    let s = target.call(cx, |snapi| unsafe {
         snapi_bridge_get_and_clear_last_exception(snapi, &mut out)
     })?;
     if s == 0 {
@@ -3187,12 +3240,15 @@ async fn guest_napi_create_promise(
 ) -> Result<i32, RuntimeError> {
     let mut deferred_id: u32 = 0;
     let mut promise_id: u32 = 0;
-    let s = bridge(cx, e, |snapi| unsafe {
+    let target = cx.with(|env| bridge_env(&env, e));
+    let s = target.call(cx, |snapi| unsafe {
         snapi_bridge_create_promise(snapi, &mut deferred_id, &mut promise_id)
     })?;
     if s == 0 {
-        cx.with(|mut env| write_guest_u32(&mut env, dp, deferred_id));
-        cx.with(|mut env| write_guest_u32(&mut env, rp, promise_id));
+        cx.with(|mut env| {
+            write_guest_u32(&mut env, dp, deferred_id);
+            write_guest_u32(&mut env, rp, promise_id);
+        });
     }
     Ok(s)
 }
@@ -3206,7 +3262,8 @@ async fn guest_napi_resolve_deferred(
     d: u32,
     v: u32,
 ) -> Result<i32, RuntimeError> {
-    bridge(cx, e, |snapi| unsafe {
+    let target = cx.with(|env| bridge_env(&env, e));
+    target.call(cx, |snapi| unsafe {
         snapi_bridge_resolve_deferred(snapi, d, v)
     })
 }
@@ -3220,7 +3277,8 @@ async fn guest_napi_reject_deferred(
     d: u32,
     v: u32,
 ) -> Result<i32, RuntimeError> {
-    bridge(cx, e, |snapi| unsafe {
+    let target = cx.with(|env| bridge_env(&env, e));
+    target.call(cx, |snapi| unsafe {
         snapi_bridge_reject_deferred(snapi, d, v)
     })
 }
@@ -3498,7 +3556,8 @@ async fn guest_node_api_set_prototype(
 ) -> Result<i32, RuntimeError> {
     let object_id = object;
     let prototype_id = prototype;
-    bridge(cx, napi_env, |snapi| unsafe {
+    let target = cx.with(|env| bridge_env(&env, napi_env));
+    target.call(cx, |snapi| unsafe {
         snapi_bridge_node_api_set_prototype(snapi, object_id, prototype_id)
     })
 }
@@ -3799,19 +3858,20 @@ async fn guest_napi_call_function(
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let argc_u = argc;
-    let argv_ids = if argc_u > 0 {
-        let Some(ids) =
-            cx.with(|mut env| read_guest_u32_array(&mut env, argv_ptr, argc_u as usize))
-        else {
-            return Ok(1);
+    let (target, argv_ids) = cx.with(|mut env| {
+        let argv_ids = if argc_u > 0 {
+            read_guest_u32_array(&mut env, argv_ptr, argc_u as usize)
+        } else {
+            Some(HostCopy::default())
         };
-        ids
-    } else {
-        HostCopy::default()
+        (bridge_env(&env, e), argv_ids)
+    });
+    let Some(argv_ids) = argv_ids else {
+        return Ok(1);
     };
 
     let mut out: u32 = 0;
-    let s = bridge(cx, e, |snapi| unsafe {
+    let s = target.call(cx, |snapi| unsafe {
         snapi_bridge_call_function(snapi, recv, func, argc_u, argv_ids.as_ptr(), &mut out)
     })?;
 
@@ -4439,7 +4499,8 @@ async fn guest_napi_define_properties(
         prop_names_ptrs.push(cn.as_ptr());
     }
 
-    bridge(cx, e, |snapi| unsafe {
+    let target = cx.with(|env| bridge_env(&env, e));
+    target.call(cx, |snapi| unsafe {
         snapi_bridge_define_properties(
             snapi,
             obj,
@@ -4466,7 +4527,8 @@ async fn guest_napi_run_script(
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let mut out: u32 = 0;
-    let s = bridge(cx, e, |snapi| unsafe {
+    let target = cx.with(|env| bridge_env(&env, e));
+    let s = target.call(cx, |snapi| unsafe {
         snapi_bridge_run_script(snapi, sh, &mut out)
     })?;
 
@@ -5010,10 +5072,11 @@ async fn guest_unofficial_napi_create_uint8array(
     let mut host_ptr = 0u64;
     let mut value_id = 0u32;
     // The array's memory comes from the guest heap, which can grow the
-    // guest's memory only with the store this lends. The provider allocates
-    // fallibly: at the memory's limit this is napi_generic_failure, not a
-    // process abort.
-    let status = bridge(cx, e, |snapi| unsafe {
+    // guest's memory only through an import in the bridge. The provider
+    // allocates fallibly: at the memory's limit this is
+    // napi_generic_failure, not a process abort.
+    let target = cx.with(|env| bridge_env(&env, e));
+    let status = target.call(cx, |snapi| unsafe {
         snapi_bridge_unofficial_create_uint8array(
             snapi,
             length,
@@ -5025,16 +5088,18 @@ async fn guest_unofficial_napi_create_uint8array(
     if status != 0 {
         return Ok(status);
     }
-    let guest_ptr = if length == 0 {
+    Ok(cx.with(|mut env| {
+        let guest_ptr = if length == 0 {
+            0
+        } else if let Some(ptr) = host_ptr_to_guest_ptr(&mut env, host_ptr) {
+            ptr
+        } else {
+            return 9;
+        };
+        write_guest_u32(&mut env, data_out, guest_ptr);
+        write_guest_u32(&mut env, result_out, value_id);
         0
-    } else if let Some(ptr) = cx.with(|mut env| host_ptr_to_guest_ptr(&mut env, host_ptr)) {
-        ptr
-    } else {
-        return Ok(9);
-    };
-    cx.with(|mut env| write_guest_u32(&mut env, data_out, guest_ptr));
-    cx.with(|mut env| write_guest_u32(&mut env, result_out, value_id));
-    Ok(0)
+    }))
 }
 
 // A Uint8Array holding a copy of guest bytes, with no pointer back.
@@ -5049,14 +5114,19 @@ async fn guest_unofficial_napi_create_uint8array_copy(
     if result_out == 0 || (length > 0 && data_ptr == 0) {
         return Ok(1);
     }
-    let Some(bytes) = cx.with(|mut env| read_guest_bytes(&mut env, data_ptr, length as usize))
-    else {
+    let (target, bytes) = cx.with(|mut env| {
+        (
+            bridge_env(&env, e),
+            read_guest_bytes(&mut env, data_ptr, length as usize),
+        )
+    });
+    let Some(bytes) = bytes else {
         return Ok(1);
     };
     let mut value_id = 0u32;
-    // As unofficial_napi_create_uint8array: lend the store so the guest heap
-    // can grow, and fail rather than abort at its limit.
-    let status = bridge(cx, e, |snapi| unsafe {
+    // As unofficial_napi_create_uint8array: a bridge call, so that the guest
+    // heap can grow, and fail rather than abort at its limit.
+    let status = target.call(cx, |snapi| unsafe {
         snapi_bridge_unofficial_create_uint8array_copy(
             snapi,
             if bytes.is_empty() {
@@ -5334,19 +5404,20 @@ async fn guest_napi_new_instance(
     rp: u32,
 ) -> Result<i32, RuntimeError> {
     let argc_u = argc;
-    let argv_ids = if argc_u > 0 {
-        let Some(ids) =
-            cx.with(|mut env| read_guest_u32_array(&mut env, argv_ptr, argc_u as usize))
-        else {
-            return Ok(1);
+    let (target, argv_ids) = cx.with(|mut env| {
+        let argv_ids = if argc_u > 0 {
+            read_guest_u32_array(&mut env, argv_ptr, argc_u as usize)
+        } else {
+            Some(HostCopy::default())
         };
-        ids
-    } else {
-        HostCopy::default()
+        (bridge_env(&env, e), argv_ids)
+    });
+    let Some(argv_ids) = argv_ids else {
+        return Ok(1);
     };
 
     let mut out: u32 = 0;
-    let s = bridge(cx, e, |snapi| unsafe {
+    let s = target.call(cx, |snapi| unsafe {
         snapi_bridge_new_instance(snapi, ctor, argc_u, argv_ids.as_ptr(), &mut out)
     })?;
 

@@ -742,6 +742,16 @@ impl NapiEnv {
         self.napi_envs.get(env_id).map(|env| *env as SnapiEnv)
     }
 
+    /// What an import that may run JavaScript needs of the guest's env
+    /// `guest_env`, read once: the bridge env, which is null if there is no
+    /// such env, and whether it has a heap limit to settle after the call.
+    pub(crate) fn bridge_env(&self, guest_env: u32) -> (SnapiEnv, bool) {
+        (
+            self.resolve_napi_env(guest_env),
+            self.heap_tracker_for(guest_env).is_some(),
+        )
+    }
+
     pub(crate) fn resolve_napi_env(&self, guest_env: u32) -> SnapiEnv {
         if guest_env == 0 {
             return std::ptr::null_mut();
