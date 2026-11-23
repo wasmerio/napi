@@ -4499,8 +4499,10 @@ fn guest_napi_create_string_utf16(
     };
     // Convert bytes to u16 array
     let u16_data: Vec<u16> = raw_bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     let mut out: u32 = 0;
     // Always pass the actual char count to the 64-bit bridge (not the WASM32 NAPI_AUTO_LENGTH sentinel)
@@ -4581,8 +4583,10 @@ fn guest_napi_create_bigint_words(
         return 1;
     };
     let words: Vec<u64> = words_bytes
-        .chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
         .collect();
     let mut out: u32 = 0;
     let s = unsafe {

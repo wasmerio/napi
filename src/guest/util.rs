@@ -381,8 +381,8 @@ pub fn read_guest_u32_array(
         return None;
     }
     let mut result = Vec::with_capacity(count);
-    for chunk in bytes.chunks_exact(4) {
-        result.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    for chunk in bytes.as_chunks::<4>().0 {
+        result.push(u32::from_le_bytes(*chunk));
     }
     Some(Charged {
         value: result,
@@ -598,8 +598,8 @@ mod tests {
     #[test]
     fn guest_copies_handle_any_alignment_and_length() {
         let source: Vec<u8> = (0..64u8).map(|b| b.wrapping_mul(37) ^ 0x5a).collect();
-        let copies: [(&str, unsafe fn(*const u8, *mut u8, usize)); 2] =
-            [("from", copy_from_guest), ("to", copy_to_guest)];
+        type GuestCopy = unsafe fn(*const u8, *mut u8, usize);
+        let copies: [(&str, GuestCopy); 2] = [("from", copy_from_guest), ("to", copy_to_guest)];
         for (name, copy) in copies {
             for src_at in 0..8 {
                 for dst_at in 0..8 {

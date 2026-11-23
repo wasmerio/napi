@@ -413,7 +413,9 @@ mod tests {
                 nested
             },
         );
-        assert_eq!(call_import(&mut store, &outer), 0b11_1_1);
+        // One bit per check, in the order they are made: held, found, still
+        // held, lent again.
+        assert_eq!(call_import(&mut store, &outer), 0b1111);
         INNER_IMPORT.with(|slot| slot.borrow_mut().take());
     }
 
