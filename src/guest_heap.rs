@@ -380,6 +380,19 @@ impl GuestHeap {
         Some(unsafe { self.base.add(offset as usize) })
     }
 
+    /// [`Self::host_range`] for a non-empty range inside the largest length
+    /// already seen, which needs no lookup of the memory, and so no store.
+    /// `None` for any other range, also one the memory has grown to hold.
+    #[inline]
+    pub(crate) fn seen_range(&self, offset: u64, len: u64) -> Option<*mut u8> {
+        let end = offset.checked_add(len)?;
+        if len == 0 || end > self.observed_len.load(Ordering::Acquire) || end > self.max_bytes {
+            return None;
+        }
+        // SAFETY: as in `host_range`.
+        Some(unsafe { self.base.add(offset as usize) })
+    }
+
     /// The whole design (external backing stores, cached host pointers)
     /// relies on the mapping never moving. A moved base means every live
     /// pointer is dangling: abort before anything dereferences one.
@@ -1060,8 +1073,11 @@ mod tests {
     /// limited to the already-prefunded arena.
     #[test]
     fn allocator_hook_grows_only_through_an_import_in_javascript() {
-        use crate::guest::callback::enter_javascript;
-        use wasmer::{AsyncEnv, Function, FunctionEnv, Instance, Module, imports};
+        use crate::guest::{
+            callback::enter_javascript,
+            import::{Cx, import},
+        };
+        use wasmer::{FunctionEnv, Instance, Module, imports};
 
         let mut store = Store::default();
         let (_memory, heap) = shared_heap(&mut store, ResourceBudget::unlimited());
@@ -1080,18 +1096,14 @@ mod tests {
                 Default::default(),
             ),
         );
-        let import = Function::new_typed_async(
-            &mut store,
-            &env,
-            async move |cx: &mut AsyncEnv<crate::NapiEnv>| -> i32 {
-                let (grown, _) =
-                    enter_javascript(cx, || napi_host_guest_heap_alloc(ctx, past_arena, 0));
-                if grown.is_null() {
-                    return 0;
-                }
-                napi_host_guest_heap_free(ctx, grown, past_arena)
-            },
-        );
+        let import = import(&mut store, &env, move |cx: &mut Cx<'_>| -> i32 {
+            let (grown, _) =
+                enter_javascript(cx, || napi_host_guest_heap_alloc(ctx, past_arena, 0));
+            if grown.is_null() {
+                return 0;
+            }
+            napi_host_guest_heap_free(ctx, grown, past_arena)
+        });
         let module = Module::new(
             &store,
             r#"(module
@@ -1269,5 +1281,35 @@ mod tests {
             heap.host_range(heap.range_len(), 1, || (heap.base(), u64::MAX)),
             None
         );
+    }
+
+    /// `seen_range` is `host_range` for the ranges that need no lookup, and
+    /// refuses every other one, also one the memory holds.
+    #[test]
+    fn seen_range_is_a_range_that_needs_no_lookup() {
+        let mut store = Store::default();
+        let (memory, heap) = shared_heap(&mut store, ResourceBudget::unlimited());
+        let base = heap.base() as usize;
+        let at = |ptr: Option<*mut u8>| ptr.map(|ptr| ptr as usize - base);
+        let seen = 64 * u64::from(WASM_PAGE);
+        let grown = current(&memory, &store).1;
+        assert!(grown > seen);
+
+        assert_eq!(at(heap.seen_range(16, 100)), Some(16));
+        assert_eq!(at(heap.seen_range(0, seen)), Some(0));
+        assert_eq!(at(heap.seen_range(seen - 7, 7)), Some(seen as usize - 7));
+        // Empty, as `guest_range` has it: nothing to read or write there.
+        assert_eq!(heap.seen_range(16, 0), None);
+        assert_eq!(heap.seen_range(u64::MAX - 3, 8), None);
+
+        // In the memory, but past what the heap has seen: only a lookup,
+        // which takes the store, makes it a range this gives.
+        assert_eq!(heap.seen_range(seen - 3, 9), None);
+        assert_eq!(heap.seen_range(seen, 1), None);
+        let looked_up = heap.host_range(seen - 3, 9, || current(&memory, &store));
+        assert_eq!(at(looked_up), Some(seen as usize - 3));
+        assert_eq!(at(heap.seen_range(seen - 3, 9)), Some(seen as usize - 3));
+        assert_eq!(at(heap.seen_range(grown - 1, 1)), Some(grown as usize - 1));
+        assert_eq!(heap.seen_range(grown - 1, 2), None);
     }
 }

@@ -25,6 +25,7 @@
 use std::{
     cell::{Cell, RefCell},
     future::Future,
+    mem::ManuallyDrop,
     pin::pin,
     sync::{
         Arc,
@@ -54,31 +55,35 @@ impl Wake for Signal {
     }
 }
 
-thread_local! {
+/// What [`run_to_completion`] keeps for its thread. One value, so that a
+/// call looks its thread's up once.
+struct Driver {
     /// How many [`run_to_completion`] calls are on this thread's stack.
-    static DEPTH: Cell<usize> = const { Cell::new(0) };
-    /// One signal for each depth, made when the thread first gets that deep.
+    depth: Cell<usize>,
+    /// One signal for each depth, made when the thread first gets that deep
+    /// and kept until the thread ends.
     ///
     /// Calls nest: a guest function that JavaScript calls can call into
     /// JavaScript, which calls the guest again. Each waits on the signal of
     /// its own depth, so a wake meant for an outer call is still there when
     /// the inner one has returned.
-    static SIGNALS: RefCell<Vec<Arc<Signal>>> = const { RefCell::new(Vec::new()) };
+    signals: RefCell<Vec<Arc<Signal>>>,
 }
 
-/// Polls `future` on this thread until it is ready, sleeping while it waits.
-pub(crate) fn run_to_completion<F: Future>(future: F) -> F::Output {
-    struct Leave;
-    impl Drop for Leave {
-        fn drop(&mut self) {
-            DEPTH.with(|depth| depth.set(depth.get() - 1));
+thread_local! {
+    static DRIVER: Driver = const {
+        Driver {
+            depth: Cell::new(0),
+            signals: RefCell::new(Vec::new()),
         }
-    }
+    };
+}
 
-    let depth = DEPTH.with(|depth| depth.replace(depth.get() + 1));
-    let _leave = Leave;
-    let signal = SIGNALS.with(|signals| {
-        let mut signals = signals.borrow_mut();
+impl Driver {
+    /// The signal of `depth`, as `Arc::as_ptr` gives it. The thread keeps
+    /// its reference to the signal until it ends.
+    fn signal(&self, depth: usize) -> *const Signal {
+        let mut signals = self.signals.borrow_mut();
         if signals.len() <= depth {
             signals.resize_with(depth + 1, || {
                 Arc::new(Signal {
@@ -87,27 +92,54 @@ pub(crate) fn run_to_completion<F: Future>(future: F) -> F::Output {
                 })
             });
         }
-        Arc::clone(&signals[depth])
-    });
-    // A waker of an earlier call at this depth may still fire. That costs
-    // this call a poll at most; it must not make it skip a sleep.
-    signal.notified.store(false, Ordering::Release);
-    let waker = Waker::from(Arc::clone(&signal));
-    let mut context = Context::from_waker(&waker);
+        Arc::as_ptr(&signals[depth])
+    }
+}
+
+/// Polls `future` on this thread until it is ready, sleeping while it waits.
+pub(crate) fn run_to_completion<F: Future>(future: F) -> F::Output {
+    struct Leave<'a>(&'a Cell<usize>);
+    impl Drop for Leave<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() - 1);
+        }
+    }
 
     // See the module's documentation. Harmless outside a tokio runtime.
     #[cfg(feature = "wasix")]
     let future = tokio::task::unconstrained(future);
+    // Pinned here, not in the closure below, which would move it once more.
     let mut future = pin!(future);
-    loop {
-        if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
-            return output;
+    DRIVER.with(|driver| {
+        let depth = driver.depth.replace(driver.depth.get() + 1);
+        let _leave = Leave(&driver.depth);
+        let signal = driver.signal(depth);
+        // Nearly every call is ready at its first poll and wakes nobody, so
+        // its waker borrows the thread's reference to the signal: one of its
+        // own would cost each call four atomic updates. A clone of the
+        // waker, which is what a future that waits keeps, takes its own.
+        //
+        // SAFETY: `signal` is what `Arc::as_ptr` gave for a reference the
+        // thread keeps until it ends, which is after this call and after
+        // `waker`. `ManuallyDrop` keeps `waker` from giving back a reference
+        // it did not take.
+        let waker = ManuallyDrop::new(Waker::from(unsafe { Arc::from_raw(signal) }));
+        // SAFETY: as above.
+        let signal = unsafe { &*signal };
+        // A waker of an earlier call at this depth may still fire. That costs
+        // this call a poll at most; it must not make it skip a sleep.
+        signal.notified.store(false, Ordering::Release);
+        let mut context = Context::from_waker(&waker);
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                return output;
+            }
+            // `park` may return for no reason, and for the wake of another depth.
+            while !signal.notified.swap(false, Ordering::Acquire) {
+                thread::park();
+            }
         }
-        // `park` may return for no reason, and for the wake of another depth.
-        while !signal.notified.swap(false, Ordering::Acquire) {
-            thread::park();
-        }
-    }
+    })
 }
 
 #[cfg(test)]

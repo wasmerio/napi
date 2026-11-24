@@ -1,7 +1,57 @@
 //! Validated native callback dispatch, with generic compatibility fallback.
+use std::collections::HashMap;
+
 use wasmer::{AsStoreRef, AsyncCallStore, Function, RuntimeError, TypedFunction, Value};
 
 use super::drive::run_to_completion;
+
+/// How many of the guest functions called last are found without hashing.
+const RECENT: usize = 256;
+
+/// The guest functions JavaScript has called, by their index in the guest's
+/// `__indirect_function_table`.
+///
+/// `Function::from_vm_funcref` (invoked by `Table::get`) unconditionally
+/// appends a new entry to the store's function arena on every call with no
+/// dedup, so re-resolving the same index on every guest→host→guest callback
+/// would leak memory unboundedly. `Function` clones are cheap (a store
+/// handle), so each index is resolved once and kept.
+///
+/// The guest chooses the indices, so the map that keeps them all hashes them
+/// with SipHash, which is too much to pay on every callback. The functions
+/// called last are therefore also in an array, each in the slot its index
+/// alone decides. A guest that makes its indices share slots gets the cost
+/// of the map back, and no more.
+#[derive(Default)]
+pub(crate) struct GuestCallbacks {
+    /// Empty until the first callback, then `RECENT` slots.
+    recent: Vec<Option<(u32, CachedGuestCallback)>>,
+    all: HashMap<u32, CachedGuestCallback>,
+}
+
+impl GuestCallbacks {
+    /// The function resolved for `index`, if one was.
+    #[inline]
+    pub(crate) fn get(&mut self, index: u32) -> Option<CachedGuestCallback> {
+        if let Some(Some((recent, function))) = self.recent.get(index as usize % RECENT)
+            && *recent == index
+        {
+            return Some(function.clone());
+        }
+        let function = self.all.get(&index)?.clone();
+        self.recent[index as usize % RECENT] = Some((index, function.clone()));
+        Some(function)
+    }
+
+    /// Keeps `function` as the one resolved for `index`.
+    pub(crate) fn insert(&mut self, index: u32, function: CachedGuestCallback) {
+        if self.recent.is_empty() {
+            self.recent.resize_with(RECENT, || None);
+        }
+        self.recent[index as usize % RECENT] = Some((index, function.clone()));
+        self.all.insert(index, function);
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct CachedGuestCallback {
@@ -76,7 +126,7 @@ fn result(values: &[Value]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::CachedGuestCallback;
+    use super::{CachedGuestCallback, GuestCallbacks, RECENT};
     use wasmer::{
         AsStoreMut, AsyncEnv, Function, FunctionEnv, Instance, Module, RuntimeError, Store, imports,
     };
@@ -275,5 +325,38 @@ mod tests {
                 .unwrap(),
             42
         );
+    }
+
+    /// A function is found again whether or not it is still among the ones
+    /// called last, where another whose index shares its slot replaces it.
+    #[test]
+    fn callbacks_are_kept_when_their_indices_share_a_slot() {
+        let mut store = Store::default();
+        let instance = fixtures(&mut store);
+        let typed = cached(&store, &instance, "add");
+        let generic = cached(&store, &instance, "void");
+        let mut callbacks = GuestCallbacks::default();
+        let shared_slot = 5 + RECENT as u32;
+        assert!(callbacks.get(5).is_none());
+
+        callbacks.insert(5, typed);
+        callbacks.insert(6, generic.clone());
+        assert!(callbacks.get(5).is_some_and(|found| found.is_typed()));
+        assert!(callbacks.get(6).is_some_and(|found| !found.is_typed()));
+        assert!(callbacks.get(shared_slot).is_none());
+        // A miss does not take the slot.
+        assert!(callbacks.get(5).is_some_and(|found| found.is_typed()));
+
+        // Each takes the slot from the other, and both are still found.
+        callbacks.insert(shared_slot, generic);
+        for _ in 0..2 {
+            assert!(
+                callbacks
+                    .get(shared_slot)
+                    .is_some_and(|found| !found.is_typed())
+            );
+            assert!(callbacks.get(5).is_some_and(|found| found.is_typed()));
+        }
+        assert!(callbacks.get(u32::MAX).is_none());
     }
 }

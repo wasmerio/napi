@@ -9,6 +9,7 @@ use std::{
 
 use wasmer::{AsStoreMut, FunctionEnvMut};
 
+use super::import::Cx;
 use crate::{
     NapiEnv,
     budget::{Pool, ResourceBudget, UNCHARGED_HOST_COPY_BYTES},
@@ -470,6 +471,16 @@ pub fn read_guest_name_inline(
 ) -> Option<usize> {
     let src = guest_range(env, guest_ptr, GUEST_NAME_INLINE)?;
     // SAFETY: the range is mapped guest memory.
+    unsafe { guest_name_at(src, out) }
+}
+
+/// [`read_guest_name_inline`] from the host address of its window.
+///
+/// # Safety
+/// The `GUEST_NAME_INLINE` bytes at `src` must be mapped guest memory.
+#[inline]
+unsafe fn guest_name_at(src: *const u8, out: &mut [u8; GUEST_NAME_INLINE]) -> Option<usize> {
+    // SAFETY: as the caller ensures.
     let len = unsafe { guest_nul_offset(src, GUEST_NAME_INLINE) }?;
     // SAFETY: `len` < `GUEST_NAME_INLINE` bytes of that range, into `out`.
     unsafe { copy_from_guest(src, out.as_mut_ptr(), len) };
@@ -479,6 +490,86 @@ pub fn read_guest_name_inline(
     }
     out[len] = 0;
     Some(len)
+}
+
+/// Guest memory for a handler that can run JavaScript: what the functions
+/// above do with the store, with a slice of it only for a range the guest
+/// heap has not seen yet (see [`GuestShared`]). Nearly every range is one it
+/// has seen, and costs none.
+///
+/// [`GuestShared`]: crate::env::GuestShared
+impl Cx<'_> {
+    /// [`write_guest_bytes`].
+    #[inline]
+    pub fn write_bytes(&mut self, guest_ptr: u32, data: &[u8]) -> bool {
+        if let Some(dst) = self.shared.seen_range(guest_ptr, data.len()) {
+            // SAFETY: the whole range is mapped guest memory.
+            unsafe { copy_to_guest(data.as_ptr(), dst, data.len()) };
+            return true;
+        }
+        self.write_bytes_in_slice(guest_ptr, data)
+    }
+
+    #[inline(never)]
+    fn write_bytes_in_slice(&mut self, guest_ptr: u32, data: &[u8]) -> bool {
+        self.with(|mut env| write_guest_bytes(&mut env, guest_ptr, data))
+    }
+
+    #[inline]
+    pub fn write_u32(&mut self, guest_ptr: u32, val: u32) -> bool {
+        self.write_bytes(guest_ptr, &val.to_le_bytes())
+    }
+
+    #[inline]
+    pub fn write_i32(&mut self, guest_ptr: u32, val: i32) -> bool {
+        self.write_bytes(guest_ptr, &val.to_le_bytes())
+    }
+
+    #[inline]
+    pub fn write_u8(&mut self, guest_ptr: u32, val: u8) -> bool {
+        self.write_bytes(guest_ptr, &[val])
+    }
+
+    /// [`read_guest_u32_array`]. An array large enough to be charged is
+    /// read in a slice too: the budget is the store's.
+    pub fn read_u32_array(&mut self, guest_ptr: u32, count: usize) -> Option<HostCopy<u32>> {
+        if let Some(byte_len) = count.checked_mul(4)
+            && byte_len < UNCHARGED_HOST_COPY_BYTES
+            && let Some(src) = self.shared.seen_range(guest_ptr, byte_len)
+        {
+            let mut words = Vec::<u32>::with_capacity(count);
+            // SAFETY: the range is mapped guest memory, and `words` has room
+            // for its `count` words, all written before `set_len`.
+            unsafe {
+                copy_from_guest(src, words.as_mut_ptr().cast(), byte_len);
+                words.set_len(count);
+            }
+            if cfg!(target_endian = "big") {
+                words
+                    .iter_mut()
+                    .for_each(|word| *word = u32::from_le(*word));
+            }
+            return Some(Charged {
+                value: words,
+                charge: TransientCharge::default(),
+            });
+        }
+        self.with(|mut env| read_guest_u32_array(&mut env, guest_ptr, count))
+    }
+
+    /// [`read_guest_name_inline`] where the heap has seen the name's whole
+    /// window. `None` also where it has not: the caller reads that name, like
+    /// a long one, in a slice.
+    #[inline]
+    pub fn read_name_inline(
+        &mut self,
+        guest_ptr: u32,
+        out: &mut [u8; GUEST_NAME_INLINE],
+    ) -> Option<usize> {
+        let src = self.shared.seen_range(guest_ptr, GUEST_NAME_INLINE)?;
+        // SAFETY: the range is mapped guest memory.
+        unsafe { guest_name_at(src, out) }
+    }
 }
 
 /// As `read_guest_c_string`, but also `None` for a string longer than `max`
@@ -583,7 +674,7 @@ mod tests {
     use wasmer::{AsStoreMut, FunctionEnv, FunctionEnvMut, Memory, MemoryType, Pages, Store};
 
     use super::{
-        GUEST_NAME_INLINE, V8_MAX_STRING_BYTES, c_string_search_len, copy_from_guest,
+        Cx, GUEST_NAME_INLINE, V8_MAX_STRING_BYTES, c_string_search_len, copy_from_guest,
         copy_to_guest, guest_data_size, guest_nul_offset, read_guest_c_string_max,
         read_guest_name_inline,
     };
@@ -893,5 +984,121 @@ mod tests {
             );
             assert_eq!(read_guest_name_inline(&mut env, size, &mut out), None);
         }
+    }
+
+    /// A handler that can run JavaScript reads and writes guest memory the
+    /// heap has seen with no slice of the store, and memory it has not seen
+    /// in a slice, which is what makes the heap see it.
+    #[test]
+    fn a_handler_reaches_guest_memory_the_heap_has_and_has_not_seen() {
+        use super::super::import::import;
+        use wasmer::{Instance, Module, Value, imports};
+
+        let mut store = Store::default();
+        let ty = MemoryType::new(Pages(64), Some(Pages(2048)), false);
+        let memory = Memory::new(&mut store, ty).expect("create owned memory");
+        let heap = GuestHeap::new(
+            &mut store.as_store_mut(),
+            &memory,
+            ResourceBudget::unlimited(),
+            None,
+        )
+        .expect("guest heap");
+        let mut state = NapiEnv::new(
+            ResourceBudget::unlimited(),
+            None,
+            Arc::new(Mutex::new(EnvRegistry::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        state.memory = Some(memory.clone());
+        state.shared.set_heap(&heap);
+        state.guest_heap = Some(Arc::clone(&heap));
+        let env = FunctionEnv::new(&mut store, state);
+
+        // Sums `count` words at `ptr`, and writes the sum and a byte there.
+        let sum = import(
+            &mut store,
+            &env,
+            |cx: &mut Cx<'_>, ptr: u32, count: u32| -> i32 {
+                let Some(words) = cx.read_u32_array(ptr, count as usize) else {
+                    return -1;
+                };
+                let sum = words.iter().sum::<u32>();
+                if !cx.write_u32(ptr, sum) || !cx.write_u8(ptr + 4, 0xab) {
+                    return -2;
+                }
+                sum as i32
+            },
+        );
+        // The length of the short name at `ptr`, if no slice is needed for it.
+        let name = import(&mut store, &env, |cx: &mut Cx<'_>, ptr: u32| -> i32 {
+            let mut out = [0xff; GUEST_NAME_INLINE];
+            match cx.read_name_inline(ptr, &mut out) {
+                Some(len) if out[len] == 0 => len as i32,
+                Some(_) => -2,
+                None => -1,
+            }
+        });
+        let module = Module::new(
+            &store,
+            r#"(module
+              (import "host" "sum" (func $sum (param i32 i32) (result i32)))
+              (import "host" "name" (func $name (param i32) (result i32)))
+              (func (export "sum") (param i32 i32) (result i32)
+                local.get 0 local.get 1 call $sum)
+              (func (export "name") (param i32) (result i32) local.get 0 call $name))"#,
+        )
+        .unwrap();
+        let imports = imports! { "host" => { "sum" => sum, "name" => name } };
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        let call = |store: &mut Store, name: &str, args: &[u32]| {
+            let args: Vec<Value> = args.iter().map(|arg| Value::I32(*arg as i32)).collect();
+            let function = instance.exports.get_function(name).unwrap();
+            function.call(store, &args).unwrap()[0].unwrap_i32()
+        };
+        let put = |store: &Store, ptr: u32, bytes: &[u8]| {
+            memory.view(store).write(u64::from(ptr), bytes).unwrap();
+        };
+        let get = |store: &Store, ptr: u32| {
+            let mut bytes = [0u8; 5];
+            memory.view(store).read(u64::from(ptr), &mut bytes).unwrap();
+            bytes
+        };
+        let words = |words: &[u32]| -> Vec<u8> {
+            words.iter().flat_map(|word| word.to_le_bytes()).collect()
+        };
+
+        // The heap saw the memory's first 64 pages, and has grown it since.
+        let seen = 64 * 65536_u32;
+        let size = u32::try_from(memory.view(&store).data_size()).unwrap();
+        assert!(size > seen);
+        let unseen = |len: usize| heap.seen_range(u64::from(seen), len as u64).is_none();
+
+        // Seen memory: no slice, so the heap has still seen no more.
+        put(&store, 4096, &words(&[1, 2, 3]));
+        assert_eq!(call(&mut store, "sum", &[4096, 3]), 6);
+        assert_eq!(get(&store, 4096), [6, 0, 0, 0, 0xab]);
+        put(&store, 8192, b"name\0");
+        assert_eq!(call(&mut store, "name", &[8192]), 4);
+        assert!(unseen(1));
+
+        // A name whose window runs into memory the heap has not seen is
+        // left to the caller's slice.
+        put(&store, seen - 8, b"end\0");
+        assert_eq!(call(&mut store, "name", &[seen - 8]), -1);
+        assert!(unseen(1));
+
+        // Memory it has not seen: the same results, through a slice.
+        put(&store, seen, &words(&[10, 20]));
+        assert_eq!(call(&mut store, "sum", &[seen, 2]), 30);
+        assert_eq!(get(&store, seen), [30, 0, 0, 0, 0xab]);
+        assert!(!unseen(8));
+        assert_eq!(call(&mut store, "name", &[seen - 8]), 3);
+
+        // Past the memory's end, and an empty array.
+        assert_eq!(call(&mut store, "sum", &[size - 4, 2]), -1);
+        assert_eq!(call(&mut store, "sum", &[size, 1]), -1);
+        assert_eq!(call(&mut store, "sum", &[size - 5, 0]), 0);
+        assert_eq!(get(&store, size - 5), [0, 0, 0, 0, 0xab]);
     }
 }
