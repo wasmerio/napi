@@ -349,8 +349,9 @@ struct SnapiAgentState {
 
   // How engine callbacks reach the guest: the callback context the host
   // installs once when the env is created (snapi_bridge_swap_active_callback_ctx).
-  // It names the guest instance and its store, and the host checks that this
-  // store is the one lent to the thread before it re-enters the guest.
+  // It names the guest instance and its store, and the host checks that the
+  // import running this JavaScript is one of that store before it re-enters
+  // the guest.
   // Owner thread only; cleared when the agent is released.
   void* active_callback_ctx = nullptr;
   // Guest callbacks in progress, innermost last. Callbacks nest, so entries
@@ -3557,14 +3558,14 @@ extern "C" uint32_t snapi_host_invoke_wasm_callback(void* callback_ctx,
                                                     uint32_t wasm_fn_ptr,
                                                     uint32_t callback_arg);
 
-// What the trampoline returns in place of a value id when the guest's store
-// is not lent to the thread, so the guest function did not run
-// (CALLBACK_STORE_NOT_LENT in guest/callback.rs). No value id has this
+// What the trampoline returns in place of a value id when JavaScript cannot
+// enter the guest from where it runs, so the guest function did not run
+// (CALLBACK_GUEST_OUT_OF_REACH in guest/callback.rs). No value id has this
 // value: an id's upper bits hold its slot index plus one, never zero. The
 // trampoline never passes this number on from a guest function.
-constexpr uint32_t kCallbackStoreNotLent = 1;
-static_assert(kCallbackStoreNotLent != 0 &&
-                  (kCallbackStoreNotLent >> kValueIdGenBits) == 0,
+constexpr uint32_t kCallbackGuestOutOfReach = 1;
+static_assert(kCallbackGuestOutOfReach != 0 &&
+                  (kCallbackGuestOutOfReach >> kValueIdGenBits) == 0,
               "the sentinel must not be the null id or a possible value id");
 
 void WasmInterruptCallback(napi_env env, void* raw) {
@@ -3702,12 +3703,12 @@ static napi_value generic_wasm_callback(napi_env env, napi_callback_info info) {
   if (!result) {
     napi_get_undefined(env, &result);
   }
-  if (result_id == kCallbackStoreNotLent) {
+  if (result_id == kCallbackGuestOutOfReach) {
     // The guest function did not run. Fail the call instead of returning
     // undefined as if it had. No error code: setting one is an ordinary
     // assignment, which could run a setter and call a guest function again.
     napi_throw_error(env, nullptr,
-                     "Cannot call a native function: the guest's store is not lent to this thread");
+                     "Cannot call a native function: its guest is out of reach of this call");
   }
   return result;
 }

@@ -777,7 +777,7 @@ impl NapiEnv {
 impl NapiEnv {
     /// Releases every environment this store still holds, and what was
     /// charged for them. Runs no guest code: a finalizer that would call into
-    /// the guest finds no store lent and is refused.
+    /// the guest finds no import to enter it through and is refused.
     ///
     /// This is what dropping the store does. A runtime that ends an instance
     /// before its store calls it earlier; what is released is gone, so the

@@ -856,7 +856,7 @@ fn proxy_traps_run_by_an_import_can_call_guest_functions() {
     }
     assert!(lost.is_empty(), "guest calls lost in {lost:?}");
 
-    // napi_get_prototype does not lend the store: V8 reads a Proxy's
+    // napi_get_prototype is a synchronous import: V8 reads a Proxy's
     // prototype without running its trap.
     assert_eq!(guest.eval("fresh()"), (0, 0, 0));
     assert_eq!(call_import.call(&mut guest.store, 6).unwrap(), 0);
@@ -912,8 +912,8 @@ fn the_promise_init_hook_can_call_guest_functions() {
     assert_eq!(guest.release(), 0);
 }
 
-/// A guest function called from JavaScript that an import ran without
-/// lending the store cannot run, and throws instead of returning undefined.
+/// A guest function called from JavaScript that a synchronous import ran
+/// cannot run, and throws instead of returning undefined.
 /// napi_create_error is such an import: it assigns `code`, which runs a
 /// setter on the prototype chain.
 #[test]
@@ -926,7 +926,7 @@ fn a_call_that_cannot_reach_the_guest_throws() {
             "globalThis.outcome = 0; \
              Object.defineProperty(Error.prototype, 'code', { configurable: true, set() { \
              try { outcome = rec(1, () => 40) === undefined ? 1 : 2; } catch (error) { \
-             outcome = /store is not lent/.test(error.message) ? 3 : 4; } } }); 0"
+             outcome = /out of reach/.test(error.message) ? 3 : 4; } } }); 0"
         ),
         (0, 0, 0)
     );
@@ -935,7 +935,7 @@ fn a_call_that_cannot_reach_the_guest_throws() {
         guest.eval("delete Error.prototype.code; outcome"),
         (0, 3, 0)
     );
-    // The same call from an import that lends the store runs.
+    // The same call from an import that can run JavaScript runs.
     assert_eq!(guest.eval("rec(1, () => 40)"), (0, 41, 0));
     assert_eq!(guest.release(), 0);
 }

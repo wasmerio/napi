@@ -39,10 +39,11 @@
 //! Growing a wasm memory needs the store that owns it. Ordinary import handlers
 //! pass their store explicitly. V8 array-buffer allocation arrives from inside
 //! C++ frames. Bridge calls that may invoke guest code or allocate through V8's
-//! array-buffer allocator must install an invocation guard and lend their store
-//! ([`crate::guest::callback`]). A foreground allocation inside such a guarded
-//! call can recover that store; a background allocator thread has no lent store
-//! and remains arena-only. Growth is always the ordinary `Memory::grow`.
+//! array-buffer allocator are made by imports that hold no store and reach it
+//! one slice at a time ([`crate::guest::callback`]). A foreground allocation
+//! inside such a call takes a slice the same way; a background allocator
+//! thread has no import to go through and remains arena-only. Growth is always
+//! the ordinary `Memory::grow`.
 //!
 //! Memory handles are store-scoped and WASIX worker threads share one linear
 //! memory while each has its own store, so the heap keeps one handle per store
@@ -69,7 +70,7 @@ use std::sync::{
 
 use offset_allocator::{Allocation, Allocator as OffsetAllocator};
 use wasmer::sys::NativeEngineExt;
-use wasmer::{AsStoreRef, Memory, MemoryStyle, Pages, Store, StoreMut};
+use wasmer::{AsStoreMut, AsStoreRef, Memory, MemoryStyle, Pages, StoreMut};
 
 use crate::budget::{Pool, ResourceBudget};
 
@@ -113,7 +114,7 @@ struct LiveAlloc {
 struct HeapInner {
     /// One handle to this heap's linear memory per store that has reached it.
     /// A handle only works with the store that made it, so growing means
-    /// finding the one belonging to the store currently lent.
+    /// finding the one belonging to the store that asks.
     memories: Vec<Memory>,
     chunks: Vec<Chunk>,
     live: HashMap<u32, LiveAlloc>,
@@ -237,8 +238,8 @@ impl GuestHeap {
             .expect("guest-heap registry poisoned");
         if let Some(existing) = reg.get(&base).and_then(Weak::upgrade) {
             // This store reaches the heap for the first time; its handle is
-            // the only one that can grow the memory while it is the store
-            // being lent.
+            // the only one that can grow the memory when this store is the
+            // one that asks.
             existing.register_memory(store, memory);
             return Some(existing);
         }
@@ -251,7 +252,7 @@ impl GuestHeap {
     }
 
     /// Record the handle `store` uses for this heap's linear memory, if it has
-    /// not already. Only the handle belonging to the store being lent can grow
+    /// not already. Only the handle belonging to the store that asks can grow
     /// the memory, so every store that reaches a shared heap contributes one.
     fn register_memory(&self, store: &impl AsStoreRef, memory: &Memory) {
         let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
@@ -430,8 +431,8 @@ impl GuestHeap {
 
     /// Allocate with explicit access to the store that owns this heap's memory.
     /// Existing arena space remains the fast path; only exhaustion grows the
-    /// memory. This is used directly by import handlers and, through a lent
-    /// store, by synchronous foreground V8 allocator calls in guarded bridges.
+    /// memory. This is used directly by import handlers and, in a slice of the
+    /// store, by the V8 allocator calls an import in JavaScript leads to.
     pub(crate) fn alloc_with_store(
         &self,
         store: &mut StoreMut<'_>,
@@ -749,8 +750,12 @@ pub extern "C" fn napi_host_guest_heap_alloc(
     let Some(heap) = ctx.heap.upgrade() else {
         return std::ptr::null_mut();
     };
-    let offset = Store::with_current(|store| heap.alloc_with_store(store, length, zero != 0))
-        .unwrap_or_else(|| heap.alloc(length, zero != 0));
+    // An import that is in JavaScript is the way to the store, as it is for a
+    // guest function JavaScript calls. Anywhere else the arena has to do.
+    let offset = crate::guest::callback::from_javascript(|cx| {
+        cx.with(|mut env| heap.alloc_with_store(&mut env.as_store_mut(), length, zero != 0))
+    })
+    .unwrap_or_else(|| heap.alloc(length, zero != 0));
     match offset {
         Some(offset) => heap.offset_to_host(offset).cast(),
         None => std::ptr::null_mut(),
@@ -1050,24 +1055,58 @@ mod tests {
         assert!(heap.free_offset(grown));
     }
 
-    /// The foreign V8 allocator has no Rust store argument. It may recover a
-    /// store only while an explicitly guarded bridge lends one; otherwise it
-    /// is limited to the already-prefunded arena.
+    /// The foreign V8 allocator has no Rust store argument. It reaches a
+    /// store only through an import that is in JavaScript; otherwise it is
+    /// limited to the already-prefunded arena.
     #[test]
-    fn allocator_hook_grows_only_with_a_lent_store() {
+    fn allocator_hook_grows_only_through_an_import_in_javascript() {
+        use crate::guest::callback::enter_javascript;
+        use wasmer::{AsyncEnv, Function, FunctionEnv, Instance, Module, imports};
+
         let mut store = Store::default();
         let (_memory, heap) = shared_heap(&mut store, ResourceBudget::unlimited());
         let ctx = heap.make_alloc_ctx();
         let past_arena = (PREFUND_BYTES as usize) * 2;
 
-        let without_guard = napi_host_guest_heap_alloc(ctx, past_arena, 0);
-        assert!(without_guard.is_null());
+        let outside = napi_host_guest_heap_alloc(ctx, past_arena, 0);
+        assert!(outside.is_null());
 
-        let with_guard = store
-            .as_store_mut()
-            .parked(|| napi_host_guest_heap_alloc(ctx, past_arena, 0));
-        assert!(!with_guard.is_null());
-        assert_eq!(napi_host_guest_heap_free(ctx, with_guard, past_arena), 1);
+        let env = FunctionEnv::new(
+            &mut store,
+            crate::NapiEnv::new(
+                ResourceBudget::unlimited(),
+                None,
+                Default::default(),
+                Default::default(),
+            ),
+        );
+        let import = Function::new_typed_async(
+            &mut store,
+            &env,
+            async move |cx: &mut AsyncEnv<crate::NapiEnv>| -> i32 {
+                let (grown, _) =
+                    enter_javascript(cx, || napi_host_guest_heap_alloc(ctx, past_arena, 0));
+                if grown.is_null() {
+                    return 0;
+                }
+                napi_host_guest_heap_free(ctx, grown, past_arena)
+            },
+        );
+        let module = Module::new(
+            &store,
+            r#"(module
+              (import "host" "import" (func $import (result i32)))
+              (func (export "run") (result i32) call $import))"#,
+        )
+        .unwrap();
+        let instance = Instance::new(
+            &mut store,
+            &module,
+            &imports! { "host" => { "import" => import } },
+        )
+        .unwrap();
+        let run = instance.exports.get_function("run").unwrap().clone();
+        assert_eq!(run.call(&mut store, &[]).unwrap()[0].unwrap_i32(), 1);
 
         napi_host_guest_heap_release(ctx);
     }

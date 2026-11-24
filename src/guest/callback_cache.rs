@@ -1,5 +1,5 @@
 //! Validated native callback dispatch, with generic compatibility fallback.
-use wasmer::{AsStoreRef, Function, RuntimeError, StoreMut, TypedFunction, Value};
+use wasmer::{AsStoreRef, AsyncCallStore, Function, RuntimeError, TypedFunction, Value};
 
 use super::drive::run_to_completion;
 
@@ -25,9 +25,12 @@ impl CachedGuestCallback {
     // The call is an async one that this thread stays in until it is done
     // (see `drive`): the guest may wait in one of its runtime's async imports,
     // and V8's frames below this one cannot be suspended.
-    pub(crate) fn call(
+    //
+    // `store` is what the engine runs an async call on: the `AsyncEnv` of
+    // the import that is in JavaScript, or a store itself.
+    pub(crate) fn call<S: AsyncCallStore>(
         &self,
-        store: &mut StoreMut<'_>,
+        store: &mut S,
         env: u32,
         info: u32,
     ) -> Result<u32, RuntimeError> {
@@ -42,9 +45,9 @@ impl CachedGuestCallback {
         run_to_completion(self.function.call_async(store, &params)).map(|values| result(&values))
     }
 
-    pub(crate) fn call_finalizer(
+    pub(crate) fn call_finalizer<S: AsyncCallStore>(
         &self,
-        store: &mut StoreMut<'_>,
+        store: &mut S,
         env: u32,
         data: u32,
         hint: u32,
@@ -75,8 +78,7 @@ fn result(values: &[Value]) -> u32 {
 mod tests {
     use super::CachedGuestCallback;
     use wasmer::{
-        AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Instance, Module, RuntimeError, Store,
-        imports,
+        AsStoreMut, AsyncEnv, Function, FunctionEnv, Instance, Module, RuntimeError, Store, imports,
     };
 
     fn instance(store: &mut Store, wat: &str) -> Instance {
@@ -235,22 +237,19 @@ mod tests {
     }
 
     #[test]
-    fn typed_callback_reenters_a_parked_store() {
+    fn typed_callback_reenters_through_an_async_import() {
         let mut store = Store::default();
         let instance = fixtures(&mut store);
         let inner = cached(&store, &instance, "add");
         let env = FunctionEnv::new(&mut store, inner);
-        let reenter = Function::new_typed_with_env(
+        // As the trampoline calls a guest function: with the env of the
+        // import that led to it, which holds no store.
+        let reenter = Function::new_typed_async(
             &mut store,
             &env,
-            |mut env: FunctionEnvMut<CachedGuestCallback>, a: i32, b: i32| -> i32 {
-                let callback = env.data().clone();
-                env.as_store_mut().parked(|| {
-                    Store::with_current(|store| {
-                        callback.call(store, a as u32, b as u32).unwrap() as i32
-                    })
-                    .unwrap()
-                })
+            async |cx: &mut AsyncEnv<CachedGuestCallback>, a: i32, b: i32| -> i32 {
+                let callback = cx.with(|env| env.data().clone());
+                callback.call(cx, a as u32, b as u32).unwrap() as i32
             },
         );
         let module = Module::new(
