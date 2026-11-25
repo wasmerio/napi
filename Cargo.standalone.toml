@@ -50,16 +50,16 @@ anyhow = "1"
 wasmer = { git = "https://github.com/wasmerio/wasmer-runtime", branch = "refactor/native-async-single-stack", default-features = false }
 
 # This dependencies are ONLY needed for testing napi in Wasm locally
-wasmer-cache = { git = "https://github.com/wasmerio/wasmer-next", rev = "bc312beea52570dcacc805bf0c9170d4d5df2470", optional = true }
-wasmer-c-api-imports-wasixv2 = { git = "https://github.com/wasmerio/wasmer-next", rev = "bc312beea52570dcacc805bf0c9170d4d5df2470", optional = true, default-features = false, features = [
+wasmer-cache = { git = "https://github.com/wasmerio/wasmer-next", rev = "8c003487dae9c18bb1faff8047ac47519f43c325", optional = true }
+wasmer-c-api-imports-wasixv2 = { git = "https://github.com/wasmerio/wasmer-next", rev = "8c003487dae9c18bb1faff8047ac47519f43c325", optional = true, default-features = false, features = [
   "sys",
 ] }
 wasmer-types = { git = "https://github.com/wasmerio/wasmer-runtime", branch = "refactor/native-async-single-stack", optional = true }
-wasixv2 = { git = "https://github.com/wasmerio/wasmer-next", rev = "bc312beea52570dcacc805bf0c9170d4d5df2470", optional = true }
-wasixv2-dylink = { git = "https://github.com/wasmerio/wasmer-next", rev = "bc312beea52570dcacc805bf0c9170d4d5df2470", default-features = false, features = [
+wasixv2 = { git = "https://github.com/wasmerio/wasmer-next", rev = "8c003487dae9c18bb1faff8047ac47519f43c325", optional = true }
+wasixv2-dylink = { git = "https://github.com/wasmerio/wasmer-next", rev = "8c003487dae9c18bb1faff8047ac47519f43c325", default-features = false, features = [
   "sys",
 ], optional = true }
-wasixv2-exec = { git = "https://github.com/wasmerio/wasmer-next", rev = "bc312beea52570dcacc805bf0c9170d4d5df2470", default-features = false, optional = true }
+wasixv2-exec = { git = "https://github.com/wasmerio/wasmer-next", rev = "8c003487dae9c18bb1faff8047ac47519f43c325", default-features = false, optional = true }
 tokio = { version = "1", optional = true }
 enum-iterator = "2.3.0"
 offset-allocator = "0.2.0"
@@ -78,7 +78,7 @@ wasmer = { git = "https://github.com/wasmerio/wasmer-runtime", branch = "refacto
   "sys-default",
   "experimental-async",
 ] }
-wasixv2-exec = { git = "https://github.com/wasmerio/wasmer-next", rev = "bc312beea52570dcacc805bf0c9170d4d5df2470", default-features = false, optional = true, features = [
+wasixv2-exec = { git = "https://github.com/wasmerio/wasmer-next", rev = "8c003487dae9c18bb1faff8047ac47519f43c325", default-features = false, optional = true, features = [
   "sys",
 ] }
 
