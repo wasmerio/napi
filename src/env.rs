@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 use std::sync::{
     OnceLock,
-    atomic::{AtomicU32, AtomicU64, AtomicUsize},
+    atomic::{AtomicU32, AtomicUsize},
 };
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -126,19 +126,12 @@ pub(crate) struct EnvRegistry {
 /// such a handler takes a slice of the store only for the rest: a range the
 /// heap has not seen, a store with several envs.
 ///
-/// The same goes for what JavaScript needs before it calls a guest function:
-/// whose guest the import that runs it belongs to, and how deep the guest is
-/// in callbacks.
-///
 /// Only the thread that has the store reads or writes it, so the order of
 /// its atomic accesses is the order of the program.
 ///
 /// [`GuestHeap::seen_range`]: crate::guest_heap::GuestHeap::seen_range
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 pub(crate) struct GuestShared {
-    /// Which guest this is. No other has had this number or will, so
-    /// something that outlives the guest can still tell that it is gone.
-    id: u64,
     /// [`NapiEnv::single_env`]: the guest id, the bridge env and the heap
     /// tracker of a store's only env. All zero otherwise.
     env_id: AtomicU32,
@@ -146,57 +139,17 @@ pub(crate) struct GuestShared {
     tracker: AtomicUsize,
     /// [`NapiEnv::guest_heap`], once the instance has one.
     heap: OnceLock<Arc<crate::guest_heap::GuestHeap>>,
-    /// Depth of nested guest↔host callback crossings, bounded to keep
-    /// guest→host→guest recursion from overflowing the host native stack
-    /// (an uncatchable SIGSEGV). See [`GuestShared::enter_callback`].
-    callback_depth: AtomicU32,
 }
 
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
 impl GuestShared {
     fn new() -> Self {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         Self {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             env_id: AtomicU32::new(0),
             env: AtomicUsize::new(0),
             tracker: AtomicUsize::new(0),
             heap: OnceLock::new(),
-            callback_depth: AtomicU32::new(0),
         }
-    }
-
-    /// Which guest this is: a number no other guest has had or will have.
-    #[inline]
-    pub(crate) fn id(&self) -> u64 {
-        self.id
-    }
-
-    /// Claim one level of guest↔host callback reentrancy. Returns `false` (the
-    /// callback must be refused) once [`MAX_CALLBACK_DEPTH`] is reached, so a
-    /// runaway recursion across the FFI boundary cannot overflow the host native
-    /// stack. Pair every `true` with exactly one [`leave_callback`].
-    ///
-    /// [`MAX_CALLBACK_DEPTH`]: crate::guest::MAX_CALLBACK_DEPTH
-    /// [`leave_callback`]: GuestShared::leave_callback
-    #[inline]
-    pub(crate) fn enter_callback(&self) -> bool {
-        let depth = self.callback_depth.load(Ordering::Relaxed);
-        if depth >= crate::guest::MAX_CALLBACK_DEPTH {
-            return false;
-        }
-        self.callback_depth.store(depth + 1, Ordering::Relaxed);
-        true
-    }
-
-    /// Release one level claimed by a `true` [`enter_callback`].
-    ///
-    /// [`enter_callback`]: GuestShared::enter_callback
-    #[inline]
-    pub(crate) fn leave_callback(&self) {
-        let depth = self.callback_depth.load(Ordering::Relaxed);
-        self.callback_depth
-            .store(depth.saturating_sub(1), Ordering::Relaxed);
     }
 
     /// The bridge env `guest_env` stands for, and whether its heap is
@@ -269,7 +222,7 @@ pub(crate) struct NapiEnv {
     /// Depth of nested guest↔host callback crossings on this thread, bounded to
     /// keep guest→host→guest recursion from overflowing the host native stack
     /// (an uncatchable SIGSEGV). See [`NapiEnv::enter_callback`]. Natively
-    /// it is in [`Self::shared`], for the trampolines to reach.
+    /// the driver of guest calls counts them (see `guest::drive`).
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     callback_depth: u32,
     pub(crate) memory: Option<Memory>,
@@ -1028,19 +981,16 @@ mod tests {
         );
     }
 
+    // Natively the driver of guest calls keeps the bound (`guest::drive`).
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     #[test]
     fn callback_reentrancy_is_bounded() {
-        let env = NapiEnv::new(
+        let mut env = NapiEnv::new(
             ResourceBudget::unlimited(),
             None,
             Arc::new(std::sync::Mutex::new(EnvRegistry::default())),
             Arc::new(AtomicBool::new(false)),
         );
-        // Natively the trampolines claim their levels with no store.
-        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-        let env = Arc::clone(&env.shared);
-        #[cfg(all(target_arch = "wasm32", feature = "js"))]
-        let mut env = env;
         let max = crate::guest::MAX_CALLBACK_DEPTH;
 
         // Reentrancy is allowed up to the limit, then refused.

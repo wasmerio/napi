@@ -1,98 +1,17 @@
-use std::{cell::Cell, ffi::c_void, ptr, sync::Arc};
+use std::{cell::Cell, ffi::c_void, sync::Arc};
 
 use wasmer::sys::vm::TrapCode;
-use wasmer::{AsyncEnv, FunctionEnvMut, RuntimeError, Value};
+use wasmer::{AsyncEnv, FunctionEnv, FunctionEnvMut, RuntimeError, Value};
 
-use super::{callback_cache::CachedGuestCallback, import::Cx};
-use crate::{NapiEnv, env::GuestShared, snapi::SnapiEnv};
+use super::callback_cache::CachedGuestCallback;
+use crate::{NapiEnv, snapi::SnapiEnv};
 
-/// What an import that is in JavaScript and the JavaScript it runs leave for
-/// each other on their thread. One value, so that each of them looks its
-/// thread's up once.
-struct InJavaScript {
-    /// The call of the import that is in JavaScript on this thread, while
-    /// JavaScript can enter the guest through it. See [`enter_javascript`].
-    cx: Cell<*mut Cx<'static>>,
+thread_local! {
     /// The error that ended a guest callback and that its guest must unwind
     /// with: the exit of its process, an abort by the host. The trampoline
     /// cannot propagate an error through V8's native frames. The enclosing
     /// N-API import retrieves it and returns it to Wasmer.
-    pending_unwind: Cell<Option<RuntimeError>>,
-}
-
-thread_local! {
-    static IN_JAVASCRIPT: InJavaScript = const {
-        InJavaScript {
-            cx: Cell::new(ptr::null_mut()),
-            pending_unwind: Cell::new(None),
-        }
-    };
-}
-
-/// Puts a thread's [`InJavaScript::cx`] back when dropped, also on an unwind.
-struct PutBack<'a> {
-    thread: &'a InJavaScript,
-    cx: *mut Cx<'static>,
-}
-
-impl Drop for PutBack<'_> {
-    fn drop(&mut self) {
-        self.thread.cx.set(self.cx);
-    }
-}
-
-/// Runs `f`, a bridge call that may run JavaScript, with `cx` as the way
-/// back into the guest. Returns any error the bridge call must unwind its
-/// guest with.
-///
-/// The import holds no store while `f` runs, so there is none to lend. What
-/// V8 calls meanwhile (a guest function, a guest finalizer, the array-buffer
-/// allocator) reaches the store as the import itself does, with
-/// [`Cx::with`], and calls the guest with `cx`. The engine decides at each
-/// of those whether the store can be had.
-pub(crate) fn enter_javascript<R>(
-    cx: &mut Cx<'_>,
-    f: impl FnOnce() -> R,
-) -> (R, Option<RuntimeError>) {
-    IN_JAVASCRIPT.with(|thread| {
-        let result = {
-            // Only the pointer's type outlives `cx`: it is taken out again
-            // before this returns.
-            let cx = ptr::from_mut(cx).cast::<Cx<'static>>();
-            let _leave = PutBack {
-                thread,
-                cx: thread.cx.replace(cx),
-            };
-            f()
-        };
-        (result, thread.pending_unwind.take())
-    })
-}
-
-/// Runs `f` with the call of the import that is in JavaScript on this thread
-/// (see [`enter_javascript`]). `None` if JavaScript cannot enter a guest from
-/// here: it runs outside such an import, or inside a guest function that it
-/// called, whose own imports are the way in from there.
-///
-/// Nothing says the import is of the guest the caller expects; a thread may
-/// run several guests.
-pub(crate) fn from_javascript<R>(f: impl FnOnce(&mut Cx<'_>) -> R) -> Option<R> {
-    IN_JAVASCRIPT.with(|thread| {
-        // Taken for as long as `f` runs. A guest function `f` calls has the
-        // store while one of its synchronous imports runs, where `cx.with`
-        // would find none and panic: JavaScript that such an import runs
-        // finds nothing here, and its guest functions are refused.
-        let taken = PutBack {
-            thread,
-            cx: thread.cx.replace(ptr::null_mut()),
-        };
-        // SAFETY: the import that put its call here is beneath this frame,
-        // in the bridge call that led here. It does not use the call until
-        // that bridge call returns, and takes it back from here before it
-        // does.
-        let cx = unsafe { taken.cx.as_mut() }?;
-        Some(f(cx))
-    })
+    static PENDING_UNWIND: Cell<Option<RuntimeError>> = const { Cell::new(None) };
 }
 
 /// Whether an error that ended a guest callback has to unwind the guest that
@@ -124,20 +43,17 @@ fn stash_guest_unwind(err: &RuntimeError) -> bool {
     if !unwinds_guest(err) {
         return false;
     }
-    IN_JAVASCRIPT.with(|thread| {
-        let first = thread.pending_unwind.take();
-        thread
-            .pending_unwind
-            .set(Some(first.unwrap_or_else(|| err.clone())));
+    PENDING_UNWIND.with(|pending| {
+        let first = pending.take();
+        pending.set(Some(first.unwrap_or_else(|| err.clone())));
     });
     true
 }
 
-/// Take the pending error stashed by a callback trampoline, if any. For an
-/// import boundary that did not enter JavaScript; [`enter_javascript`] hands
-/// the error to one that did.
+/// Take the pending error stashed by a callback trampoline, if any: what an
+/// import boundary does when its bridge call is over.
 pub(crate) fn take_pending_guest_unwind() -> Option<RuntimeError> {
-    IN_JAVASCRIPT.with(|thread| thread.pending_unwind.take())
+    PENDING_UNWIND.take()
 }
 
 /// What [`snapi_host_invoke_wasm_callback`] returns in place of a value id
@@ -151,89 +67,85 @@ pub(crate) fn take_pending_guest_unwind() -> Option<RuntimeError> {
 /// itself is handled in [`snapi_host_invoke_wasm_callback`].
 pub(crate) const CALLBACK_GUEST_OUT_OF_REACH: u32 = 1;
 
-/// What a V8 callback needs to know of the guest it belongs to: which one it
-/// is. That does not change for the life of a bridge env, so
-/// [`install_callback_ctx`] gives each env one when it is created. It holds
-/// no store and no way to one; that is the call of the import that is in
-/// JavaScript (see [`from_javascript`]). C++ only ever passes this back as
-/// an opaque pointer.
-#[derive(Clone, Copy)]
+/// What a V8 callback has of the guest it belongs to: the guest's env. That
+/// does not change for the life of a bridge env, so [`install_callback_ctx`]
+/// gives each env one when it is created. It holds no store. Whether the
+/// store can be had where a callback fires is the engine's to say (see
+/// [`dispatch`]). C++ only ever passes this back as an opaque pointer.
 pub(crate) struct CallbackInvocationCtx {
-    /// [`GuestShared::id`] of the guest. A callback only runs through an
-    /// import of that guest: guests can share a thread.
-    guest: u64,
+    env: FunctionEnv<NapiEnv>,
+}
+
+impl CallbackInvocationCtx {
+    /// The context of the guest whose env is `env`.
+    pub(crate) fn of(env: FunctionEnv<NapiEnv>) -> Self {
+        Self { env }
+    }
+
+    /// A handle to the guest's env, for one callback. It is not a borrow of
+    /// this context, which the guest function can release with its env.
+    fn async_env(&self) -> AsyncEnv<NapiEnv> {
+        self.env.async_env()
+    }
 }
 
 /// Why a trampoline does not call the guest function it was asked for.
 enum Refused {
     /// JavaScript cannot enter this guest from where it runs.
     OutOfReach,
-    /// The function does not exist, or the guest is too deep in callbacks.
+    /// The function does not exist, or the thread is too deep in callbacks.
     /// The trampoline returns the null id.
     NotCalled,
 }
 
-impl CallbackInvocationCtx {
-    /// The context of the guest that `guest` is of.
-    pub(crate) fn of(guest: &GuestShared) -> Self {
-        Self { guest: guest.id() }
-    }
-
-    /// Calls the guest function at `wasm_fn_ptr` through the import that is
-    /// in JavaScript, and returns what `call` did, or 0 if the function ended
-    /// with an error.
-    ///
-    /// Whose import that is and how deep its guest is in callbacks are not
-    /// the store's to say, so the one slice this takes of the store is for
-    /// the function itself.
-    fn dispatch(
-        self,
-        wasm_fn_ptr: u32,
-        trampoline: &str,
-        call: impl FnOnce(&CachedGuestCallback, &mut AsyncEnv<NapiEnv>) -> Result<u32, RuntimeError>,
-    ) -> Result<u32, Refused> {
-        from_javascript(|cx| {
-            if cx.shared.id() != self.guest {
-                return Err(Refused::OutOfReach);
-            }
-            // Bound guest↔host callback reentrancy so a runaway recursion
-            // cannot overflow the host native stack (an uncatchable SIGSEGV
-            // that would take down every co-tenant). Refuse the callback past
-            // the limit rather than crash.
-            if !cx.shared.enter_callback() {
-                eprintln!("[{trampoline} trampoline] reentrancy depth limit exceeded");
-                return Err(Refused::NotCalled);
-            }
-            let result = match cx.with(|env| guest_function(env, wasm_fn_ptr)) {
-                Some(func) => Ok(call(&func, cx.async_env).unwrap_or_else(|err| {
-                    if !stash_guest_unwind(&err) {
-                        eprintln!("[{trampoline} trampoline] error calling guest function: {err}");
-                    }
-                    0
-                })),
-                None => Err(Refused::NotCalled),
-            };
-            // The guest function returned, normally or with an error, or
-            // there was none to call.
-            cx.shared.leave_callback();
-            result
-        })
-        .unwrap_or(Err(Refused::OutOfReach))
-    }
+/// Calls the guest function at `wasm_fn_ptr` of the guest `cx` is of, and
+/// returns what `call` did, or 0 if the function ended with an error.
+///
+/// JavaScript can enter a guest where the engine can give it the guest's
+/// store: while an import of that store that can run JavaScript is in a
+/// bridge call, which is an async host function that holds no slice. It
+/// cannot from a synchronous import, which has the store itself, nor from
+/// outside every import, nor from an import of another store. The engine
+/// tells those apart (`AsyncEnv::with_if_in_reach`), and a guest function
+/// that is called takes the store with it: JavaScript that one of its
+/// synchronous imports runs is refused in turn.
+///
+/// The one slice this takes of the store is for the function itself. How
+/// deep the thread is in such calls is the driver's to say (see `drive`),
+/// which is where `call` gets `None` from.
+fn dispatch(
+    mut cx: AsyncEnv<NapiEnv>,
+    wasm_fn_ptr: u32,
+    trampoline: &str,
+    call: impl FnOnce(&CachedGuestCallback, &mut AsyncEnv<NapiEnv>) -> Option<Result<u32, RuntimeError>>,
+) -> Result<u32, Refused> {
+    let func = cx
+        .with_if_in_reach(|mut env| guest_function(&mut env, wasm_fn_ptr))
+        .ok_or(Refused::OutOfReach)?
+        .ok_or(Refused::NotCalled)?;
+    let Some(result) = call(&func, &mut cx) else {
+        eprintln!("[{trampoline} trampoline] reentrancy depth limit exceeded");
+        return Err(Refused::NotCalled);
+    };
+    Ok(result.unwrap_or_else(|err| {
+        if !stash_guest_unwind(&err) {
+            eprintln!("[{trampoline} trampoline] error calling guest function: {err}");
+        }
+        0
+    }))
 }
 
-/// The function at `wasm_fn_ptr` of the guest's table, if it has one. `env`
-/// is of the import that is in JavaScript, which is the guest's own.
+/// The function at `wasm_fn_ptr` of the guest's table, if it has one.
 fn guest_function(
-    mut env: FunctionEnvMut<'_, NapiEnv>,
+    env: &mut FunctionEnvMut<'_, NapiEnv>,
     wasm_fn_ptr: u32,
 ) -> Option<CachedGuestCallback> {
     if let Some(func) = env.data_mut().func_cache.get(wasm_fn_ptr) {
         return Some(func);
     }
     let table = env.data().table.clone()?;
-    let func = match table.get(&mut env, wasm_fn_ptr) {
-        Some(Value::FuncRef(Some(func))) => CachedGuestCallback::new(func, &env),
+    let func = match table.get(env, wasm_fn_ptr) {
+        Some(Value::FuncRef(Some(func))) => CachedGuestCallback::new(func, env),
         _ => return None,
     };
     env.data_mut().func_cache.insert(wasm_fn_ptr, func.clone());
@@ -249,7 +161,7 @@ pub(crate) fn install_callback_ctx(
     env_id: u32,
     snapi_env: SnapiEnv,
 ) {
-    let ctx = Arc::new(CallbackInvocationCtx::of(&env.data().shared));
+    let ctx = Arc::new(CallbackInvocationCtx::of(env.as_ref()));
     let ctx_ptr = Arc::as_ptr(&ctx).cast_mut().cast::<c_void>();
     env.data_mut().native_callback_contexts.insert(env_id, ctx);
     unsafe {
@@ -257,9 +169,8 @@ pub(crate) fn install_callback_ctx(
     }
 }
 
-/// Rust trampoline called from C++ when a V8 callback fires. Enters the
-/// guest through the import that is in JavaScript and calls the guest
-/// function.
+/// Rust trampoline called from C++ when a V8 callback fires. Calls the guest
+/// function, if JavaScript can enter the guest from where it runs.
 #[unsafe(no_mangle)]
 pub extern "C" fn snapi_host_invoke_wasm_callback(
     callback_ctx: *mut c_void,
@@ -272,11 +183,12 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
         return 0;
     }
     // SAFETY: `callback_ctx` is the context `install_callback_ctx` gave the
-    // env, which lives at least as long as the env's agent points to it.
-    // Copied: the guest function can release the env, and the context with it.
-    let ctx = unsafe { *(callback_ctx as *const CallbackInvocationCtx) };
+    // env, which lives at least as long as the env's agent points to it. It
+    // is only used here: the guest function can release the env, and the
+    // context with it.
+    let cx = unsafe { &*(callback_ctx as *const CallbackInvocationCtx) }.async_env();
 
-    match ctx.dispatch(wasm_fn_ptr, "callback", |func, cx| {
+    match dispatch(cx, wasm_fn_ptr, "callback", |func, cx| {
         func.call(cx, guest_env, callback_arg)
     }) {
         // A guest function that returns the sentinel's number returned no
@@ -287,7 +199,7 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
         Err(Refused::NotCalled) => 0,
         Err(Refused::OutOfReach) => {
             // No import of this guest that can run JavaScript led here, so
-            // there is no way back into the guest. The bridge throws in the
+            // the guest's store cannot be had. The bridge throws in the
             // JavaScript that made the call.
             eprintln!("[callback trampoline] the guest is out of reach of this call");
             CALLBACK_GUEST_OUT_OF_REACH
@@ -297,8 +209,8 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
 
 /// Rust trampoline called from C++ when a guest-registered N-API finalizer
 /// fires (during the deferred finalizer drain, which runs inside a guest→bridge
-/// import call). Enters the guest through that import and dispatches
-/// `finalize(env, data, hint)` through the indirect table. The guest's ABI is
+/// import call). Dispatches `finalize(env, data, hint)` through the indirect
+/// table, as a callback is. The guest's ABI is
 /// `void finalize(napi_env env, void* data, void* hint)`.
 #[unsafe(no_mangle)]
 pub extern "C" fn snapi_host_invoke_wasm_finalizer(
@@ -314,11 +226,11 @@ pub extern "C" fn snapi_host_invoke_wasm_finalizer(
         return 0;
     }
     // SAFETY: as in `snapi_host_invoke_wasm_callback`.
-    let ctx = unsafe { *(callback_ctx as *const CallbackInvocationCtx) };
+    let cx = unsafe { &*(callback_ctx as *const CallbackInvocationCtx) }.async_env();
 
     // A finalizer may itself create and free values and trigger more
     // callbacks: it has the reentrancy bound of the callback trampoline.
-    ctx.dispatch(wasm_fn_ptr, "finalizer", |func, cx| {
+    dispatch(cx, wasm_fn_ptr, "finalizer", |func, cx| {
         func.call_finalizer(cx, guest_env, data, hint)
     })
     .unwrap_or(0)
@@ -326,7 +238,7 @@ pub extern "C" fn snapi_host_invoke_wasm_finalizer(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{drive::run_to_completion, import::import};
+    use super::super::import::{Cx, import};
     use super::*;
     use wasmer::{
         AsStoreMut, Function, FunctionEnv, Instance, Module, Store, Table, TableType, Type, imports,
@@ -344,11 +256,6 @@ mod tests {
     /// The id of the store `cx` reaches, read in a slice of it.
     fn store_of(cx: &mut Cx<'_>) -> usize {
         cx.with(|mut env| env.objects_mut().id().as_raw().get())
-    }
-
-    /// Whether JavaScript that ran here could enter a guest.
-    fn in_reach() -> bool {
-        from_javascript(|_| ()).is_some()
     }
 
     /// A guest function that calls `import` and returns what it returned.
@@ -391,112 +298,163 @@ mod tests {
     }
 
     /// The callback context of `func_env`, as the bridge holds it.
-    fn callback_ctx(store: &mut Store, func_env: &FunctionEnv<NapiEnv>) -> *mut c_void {
-        let ctx = CallbackInvocationCtx::of(&func_env.as_ref(store).shared);
-        ptr::from_mut(Box::leak(Box::new(ctx))).cast()
+    fn callback_ctx(func_env: &FunctionEnv<NapiEnv>) -> *mut c_void {
+        let ctx = CallbackInvocationCtx::of(func_env.clone());
+        std::ptr::from_mut(Box::leak(Box::new(ctx))).cast()
     }
 
-    /// Calls the guest function at index 0 of `ctx` as the bridge does when
-    /// JavaScript that an import of `env` runs calls it.
+    /// Calls the guest function at `index` of `ctx` as the bridge does when
+    /// JavaScript calls it, and returns what the trampoline returned.
+    fn callback(ctx: *mut c_void, index: u32) -> u32 {
+        snapi_host_invoke_wasm_callback(ctx, 0, index, 0)
+    }
+
+    /// [`callback`] of index 0, from JavaScript that an import of `env` runs.
     fn call_from_javascript(
         store: &mut Store,
         env: &FunctionEnv<NapiEnv>,
         ctx: *mut c_void,
     ) -> u32 {
-        let import = import(store, env, move |cx: &mut Cx<'_>| -> i32 {
-            let (result, _) =
-                enter_javascript(cx, || snapi_host_invoke_wasm_callback(ctx, 0, 0, 0));
-            result as i32
+        let import = import(store, env, move |_: &mut Cx<'_>| -> i32 {
+            callback(ctx, 0) as i32
         });
         run(store, import) as u32
     }
 
+    /// An env whose guest is `wat`, with `imports` as the module `host` and
+    /// its export `table` as the functions JavaScript can call. `imports`
+    /// gets the env and its callback context to make the imports with.
+    fn guest(
+        store: &mut Store,
+        wat: &str,
+        imports: impl FnOnce(
+            &mut Store,
+            &FunctionEnv<NapiEnv>,
+            *mut c_void,
+        ) -> Vec<(&'static str, Function)>,
+    ) -> (FunctionEnv<NapiEnv>, *mut c_void, Instance) {
+        let env = FunctionEnv::new(store, napi_env());
+        let ctx = callback_ctx(&env);
+        let mut host = wasmer::Exports::new();
+        for (name, function) in imports(store, &env, ctx) {
+            host.insert(name, function);
+        }
+        let mut import_object = wasmer::Imports::new();
+        import_object.register_namespace("host", host);
+        let module = Module::new(&store, wat).unwrap();
+        let instance = Instance::new(store, &module, &import_object).unwrap();
+        env.as_mut(store).table = Some(instance.exports.get_table("table").unwrap().clone());
+        (env, ctx, instance)
+    }
+
+    /// Calls the export `run` of `instance`.
+    fn run_export(store: &mut Store, instance: &Instance) -> i32 {
+        let run = instance.exports.get_function("run").unwrap().clone();
+        run.call(store, &[]).expect("the guest trapped")[0].unwrap_i32()
+    }
+
     #[test]
-    fn an_import_is_the_way_into_its_guest_only_while_it_is_in_javascript() {
+    fn javascript_enters_a_guest_only_under_an_import_that_holds_no_slice() {
         let mut store = Store::default();
-        let env = FunctionEnv::new(&mut store, napi_env());
-        let import = import(&mut store, &env, |cx: &mut Cx<'_>| -> i32 {
+        let env = env_with_a_guest_function(&mut store);
+        let env = FunctionEnv::new(&mut store, env);
+        let ctx = callback_ctx(&env);
+        // No import of the guest is beneath: its store is out of reach.
+        assert_eq!(callback(ctx, 0), CALLBACK_GUEST_OUT_OF_REACH);
+
+        let import = import(&mut store, &env, move |cx: &mut Cx<'_>| -> i32 {
             let id = store_of(cx);
-            // The import is not in JavaScript: nothing leads to its guest.
-            let mut checks = i32::from(!in_reach());
-            let ((), unwind) = enter_javascript(cx, || {
-                for _ in 0..2 {
-                    let callback = from_javascript(|cx| {
-                        // A callback reaches the import's store, and is
-                        // the only one that does until it returns.
-                        (store_of(cx) == id, !in_reach())
-                    });
-                    checks = (checks << 2)
-                        | match callback {
-                            Some((same, alone)) => i32::from(same) << 1 | i32::from(alone),
-                            None => 0,
-                        };
-                }
-            });
-            // Back from JavaScript: nothing leads to the guest again.
-            (checks << 2) | i32::from(unwind.is_none()) << 1 | i32::from(!in_reach())
+            // The import has the store in a slice: it is not JavaScript's
+            // to take.
+            let in_slice = cx.with(|_| callback(ctx, 0));
+            let mut checks = i32::from(in_slice == CALLBACK_GUEST_OUT_OF_REACH);
+            // Outside a slice it is, and each callback gives it back.
+            for _ in 0..2 {
+                checks = checks << 1 | i32::from(callback(ctx, 0) == 17);
+            }
+            // The import goes on with its store.
+            checks << 1 | i32::from(store_of(cx) == id)
         });
-        assert_eq!(run(&mut store, import), 0b1_11_11_11);
-        assert!(!in_reach());
+        assert_eq!(run(&mut store, import), 0b1111);
+        assert_eq!(callback(ctx, 0), CALLBACK_GUEST_OUT_OF_REACH);
     }
 
     #[test]
     fn imports_nest_through_a_callback() {
+        // JavaScript calls a guest function, which calls an import that runs
+        // JavaScript, which calls a guest function.
         let mut store = Store::default();
-        let env = FunctionEnv::new(&mut store, napi_env());
-        let inner = import(&mut store, &env, |cx: &mut Cx<'_>| -> i32 {
-            let id = store_of(cx);
-            // The callback that called this import's guest has the outer
-            // import's env.
-            let alone = !in_reach();
-            let (found, _) = enter_javascript(cx, || from_javascript(|cx| store_of(cx) == id));
-            i32::from(alone) << 1 | i32::from(found == Some(true))
-        });
-        let guest = guest_calling(&mut store, inner);
-        let outer = import(&mut store, &env, move |cx: &mut Cx<'_>| -> i32 {
-            let (nested, _) = enter_javascript(cx, || {
-                let nested = from_javascript(|cx| {
-                    // As the trampoline does: a guest function, called
-                    // with the env of the import that is in JavaScript.
-                    let nested = run_to_completion(guest.call_async(cx.async_env, &[])).unwrap()[0]
-                        .unwrap_i32();
-                    // The inner import left JavaScript when it returned:
-                    // this callback still has the outer import's env.
-                    nested << 1 | i32::from(!in_reach())
+        let (_env, _ctx, instance) = guest(
+            &mut store,
+            r#"(module
+              (import "host" "outer" (func $outer (result i32)))
+              (import "host" "inner" (func $inner (result i32)))
+              (table (export "table") 2 2 funcref)
+              (elem (i32.const 0) $calls_inner $leaf)
+              (func $calls_inner (param i32 i32) (result i32) call $inner)
+              (func $leaf (param i32 i32) (result i32) i32.const 17)
+              (func (export "run") (result i32) call $outer))"#,
+            |store, env, ctx| {
+                let inner = import(store, env, move |_: &mut Cx<'_>| -> i32 {
+                    callback(ctx, 1) as i32
                 });
-                // The callback returned: the outer import is the way in
-                // again.
-                nested.unwrap_or(0) << 1 | i32::from(in_reach())
-            });
-            nested
-        });
-        // One bit per check, in the order they are made: alone, found, still
-        // taken, in reach again.
-        assert_eq!(run(&mut store, outer), 0b1111);
+                let outer = import(store, env, move |cx: &mut Cx<'_>| -> i32 {
+                    let id = store_of(cx);
+                    let nested = callback(ctx, 0);
+                    // The callback returned: the outer import is the way in
+                    // again, and has its store.
+                    let again = callback(ctx, 1);
+                    i32::from(nested == 17) << 2
+                        | i32::from(again == 17) << 1
+                        | i32::from(store_of(cx) == id)
+                });
+                vec![("outer", outer), ("inner", inner)]
+            },
+        );
+        assert_eq!(run_export(&mut store, &instance), 0b111);
     }
 
     #[test]
     fn a_synchronous_import_of_a_called_guest_function_is_out_of_reach() {
         // A synchronous import holds the store: JavaScript that it runs
-        // cannot enter the guest, and must find that out without asking the
-        // engine for a store it would refuse.
+        // cannot enter the guest, and is told so instead of taking a store
+        // that is not there to take.
         let mut store = Store::default();
-        let env = FunctionEnv::new(&mut store, napi_env());
-        let synchronous =
-            Function::new_typed_with_env(&mut store, &env, |_: FunctionEnvMut<NapiEnv>| -> i32 {
-                i32::from(in_reach())
-            });
-        let guest = guest_calling(&mut store, synchronous);
-        let import = import(&mut store, &env, move |cx: &mut Cx<'_>| -> i32 {
-            let (reached, _) = enter_javascript(cx, || {
-                from_javascript(|cx| {
-                    run_to_completion(guest.call_async(cx.async_env, &[])).unwrap()[0].unwrap_i32()
-                })
-            });
-            // Then the import can use its store again.
-            reached.unwrap_or(1) << 1 | i32::from(store_of(cx) != 0)
-        });
-        assert_eq!(run(&mut store, import), 0b01);
+        let (_env, _ctx, instance) = guest(
+            &mut store,
+            r#"(module
+              (import "host" "outer" (func $outer (result i32)))
+              (import "host" "synchronous" (func $synchronous (result i32)))
+              (table (export "table") 2 2 funcref)
+              (elem (i32.const 0) $calls_synchronous $leaf)
+              (func $calls_synchronous (param i32 i32) (result i32) call $synchronous)
+              (func $leaf (param i32 i32) (result i32) i32.const 17)
+              (func (export "run") (result i32) call $outer))"#,
+            |store, env, ctx| {
+                let ctx = ctx as usize;
+                // 42 if the guest was out of reach of JavaScript that this
+                // import ran. Not the sentinel itself, which the trampoline
+                // does not let a guest function return.
+                let synchronous = Function::new_typed_with_env(
+                    store,
+                    env,
+                    move |_: FunctionEnvMut<NapiEnv>| -> i32 {
+                        let refused = callback(ctx as *mut c_void, 1);
+                        i32::from(refused == CALLBACK_GUEST_OUT_OF_REACH) * 42
+                    },
+                );
+                let outer = import(store, env, move |cx: &mut Cx<'_>| -> i32 {
+                    let refused = callback(ctx as *mut c_void, 0);
+                    // Then the import can use its store again, and
+                    // JavaScript it runs can enter the guest.
+                    i32::from(refused == 42) << 2
+                        | i32::from(store_of(cx) != 0) << 1
+                        | i32::from(callback(ctx as *mut c_void, 1) == 17)
+                });
+                vec![("outer", outer), ("synchronous", synchronous)]
+            },
+        );
+        assert_eq!(run_export(&mut store, &instance), 0b111);
     }
 
     /// Polls `future` once, which is all a call that never waits needs.
@@ -516,23 +474,20 @@ mod tests {
         }
     }
 
-    /// A guest whose import reports whether JavaScript it runs can take a
-    /// slice of the store.
-    fn reach_probe(store: &mut Store) -> Function {
-        let env = FunctionEnv::new(store, napi_env());
-        let import = import(store, &env, |cx: &mut Cx<'_>| -> i32 {
-            let id = store_of(cx);
-            let (reached, _) = enter_javascript(cx, || from_javascript(|cx| store_of(cx) == id));
-            i32::from(reached == Some(true))
-        });
-        guest_calling(store, import)
-    }
-
     #[test]
     fn javascript_enters_the_guest_however_the_guest_was_called() {
-        // A synchronous call.
+        // A guest whose import reports whether JavaScript it runs can call
+        // a guest function.
         let mut store = Store::default();
-        let guest = reach_probe(&mut store);
+        let env = env_with_a_guest_function(&mut store);
+        let env = FunctionEnv::new(&mut store, env);
+        let ctx = callback_ctx(&env);
+        let import = import(&mut store, &env, move |_: &mut Cx<'_>| -> i32 {
+            i32::from(callback(ctx, 0) == 17)
+        });
+        let guest = guest_calling(&mut store, import);
+
+        // A synchronous call.
         assert_eq!(guest.call(&mut store, &[]).unwrap()[0].unwrap_i32(), 1);
 
         // An async call that holds the store.
@@ -607,7 +562,7 @@ mod tests {
         let mut env = napi_env();
         env.table = Some(instance.exports.get_table("table").unwrap().clone());
         let func_env = FunctionEnv::new(&mut store, env);
-        let ctx = callback_ctx(&mut store, &func_env);
+        let ctx = callback_ctx(&func_env);
         assert_eq!(call_from_javascript(&mut store, &func_env, ctx), 17);
         assert!(waited.load(Ordering::SeqCst));
     }
@@ -624,29 +579,40 @@ mod tests {
     impl std::error::Error for Exit {}
 
     #[test]
-    fn an_import_gets_a_stashed_error_back_and_leaves_javascript_on_unwind() {
+    fn a_callback_that_ends_its_guest_leaves_the_error_to_its_import() {
         let mut store = Store::default();
-        let env = FunctionEnv::new(&mut store, napi_env());
-        let import = import(&mut store, &env, |cx: &mut Cx<'_>| -> i32 {
-            let exited = RuntimeError::user(Box::new(Exit(7)));
-            let (stashed, unwind) = enter_javascript(cx, || stash_guest_unwind(&exited));
-            let handed_back =
-                unwind.is_some_and(|error| matches!(error.downcast_ref::<Exit>(), Some(Exit(7))));
-            // Taken, not copied.
-            let taken = take_pending_guest_unwind().is_none();
-
-            // resume_unwind raises a panic without the hook's message.
-            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                enter_javascript(cx, || std::panic::resume_unwind(Box::new(())))
-            }))
-            .is_err();
-            i32::from(stashed) << 4
-                | i32::from(handed_back) << 3
-                | i32::from(taken) << 2
-                | i32::from(unwound) << 1
-                | i32::from(!in_reach())
-        });
-        assert_eq!(run(&mut store, import), 0b11111);
+        let (_env, _ctx, instance) = guest(
+            &mut store,
+            r#"(module
+              (import "host" "outer" (func $outer (result i32)))
+              (import "host" "exit" (func $exit (result i32)))
+              (table (export "table") 2 2 funcref)
+              (elem (i32.const 0) $exits $leaf)
+              (func $exits (param i32 i32) (result i32) call $exit)
+              (func $leaf (param i32 i32) (result i32) i32.const 17)
+              (func (export "run") (result i32) call $outer))"#,
+            |store, env, ctx| {
+                let exit = Function::new_typed(store, || -> Result<i32, RuntimeError> {
+                    Err(RuntimeError::user(Box::new(Exit(7))))
+                });
+                let outer = import(store, env, move |_: &mut Cx<'_>| -> i32 {
+                    // The trampoline cannot return the error through V8.
+                    let returned = callback(ctx, 0);
+                    let stashed = take_pending_guest_unwind()
+                        .is_some_and(|error| matches!(error.downcast_ref::<Exit>(), Some(Exit(7))));
+                    // Taken, not copied.
+                    let taken = take_pending_guest_unwind().is_none();
+                    // The callback gave its level and the store back.
+                    let again = callback(ctx, 1);
+                    i32::from(returned == 0) << 3
+                        | i32::from(stashed) << 2
+                        | i32::from(taken) << 1
+                        | i32::from(again == 17)
+                });
+                vec![("outer", outer), ("exit", exit)]
+            },
+        );
+        assert_eq!(run_export(&mut store, &instance), 0b1111);
     }
 
     #[test]
@@ -674,20 +640,29 @@ mod tests {
         assert!(take_pending_guest_unwind().is_none());
     }
 
+    /// Runs `innermost` inside `depth` guest calls, as far as the driver of
+    /// guest calls can tell.
+    fn nested<R>(depth: u32, innermost: impl FnOnce() -> R) -> R {
+        if depth == 0 {
+            return innermost();
+        }
+        super::super::drive::run_to_completion(async { nested(depth - 1, innermost) })
+            .expect("within the limit")
+    }
+
     #[test]
     fn a_callback_respects_the_callback_depth_limit() {
         let mut store = Store::default();
         let env = env_with_a_guest_function(&mut store);
-        // Simulate the active outer callbacks without building a deep native stack.
-        let guest = Arc::clone(&env.shared);
-        for _ in 0..crate::guest::MAX_CALLBACK_DEPTH {
-            assert!(guest.enter_callback());
-        }
         let func_env = FunctionEnv::new(&mut store, env);
-        let ctx = callback_ctx(&mut store, &func_env);
-        assert_eq!(call_from_javascript(&mut store, &func_env, ctx), 0);
-        guest.leave_callback();
-        assert_eq!(call_from_javascript(&mut store, &func_env, ctx), 17);
+        let ctx = callback_ctx(&func_env);
+        let max = crate::guest::MAX_CALLBACK_DEPTH;
+        // Past the limit the function is not called, and the trampoline
+        // returns the null id.
+        let refused = nested(max, || call_from_javascript(&mut store, &func_env, ctx));
+        assert_eq!(refused, 0);
+        let called = nested(max - 1, || call_from_javascript(&mut store, &func_env, ctx));
+        assert_eq!(called, 17);
         // Each call gave its level back.
         assert_eq!(call_from_javascript(&mut store, &func_env, ctx), 17);
     }
@@ -697,13 +672,10 @@ mod tests {
         let mut store = Store::default();
         let env = env_with_a_guest_function(&mut store);
         let func_env = FunctionEnv::new(&mut store, env);
-        let ctx = callback_ctx(&mut store, &func_env);
-        // No import in JavaScript, then one of another store: the guest is
-        // out of reach.
-        assert_eq!(
-            snapi_host_invoke_wasm_callback(ctx, 0, 0, 0),
-            CALLBACK_GUEST_OUT_OF_REACH
-        );
+        let ctx = callback_ctx(&func_env);
+        // No import beneath, then one of another store: the guest is out of
+        // reach.
+        assert_eq!(callback(ctx, 0), CALLBACK_GUEST_OUT_OF_REACH);
         let mut other = Store::default();
         let other_env = FunctionEnv::new(&mut other, napi_env());
         assert_eq!(
@@ -711,5 +683,14 @@ mod tests {
             CALLBACK_GUEST_OUT_OF_REACH
         );
         assert_eq!(call_from_javascript(&mut store, &func_env, ctx), 17);
+
+        // A kept env's context outlives its guest, and names a store that
+        // is gone: nothing reaches it.
+        drop(store);
+        assert_eq!(callback(ctx, 0), CALLBACK_GUEST_OUT_OF_REACH);
+        assert_eq!(
+            call_from_javascript(&mut other, &other_env, ctx),
+            CALLBACK_GUEST_OUT_OF_REACH
+        );
     }
 }

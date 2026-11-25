@@ -76,38 +76,45 @@ impl CachedGuestCallback {
     // (see `drive`): the guest may wait in one of its runtime's async imports,
     // and V8's frames below this one cannot be suspended.
     //
-    // `store` is what the engine runs an async call on: the `AsyncEnv` of
-    // the import that is in JavaScript, or a store itself.
+    // `store` is what the engine runs an async call on: an `AsyncEnv` of
+    // the guest, under an import that the engine is polling, or a store
+    // itself.
+    //
+    // `None` if the thread is too deep in such calls for one more (see
+    // `drive`): the function did not run.
     pub(crate) fn call<S: AsyncCallStore>(
         &self,
         store: &mut S,
         env: u32,
         info: u32,
-    ) -> Result<u32, RuntimeError> {
+    ) -> Option<Result<u32, RuntimeError>> {
         if let Some(callback) = &self.napi_callback {
             // TypedFunction retains Wasmer's store, trap, and on_called guards;
             // only per-call signature validation is removed. Never jump
             // directly into compiled Wasm code.
-            return run_to_completion(callback.call_async(store, env as i32, info as i32))
-                .map(|value| value as u32);
+            let called = run_to_completion(callback.call_async(store, env as i32, info as i32))?;
+            return Some(called.map(|value| value as u32));
         }
         let params = [Value::I32(env as i32), Value::I32(info as i32)];
-        run_to_completion(self.function.call_async(store, &params)).map(|values| result(&values))
+        let called = run_to_completion(self.function.call_async(store, &params))?;
+        Some(called.map(|values| result(&values)))
     }
 
+    /// As [`Self::call`], for a finalizer.
     pub(crate) fn call_finalizer<S: AsyncCallStore>(
         &self,
         store: &mut S,
         env: u32,
         data: u32,
         hint: u32,
-    ) -> Result<u32, RuntimeError> {
+    ) -> Option<Result<u32, RuntimeError>> {
         let params = [
             Value::I32(env as i32),
             Value::I32(data as i32),
             Value::I32(hint as i32),
         ];
-        run_to_completion(self.function.call_async(store, &params)).map(|values| result(&values))
+        let called = run_to_completion(self.function.call_async(store, &params))?;
+        Some(called.map(|values| result(&values)))
     }
 
     #[cfg(test)]
@@ -160,12 +167,16 @@ mod tests {
         let callback = cached(&store, &instance, "add");
         assert!(callback.is_typed());
         assert_eq!(
-            callback.call(&mut store.as_store_mut(), 10, 20).unwrap(),
+            callback
+                .call(&mut store.as_store_mut(), 10, 20)
+                .unwrap()
+                .unwrap(),
             30
         );
         assert_eq!(
             callback
                 .call(&mut store.as_store_mut(), 0, 0xffff_ffff)
+                .unwrap()
                 .unwrap(),
             0xffff_ffff
         );
@@ -177,7 +188,13 @@ mod tests {
         let instance = fixtures(&mut store);
         let callback = cached(&store, &instance, "void");
         assert!(!callback.is_typed());
-        assert_eq!(callback.call(&mut store.as_store_mut(), 1, 2).unwrap(), 0);
+        assert_eq!(
+            callback
+                .call(&mut store.as_store_mut(), 1, 2)
+                .unwrap()
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -186,7 +203,13 @@ mod tests {
         let instance = fixtures(&mut store);
         let callback = cached(&store, &instance, "wide");
         assert!(!callback.is_typed());
-        assert_eq!(callback.call(&mut store.as_store_mut(), 1, 2).unwrap(), 2);
+        assert_eq!(
+            callback
+                .call(&mut store.as_store_mut(), 1, 2)
+                .unwrap()
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
@@ -196,11 +219,13 @@ mod tests {
         assert!(
             cached(&store, &instance, "trap")
                 .call(&mut store.as_store_mut(), 1, 2)
+                .unwrap()
                 .is_err()
         );
         assert_eq!(
             cached(&store, &instance, "add")
                 .call(&mut store.as_store_mut(), 1, 2)
+                .unwrap()
                 .unwrap(),
             3
         );
@@ -214,6 +239,7 @@ mod tests {
         assert_eq!(
             finalize
                 .call_finalizer(&mut store.as_store_mut(), 1, 2, 3)
+                .unwrap()
                 .unwrap(),
             0
         );
@@ -221,6 +247,7 @@ mod tests {
         assert_eq!(
             finalize_result
                 .call_finalizer(&mut store.as_store_mut(), 1, 2, 0xffff_ffff)
+                .unwrap()
                 .unwrap(),
             0xffff_ffff
         );
@@ -228,6 +255,7 @@ mod tests {
         let add = cached(&store, &instance, "add");
         assert!(
             add.call_finalizer(&mut store.as_store_mut(), 1, 2, 3)
+                .unwrap()
                 .is_err()
         );
     }
@@ -245,7 +273,12 @@ mod tests {
         for name in ["one", "wide_params"] {
             let callback = cached(&store, &instance, name);
             assert!(!callback.is_typed());
-            assert!(callback.call(&mut store.as_store_mut(), 1, 2).is_err());
+            assert!(
+                callback
+                    .call(&mut store.as_store_mut(), 1, 2)
+                    .unwrap()
+                    .is_err()
+            );
         }
     }
 
@@ -282,7 +315,10 @@ mod tests {
         .unwrap();
         let callback = cached(&store, &instance, "callback");
         assert!(callback.is_typed());
-        let err = callback.call(&mut store.as_store_mut(), 1, 2).unwrap_err();
+        let err = callback
+            .call(&mut store.as_store_mut(), 1, 2)
+            .unwrap()
+            .unwrap_err();
         assert!(matches!(err.downcast_ref::<Exit>(), Some(Exit(7))));
     }
 
@@ -299,7 +335,7 @@ mod tests {
             &env,
             async |cx: &mut AsyncEnv<CachedGuestCallback>, a: i32, b: i32| -> i32 {
                 let callback = cx.with(|env| env.data().clone());
-                callback.call(cx, a as u32, b as u32).unwrap() as i32
+                callback.call(cx, a as u32, b as u32).unwrap().unwrap() as i32
             },
         );
         let module = Module::new(
@@ -322,6 +358,7 @@ mod tests {
         assert_eq!(
             cached(&store, &outer, "outer")
                 .call(&mut store.as_store_mut(), 19, 23)
+                .unwrap()
                 .unwrap(),
             42
         );

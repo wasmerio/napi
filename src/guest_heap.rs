@@ -70,8 +70,9 @@ use std::sync::{
 
 use offset_allocator::{Allocation, Allocator as OffsetAllocator};
 use wasmer::sys::NativeEngineExt;
-use wasmer::{AsStoreMut, AsStoreRef, Memory, MemoryStyle, Pages, StoreMut};
+use wasmer::{AsStoreMut, AsStoreRef, FunctionEnv, Memory, MemoryStyle, Pages, StoreMut};
 
+use crate::NapiEnv;
 use crate::budget::{Pool, ResourceBudget};
 
 /// Allocation granularity: every allocation is a multiple of 16 bytes and
@@ -445,7 +446,7 @@ impl GuestHeap {
     /// Allocate with explicit access to the store that owns this heap's memory.
     /// Existing arena space remains the fast path; only exhaustion grows the
     /// memory. This is used directly by import handlers and, in a slice of the
-    /// store, by the V8 allocator calls an import in JavaScript leads to.
+    /// store, by the V8 allocator calls a bridge call of an import leads to.
     pub(crate) fn alloc_with_store(
         &self,
         store: &mut StoreMut<'_>,
@@ -705,6 +706,9 @@ pub(crate) struct GuestHeapCtx {
     base: usize,
     len: u64,
     heap: Weak<GuestHeap>,
+    /// The env of the guest whose memory the heap is in: how the allocator
+    /// asks for the store that can grow it.
+    env: FunctionEnv<NapiEnv>,
 }
 
 /// Context handed to the buffer-finalizer trampoline for a single
@@ -718,11 +722,14 @@ impl GuestHeap {
     /// Box an allocator context for [`unofficial_napi_env_create_options`].
     /// The receiver takes ownership (released via
     /// [`napi_host_guest_heap_release`]).
-    pub(crate) fn make_alloc_ctx(self: &Arc<Self>) -> *mut c_void {
+    ///
+    /// `env` is the env of the guest that owns the heap's memory.
+    pub(crate) fn make_alloc_ctx(self: &Arc<Self>, env: FunctionEnv<NapiEnv>) -> *mut c_void {
         Box::into_raw(Box::new(GuestHeapCtx {
             base: self.base as usize,
             len: self.max_bytes,
             heap: Arc::downgrade(self),
+            env,
         }))
         .cast()
     }
@@ -763,12 +770,16 @@ pub extern "C" fn napi_host_guest_heap_alloc(
     let Some(heap) = ctx.heap.upgrade() else {
         return std::ptr::null_mut();
     };
-    // An import that is in JavaScript is the way to the store, as it is for a
-    // guest function JavaScript calls. Anywhere else the arena has to do.
-    let offset = crate::guest::callback::from_javascript(|cx| {
-        cx.with(|mut env| heap.alloc_with_store(&mut env.as_store_mut(), length, zero != 0))
-    })
-    .unwrap_or_else(|| heap.alloc(length, zero != 0));
+    // The engine gives the store where it gives it to a guest function that
+    // JavaScript calls: under an import of the guest that is in a bridge
+    // call. Anywhere else the arena has to do.
+    let offset = ctx
+        .env
+        .async_env()
+        .with_if_in_reach(|mut env| {
+            heap.alloc_with_store(&mut env.as_store_mut(), length, zero != 0)
+        })
+        .unwrap_or_else(|| heap.alloc(length, zero != 0));
     match offset {
         Some(offset) => heap.offset_to_host(offset).cast(),
         None => std::ptr::null_mut(),
@@ -849,6 +860,19 @@ mod tests {
         (memory, heap)
     }
 
+    /// An env in `store`, for an allocator context to ask for the store with.
+    fn napi_env(store: &mut Store) -> FunctionEnv<NapiEnv> {
+        FunctionEnv::new(
+            store,
+            NapiEnv::new(
+                ResourceBudget::unlimited(),
+                None,
+                Default::default(),
+                Default::default(),
+            ),
+        )
+    }
+
     /// The bridge owns a guest-heap context once it is handed over, so a
     /// policy it refuses must still release it, exactly once, and create no
     /// environment.
@@ -857,7 +881,7 @@ mod tests {
         let mut store = Store::default();
         let (_memory, heap) = shared_heap(&mut store, ResourceBudget::unlimited());
         let weak_before = Arc::weak_count(&heap);
-        let ctx = heap.make_alloc_ctx();
+        let ctx = heap.make_alloc_ctx(napi_env(&mut store));
         assert_eq!(Arc::weak_count(&heap), weak_before + 1);
 
         let unknown_policy = crate::WasmPolicy::EnabledUnmetered.bridge_code() + 1;
@@ -1068,57 +1092,60 @@ mod tests {
         assert!(heap.free_offset(grown));
     }
 
-    /// The foreign V8 allocator has no Rust store argument. It reaches a
-    /// store only through an import that is in JavaScript; otherwise it is
-    /// limited to the already-prefunded arena.
+    /// The foreign V8 allocator has no Rust store argument. The engine gives
+    /// it the store only under an import of the heap's guest that holds no
+    /// slice; otherwise it is limited to the already-prefunded arena.
     #[test]
-    fn allocator_hook_grows_only_through_an_import_in_javascript() {
-        use crate::guest::{
-            callback::enter_javascript,
-            import::{Cx, import},
-        };
-        use wasmer::{FunctionEnv, Instance, Module, imports};
+    fn allocator_hook_grows_only_under_an_import_of_its_guest() {
+        use crate::guest::import::{Cx, import};
+        use wasmer::{Function, Instance, Module, imports};
+
+        /// Calls `import` as a guest would and returns what it returned.
+        fn run(store: &mut Store, import: Function) -> i32 {
+            let module = Module::new(
+                &store,
+                r#"(module
+                  (import "host" "import" (func $import (result i32)))
+                  (func (export "run") (result i32) call $import))"#,
+            )
+            .unwrap();
+            let instance = Instance::new(
+                store,
+                &module,
+                &imports! { "host" => { "import" => import } },
+            )
+            .unwrap();
+            let run = instance.exports.get_function("run").unwrap().clone();
+            run.call(store, &[]).unwrap()[0].unwrap_i32()
+        }
 
         let mut store = Store::default();
         let (_memory, heap) = shared_heap(&mut store, ResourceBudget::unlimited());
-        let ctx = heap.make_alloc_ctx();
+        let env = napi_env(&mut store);
+        let ctx = heap.make_alloc_ctx(env.clone());
         let past_arena = (PREFUND_BYTES as usize) * 2;
 
         let outside = napi_host_guest_heap_alloc(ctx, past_arena, 0);
         assert!(outside.is_null());
 
-        let env = FunctionEnv::new(
-            &mut store,
-            crate::NapiEnv::new(
-                ResourceBudget::unlimited(),
-                None,
-                Default::default(),
-                Default::default(),
-            ),
-        );
+        // An import of another store is not the way to this one.
+        let mut other = Store::default();
+        let other_env = napi_env(&mut other);
+        let stranger = import(&mut other, &other_env, move |_: &mut Cx<'_>| -> i32 {
+            i32::from(napi_host_guest_heap_alloc(ctx, past_arena, 0).is_null())
+        });
+        assert_eq!(run(&mut other, stranger), 1);
+
         let import = import(&mut store, &env, move |cx: &mut Cx<'_>| -> i32 {
-            let (grown, _) =
-                enter_javascript(cx, || napi_host_guest_heap_alloc(ctx, past_arena, 0));
-            if grown.is_null() {
+            // The import has the store in a slice: the allocator has none.
+            let in_slice = cx.with(|_| napi_host_guest_heap_alloc(ctx, past_arena, 0));
+            let grown = napi_host_guest_heap_alloc(ctx, past_arena, 0);
+            if !in_slice.is_null() || grown.is_null() {
                 return 0;
             }
             napi_host_guest_heap_free(ctx, grown, past_arena)
         });
-        let module = Module::new(
-            &store,
-            r#"(module
-              (import "host" "import" (func $import (result i32)))
-              (func (export "run") (result i32) call $import))"#,
-        )
-        .unwrap();
-        let instance = Instance::new(
-            &mut store,
-            &module,
-            &imports! { "host" => { "import" => import } },
-        )
-        .unwrap();
-        let run = instance.exports.get_function("run").unwrap().clone();
-        assert_eq!(run.call(&mut store, &[]).unwrap()[0].unwrap_i32(), 1);
+        assert_eq!(run(&mut store, import), 1);
 
         napi_host_guest_heap_release(ctx);
     }

@@ -21,6 +21,14 @@
 //! callback that makes more syscalls than the budget would be woken and
 //! refused for ever. With the `wasix` feature the call is therefore polled
 //! outside tokio's budget.
+//!
+//! Calls nest: a guest function that JavaScript calls can call into
+//! JavaScript, which calls the guest again. Each crossing piles host native
+//! stack frames (Rust bridge and C++ V8) that neither the Wasm nor the V8
+//! stack limit bounds, so a runaway recursion would overflow the thread's
+//! stack: an uncatchable SIGSEGV that would take down every co-tenant. A
+//! thread therefore stays in at most [`MAX_CALLBACK_DEPTH`] calls at once,
+//! and a call past that is refused before its guest runs.
 
 use std::{
     cell::{Cell, RefCell},
@@ -34,6 +42,8 @@ use std::{
     task::{Context, Poll, Wake, Waker},
     thread::{self, Thread},
 };
+
+use super::MAX_CALLBACK_DEPTH;
 
 /// Wakes the thread that sleeps in [`run_to_completion`].
 struct Signal {
@@ -97,7 +107,10 @@ impl Driver {
 }
 
 /// Polls `future` on this thread until it is ready, sleeping while it waits.
-pub(crate) fn run_to_completion<F: Future>(future: F) -> F::Output {
+///
+/// `None` if the thread is in [`MAX_CALLBACK_DEPTH`] such calls already (see
+/// the module's documentation): `future` is then dropped without a poll.
+pub(crate) fn run_to_completion<F: Future>(future: F) -> Option<F::Output> {
     struct Leave<'a>(&'a Cell<usize>);
     impl Drop for Leave<'_> {
         fn drop(&mut self) {
@@ -111,7 +124,11 @@ pub(crate) fn run_to_completion<F: Future>(future: F) -> F::Output {
     // Pinned here, not in the closure below, which would move it once more.
     let mut future = pin!(future);
     DRIVER.with(|driver| {
-        let depth = driver.depth.replace(driver.depth.get() + 1);
+        let depth = driver.depth.get();
+        if depth >= MAX_CALLBACK_DEPTH as usize {
+            return None;
+        }
+        driver.depth.set(depth + 1);
         let _leave = Leave(&driver.depth);
         let signal = driver.signal(depth);
         // Nearly every call is ready at its first poll and wakes nobody, so
@@ -132,7 +149,7 @@ pub(crate) fn run_to_completion<F: Future>(future: F) -> F::Output {
         let mut context = Context::from_waker(&waker);
         loop {
             if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
-                return output;
+                return Some(output);
             }
             // `park` may return for no reason, and for the wake of another depth.
             while !signal.notified.swap(false, Ordering::Acquire) {
@@ -191,12 +208,12 @@ mod tests {
 
     #[test]
     fn a_ready_future_returns_without_sleeping() {
-        assert_eq!(run_to_completion(async { 7 }), 7);
+        assert_eq!(run_to_completion(async { 7 }), Some(7));
     }
 
     #[test]
     fn sleeps_until_another_thread_wakes_it() {
-        let polls = run_to_completion(woken_elsewhere(Duration::from_millis(20)));
+        let polls = run_to_completion(woken_elsewhere(Duration::from_millis(20))).unwrap();
         assert!(polls >= 2, "the first poll was pending");
     }
 
@@ -220,7 +237,7 @@ mod tests {
                 });
                 // Still inside the outer poll, as a guest call nested in
                 // JavaScript is.
-                run_to_completion(woken_elsewhere(Duration::from_millis(60)));
+                run_to_completion(woken_elsewhere(Duration::from_millis(60))).unwrap();
                 // Woken long ago: a lost wake would sleep forever below.
                 if !outer_ready.swap(false, Ordering::SeqCst) {
                     panic!("the outer wake was due before the inner call returned");
@@ -234,7 +251,35 @@ mod tests {
             }
             Poll::Pending
         });
-        run_to_completion(outer);
+        run_to_completion(outer).unwrap();
+    }
+
+    /// Runs `innermost` inside `depth` nested calls.
+    fn nested<R>(depth: u32, innermost: impl FnOnce() -> R) -> R {
+        if depth == 0 {
+            return innermost();
+        }
+        run_to_completion(async { nested(depth - 1, innermost) }).expect("within the limit")
+    }
+
+    #[test]
+    fn a_call_past_the_depth_limit_is_refused_before_it_is_polled() {
+        let polled = Cell::new(false);
+        let call = || run_to_completion(async { polled.set(true) });
+        assert_eq!(nested(MAX_CALLBACK_DEPTH, call), None);
+        assert!(!polled.get(), "the refused call ran");
+
+        // One level less is within the limit, and every call gave its level
+        // back: the thread can go as deep again.
+        assert_eq!(nested(MAX_CALLBACK_DEPTH - 1, call), Some(()));
+        assert_eq!(nested(MAX_CALLBACK_DEPTH, call), None);
+
+        // A call that unwinds gives its level back too.
+        let unwound = std::panic::catch_unwind(|| {
+            run_to_completion(async { std::panic::resume_unwind(Box::new(())) })
+        });
+        assert!(unwound.is_err());
+        nested(MAX_CALLBACK_DEPTH - 1, || ());
     }
 
     /// More operations than tokio allows a task between two returns to its
@@ -250,14 +295,15 @@ mod tests {
         thread::spawn(move || {
             let count = runtime.block_on(async {
                 // As the trampoline does: from inside the task's own poll.
-                run_to_completion(async {
+                let count = run_to_completion(async {
                     let mut count = 0;
                     for _ in 0..1000 {
                         tokio::task::spawn_blocking(|| ()).await.unwrap();
                         count += 1;
                     }
                     count
-                })
+                });
+                count.unwrap()
             });
             let _ = done.send(count);
         });
@@ -274,11 +320,12 @@ mod tests {
             run_to_completion(std::future::poll_fn(|cx| {
                 kept = Some(cx.waker().clone());
                 Poll::Ready(())
-            }));
+            }))
+            .unwrap();
             kept.unwrap()
         };
         stale.wake();
-        let polls = run_to_completion(woken_elsewhere(Duration::from_millis(20)));
+        let polls = run_to_completion(woken_elsewhere(Duration::from_millis(20))).unwrap();
         assert!(polls >= 2);
     }
 }

@@ -14,7 +14,7 @@ use crate::{
     budget::UNCHARGED_HOST_COPY_BYTES,
     guest::{
         MAX_GUEST_CSTRING_SCAN, MAX_NAPI_BIGINT_WORDS, MAX_NAPI_CALLBACK_ARGS,
-        callback::{enter_javascript, take_pending_guest_unwind},
+        callback::take_pending_guest_unwind,
     },
     snapi::*,
 };
@@ -95,22 +95,21 @@ fn guest_heap_alloc_ctx(env: &FunctionEnvMut<NapiEnv>) -> *const std::ffi::c_voi
     env.data()
         .guest_heap
         .as_ref()
-        .map(|heap| heap.make_alloc_ctx() as *const std::ffi::c_void)
+        .map(|heap| heap.make_alloc_ctx(env.as_ref()) as *const std::ffi::c_void)
         .unwrap_or(std::ptr::null())
 }
 
 /// Calls the bridge for the guest's env `guest_env`: hands `f` the bridge
-/// env, and makes `cx` the way back into the guest while it runs, so that
-/// JavaScript `f` runs can call guest functions and V8's array-buffer
-/// allocator can grow guest memory. Re-raises any guest exit trapped in a
-/// callback.
+/// env. Re-raises any guest exit trapped in a callback.
 ///
 /// This is how an import that may run JavaScript reaches the bridge. Such an
 /// import is an async host function (see `import`): it has `cx` where a
 /// synchronous one has the store, and reaches the store one slice at a time
-/// with [`Cx::with`]. It holds none across `f`, so whatever JavaScript calls
-/// takes its own slices the same way. For the store's only env, this takes
-/// none itself.
+/// with [`Cx::with`]. It holds none across `f`, so the engine can give the
+/// store to what JavaScript calls meanwhile: a guest function, a guest
+/// finalizer, V8's array-buffer allocator growing guest memory. Each asks
+/// the engine for it with a handle of its own (see `callback`). For the
+/// store's only env, this takes no slice itself.
 ///
 /// An error that ends the guest during a nested callback (its `_exit`, the host
 /// stopping it) cannot unwind through the intervening host V8 (C++) frames, so
@@ -126,21 +125,16 @@ fn bridge<R>(
 ) -> Result<R, RuntimeError> {
     // Only an env under a budget has a heap to settle afterwards.
     let (snapi_env, budgeted) = cx.napi_env(guest_env);
-    let (r, unwind) = if snapi_env.is_null() {
-        // No env, so no guest callback can fire and nothing needs the store.
-        (f(snapi_env), take_pending_guest_unwind())
-    } else {
-        let entered = enter_javascript(cx, || f(snapi_env));
-        // JavaScript may have left memory past the heap limit that no
-        // collection examined; settle it before the guest goes on (see
-        // `napi_host_near_heap_limit_grant`). The check is not free, so the
-        // tracker decides, lock-free, whether this return is due. Looked up
-        // again: the call may have released the env, and its tracker.
-        if budgeted && cx.napi_env(guest_env).1 {
-            unsafe { snapi_bridge_unofficial_settle_heap(snapi_env) };
-        }
-        entered
-    };
+    let r = f(snapi_env);
+    let unwind = take_pending_guest_unwind();
+    // JavaScript may have left memory past the heap limit that no collection
+    // examined; settle it before the guest goes on (see
+    // `napi_host_near_heap_limit_grant`). The check is not free, so the
+    // tracker decides, lock-free, whether this return is due. Looked up
+    // again: the call may have released the env, and its tracker.
+    if !snapi_env.is_null() && budgeted && cx.napi_env(guest_env).1 {
+        unsafe { snapi_bridge_unofficial_settle_heap(snapi_env) };
+    }
     if let Some(error) = unwind {
         return Err(error);
     }

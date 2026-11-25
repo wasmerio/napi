@@ -2,8 +2,9 @@
 //!
 //! Such a handler holds no store while JavaScript runs. It is an async host
 //! function of the engine: it has an `AsyncEnv` where a synchronous one has
-//! the store, and takes the store one slice at a time (`AsyncEnv::with`), as
-//! whatever JavaScript calls meanwhile does (see `callback`).
+//! the store, and takes the store one slice at a time (`AsyncEnv::with`).
+//! What JavaScript calls meanwhile asks the engine for the store in the same
+//! way, with a handle of its own (see `callback`).
 //!
 //! None of these handlers waits, so none of them is `async`. Each is
 //! registered as a function that returns `Deferred::ready`, which the engine
@@ -27,9 +28,8 @@ use crate::{NapiEnv, env::GuestShared, snapi::SnapiEnv};
 
 /// What a handler that can run JavaScript has of its call.
 pub(crate) struct Cx<'a> {
-    /// Where slices of the store come from, and the way back into the guest
-    /// for the JavaScript the handler runs.
-    pub(crate) async_env: &'a mut AsyncEnv<NapiEnv>,
+    /// Where slices of the store come from.
+    async_env: &'a mut AsyncEnv<NapiEnv>,
     /// What the handler reaches of its guest with no slice.
     pub(crate) shared: &'a GuestShared,
 }

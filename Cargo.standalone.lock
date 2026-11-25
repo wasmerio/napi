@@ -3368,7 +3368,7 @@ dependencies = [
 [[package]]
 name = "wasmer"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#4a17040d219a14ad0447335fbe19c6840b0e2875"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#f13a88fe202551edc73a454b07f8436b236c602e"
 dependencies = [
  "bindgen",
  "bytes",
@@ -3408,7 +3408,7 @@ dependencies = [
 [[package]]
 name = "wasmer-c-api-imports"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#4a17040d219a14ad0447335fbe19c6840b0e2875"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#f13a88fe202551edc73a454b07f8436b236c602e"
 dependencies = [
  "anyhow",
  "wasmer",
@@ -3438,7 +3438,7 @@ dependencies = [
 [[package]]
 name = "wasmer-compiler"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#4a17040d219a14ad0447335fbe19c6840b0e2875"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#f13a88fe202551edc73a454b07f8436b236c602e"
 dependencies = [
  "addr2line 0.27.1",
  "backtrace",
@@ -3478,7 +3478,7 @@ dependencies = [
 [[package]]
 name = "wasmer-compiler-cranelift"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#4a17040d219a14ad0447335fbe19c6840b0e2875"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#f13a88fe202551edc73a454b07f8436b236c602e"
 dependencies = [
  "cranelift-codegen",
  "cranelift-entity",
@@ -3500,7 +3500,7 @@ dependencies = [
 [[package]]
 name = "wasmer-compiler-llvm"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#4a17040d219a14ad0447335fbe19c6840b0e2875"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#f13a88fe202551edc73a454b07f8436b236c602e"
 dependencies = [
  "byteorder",
  "crossbeam-channel",
@@ -3523,7 +3523,7 @@ dependencies = [
 [[package]]
 name = "wasmer-derive"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#4a17040d219a14ad0447335fbe19c6840b0e2875"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#f13a88fe202551edc73a454b07f8436b236c602e"
 dependencies = [
  "proc-macro-error2",
  "proc-macro2",
@@ -3563,7 +3563,7 @@ dependencies = [
 [[package]]
 name = "wasmer-types"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#4a17040d219a14ad0447335fbe19c6840b0e2875"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#f13a88fe202551edc73a454b07f8436b236c602e"
 dependencies = [
  "bytecheck",
  "crc32fast",
@@ -3586,7 +3586,7 @@ dependencies = [
 [[package]]
 name = "wasmer-vm"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#4a17040d219a14ad0447335fbe19c6840b0e2875"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#f13a88fe202551edc73a454b07f8436b236c602e"
 dependencies = [
  "backtrace",
  "bytesize",
