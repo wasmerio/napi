@@ -142,25 +142,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bindgen"
-version = "0.73.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "787ef8ef523575546b106a58213d6e6b06198a05c2f757258c68a74273670cfa"
-dependencies = [
- "bitflags",
- "cexpr",
- "clang-sys",
- "log",
- "prettyplease",
- "proc-macro2",
- "quote",
- "regex",
- "rustc-hash",
- "shlex",
- "syn 3.0.6",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -281,15 +262,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cexpr"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fac387a98bb7c37292057cffc56d62ecb629900026402633ae9160df93a8766"
-dependencies = [
- "nom",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -340,26 +312,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "clang-sys"
-version = "1.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "157a8ba7b480713b56f4c09fd13fc3e0a22a5dfab8097ba61cbc5feef950788a"
-dependencies = [
- "glob",
- "libc",
- "libloading",
-]
-
-[[package]]
-name = "cmake"
-version = "0.1.58"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "cobs"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -374,7 +326,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -830,7 +782,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1332,9 +1284,9 @@ dependencies = [
 
 [[package]]
 name = "js-sys"
-version = "0.3.106"
+version = "0.3.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7883d941dae510fb2d978fc3fe018c71c9e2892fd38854de3e8b92c2e5ad9cc5"
+checksum = "8dc09d2154098bbf4ef54eab6b117a3c24cbbffe94046b16ee6d6d4510584d3a"
 dependencies = [
  "cfg-if",
  "futures-util",
@@ -1364,16 +1316,6 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
-
-[[package]]
-name = "libloading"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
-dependencies = [
- "cfg-if",
- "windows-link",
-]
 
 [[package]]
 name = "libm"
@@ -1635,12 +1577,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "minimal-lexical"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
-
-[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1707,16 +1643,6 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
-]
-
-[[package]]
-name = "nom"
-version = "7.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
-dependencies = [
- "memchr",
- "minimal-lexical",
 ]
 
 [[package]]
@@ -1987,16 +1913,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "prettyplease"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bfe0f4c752e450fc2faf62654f1c134747922825d5b04ca717b8874f41a40c0"
-dependencies = [
- "proc-macro2",
- "syn 3.0.6",
-]
-
-[[package]]
 name = "proc-macro-crate"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2179,18 +2095,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "regex"
-version = "1.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
-dependencies = [
- "aho-corasick",
- "memchr",
- "regex-automata",
- "regex-syntax",
-]
-
-[[package]]
 name = "regex-automata"
 version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2222,7 +2126,7 @@ dependencies = [
  "bitflags",
  "libc",
  "mach2",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2309,7 +2213,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2690,7 +2594,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2967,7 +2871,7 @@ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 [[package]]
 name = "wasixv2"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "async-trait",
  "serde",
@@ -3005,12 +2909,12 @@ dependencies = [
 [[package]]
 name = "wasixv2-abi"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 
 [[package]]
 name = "wasixv2-checkpoint"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "wasixv2-kernel",
 ]
@@ -3018,7 +2922,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-dylink"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "async-lock",
  "loupe",
@@ -3039,7 +2943,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-exec"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "js-sys",
  "libc",
@@ -3052,6 +2956,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-encoder 0.263.0",
  "wasmer",
+ "wasmer-asyncify",
  "wasmer-types",
  "wasmparser 0.263.0",
 ]
@@ -3059,7 +2964,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-host"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
@@ -3073,7 +2978,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-kernel"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3090,7 +2995,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-pages"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "libc",
 ]
@@ -3098,7 +3003,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-policy"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "wasixv2-syscalls",
 ]
@@ -3106,7 +3011,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-record"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "wasixv2-syscalls",
 ]
@@ -3114,7 +3019,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-syscalls"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "wasixv2-abi",
  "wasixv2-pages",
@@ -3124,7 +3029,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-trace"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "tracing",
  "wasixv2-syscalls",
@@ -3133,7 +3038,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-vfs"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3145,7 +3050,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-vfs-host"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "async-trait",
  "libc",
@@ -3157,7 +3062,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-vfs-mem"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "async-trait",
  "wasixv2-abi",
@@ -3168,7 +3073,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-vfs-overlay"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "async-trait",
  "futures",
@@ -3179,7 +3084,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-vfs-package"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "async-trait",
  "shared-buffer",
@@ -3192,7 +3097,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-vnet"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "bincode",
  "serde",
@@ -3205,7 +3110,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-vnet-host"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "libc",
  "mio",
@@ -3219,7 +3124,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-vnet-switch"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "wasixv2-abi",
  "wasixv2-vnet",
@@ -3229,7 +3134,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-wait"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "wasixv2-abi",
 ]
@@ -3237,7 +3142,7 @@ dependencies = [
 [[package]]
 name = "wasixv2-wasix1"
 version = "0.0.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "tracing",
  "wasixv2-abi",
@@ -3253,12 +3158,11 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen"
-version = "0.2.129"
+version = "0.2.130"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bb54f33acc68fd454578d9820b0bde1a1a3d17aa17bb7b6595806d02886d409"
+checksum = "a0181c14ddd6c7b8b0b0132a5f1ea2f32be0d893cd3ea97b6e3b28886b8a3d1c"
 dependencies = [
  "cfg-if",
- "once_cell",
  "rustversion",
  "wasm-bindgen-macro",
  "wasm-bindgen-shared",
@@ -3266,9 +3170,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-futures"
-version = "0.4.79"
+version = "0.4.80"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3cbab34de2d982e9b48e18d216d04c4a6f641066ff19ffb699980f591ee3610e"
+checksum = "5e14e0327cb5368ad60ccb22d04a9827a693c95a926d8d125e9fa39e0baec501"
 dependencies = [
  "js-sys",
  "tokio",
@@ -3277,9 +3181,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro"
-version = "0.2.129"
+version = "0.2.130"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e29d0c35b16e224a7eeb5cd2d25e3e1968fbd65604117b44d3b789d00ee8535"
+checksum = "6e931a02a39abdbf66966fc35902b5ed58344750a70885bed4ebb3d8eaf28ed9"
 dependencies = [
  "quote",
  "wasm-bindgen-macro-support",
@@ -3287,9 +3191,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro-support"
-version = "0.2.129"
+version = "0.2.130"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f501a8bc3719dba86ef8ae4728879c08001bea749eb1333ac5b91e040e2a6b7"
+checksum = "2ca4b54280e455bd831e33a6b8e734baf432fe63fbc35c42ac14ce67a043a53a"
 dependencies = [
  "bumpalo",
  "proc-macro2",
@@ -3300,20 +3204,19 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-shared"
-version = "0.2.129"
+version = "0.2.130"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f0c9c52aa7cd7d77769a4cfe2a9adb1b331f489a41d912ce14513d5ab995c6"
+checksum = "3b1f9c3798725016c6ee5f2f57869ec0831e8bbc0ab0310a86e787e97f41389e"
 dependencies = [
  "unicode-ident",
 ]
 
 [[package]]
 name = "wasm-bindgen-test"
-version = "0.3.79"
+version = "0.3.80"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae7499dfd45780a0a91d7ee6bb9ac51970a4479a41a89da443fdda5a39547d42"
+checksum = "5b4913c0ade07e01ab574b20d2741538f070efa12cb7a1a1e2d5df6ea41cf522"
 dependencies = [
- "async-trait",
  "cast",
  "js-sys",
  "libm",
@@ -3331,9 +3234,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-test-macro"
-version = "0.3.79"
+version = "0.3.80"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b84b5ac638bfb168196a1a461fcc8f46a294a18b1b6be52133b4e0db122cc9f"
+checksum = "238071aa4c5b268e57d21018621a2e2403c29dd11c55dbdf790ed47fdb9241c0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3342,9 +3245,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-test-shared"
-version = "0.2.129"
+version = "0.2.130"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f692aa943ccd88363733b77063f32cfed5bc6cbea8e6e8b251b302f881606fe"
+checksum = "9ab365ce29ba0232367502b2894556ae77a9c214d33dbf453fdba7f586905918"
 
 [[package]]
 name = "wasm-encoder"
@@ -3368,11 +3271,9 @@ dependencies = [
 [[package]]
 name = "wasmer"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#f13a88fe202551edc73a454b07f8436b236c602e"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=main#602f879fe2b7d40fcd71e1675d660e145b74fbe1"
 dependencies = [
- "bindgen",
  "bytes",
- "cmake",
  "crossbeam-skiplist",
  "dashmap",
  "derive_more",
@@ -3388,7 +3289,6 @@ dependencies = [
  "shared-buffer",
  "smallvec",
  "symbolic-demangle",
- "tar",
  "target-lexicon",
  "thiserror",
  "tracing",
@@ -3406,9 +3306,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmer-asyncify"
+version = "7.5.0"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
+dependencies = [
+ "wasmer",
+]
+
+[[package]]
 name = "wasmer-c-api-imports"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#f13a88fe202551edc73a454b07f8436b236c602e"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=main#602f879fe2b7d40fcd71e1675d660e145b74fbe1"
 dependencies = [
  "anyhow",
  "wasmer",
@@ -3417,7 +3325,7 @@ dependencies = [
 [[package]]
 name = "wasmer-c-api-imports-wasixv2"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "wasixv2-exec",
  "wasmer",
@@ -3427,7 +3335,7 @@ dependencies = [
 [[package]]
 name = "wasmer-cache"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-next?rev=8c003487dae9c18bb1faff8047ac47519f43c325#8c003487dae9c18bb1faff8047ac47519f43c325"
+source = "git+https://github.com/wasmerio/wasmer-next?rev=c2845adb332ef35152189d165dd7ecae2ea4de08#c2845adb332ef35152189d165dd7ecae2ea4de08"
 dependencies = [
  "blake3",
  "hex",
@@ -3438,7 +3346,7 @@ dependencies = [
 [[package]]
 name = "wasmer-compiler"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#f13a88fe202551edc73a454b07f8436b236c602e"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=main#602f879fe2b7d40fcd71e1675d660e145b74fbe1"
 dependencies = [
  "addr2line 0.27.1",
  "backtrace",
@@ -3478,7 +3386,7 @@ dependencies = [
 [[package]]
 name = "wasmer-compiler-cranelift"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#f13a88fe202551edc73a454b07f8436b236c602e"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=main#602f879fe2b7d40fcd71e1675d660e145b74fbe1"
 dependencies = [
  "cranelift-codegen",
  "cranelift-entity",
@@ -3500,7 +3408,7 @@ dependencies = [
 [[package]]
 name = "wasmer-compiler-llvm"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#f13a88fe202551edc73a454b07f8436b236c602e"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=main#602f879fe2b7d40fcd71e1675d660e145b74fbe1"
 dependencies = [
  "byteorder",
  "crossbeam-channel",
@@ -3523,7 +3431,7 @@ dependencies = [
 [[package]]
 name = "wasmer-derive"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#f13a88fe202551edc73a454b07f8436b236c602e"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=main#602f879fe2b7d40fcd71e1675d660e145b74fbe1"
 dependencies = [
  "proc-macro-error2",
  "proc-macro2",
@@ -3563,7 +3471,7 @@ dependencies = [
 [[package]]
 name = "wasmer-types"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#f13a88fe202551edc73a454b07f8436b236c602e"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=main#602f879fe2b7d40fcd71e1675d660e145b74fbe1"
 dependencies = [
  "bytecheck",
  "crc32fast",
@@ -3586,7 +3494,7 @@ dependencies = [
 [[package]]
 name = "wasmer-vm"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=refactor%2Fnative-async-single-stack#f13a88fe202551edc73a454b07f8436b236c602e"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=main#602f879fe2b7d40fcd71e1675d660e145b74fbe1"
 dependencies = [
  "backtrace",
  "bytesize",
@@ -3732,7 +3640,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

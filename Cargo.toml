@@ -14,7 +14,7 @@ js = [
   "dep:js-sys",
   "dep:wasm-bindgen",
   "dep:wasm-bindgen-futures",
-  "wasmer/experimental-async",
+  "wasmer/async",
   "wasmer/js-default",
   "wasixv2-exec?/js",
 ]
@@ -74,7 +74,7 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 # imports, and one that has to wait would trap on a synchronous call.
 wasmer = { workspace = true, default-features = false, features = [
   "sys-default",
-  "experimental-async",
+  "async",
 ] }
 wasixv2-exec = { path = "../wasix/exec", default-features = false, optional = true, features = [
   "sys",
