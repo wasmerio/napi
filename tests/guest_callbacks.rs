@@ -3,10 +3,15 @@
 //! values created in them, argument counts, missing arguments, settling a
 //! deferred (and settling it again from inside), Proxy traps, promise hooks
 //! and the source-map callback run by an import, a call that cannot reach the
-//! guest, raw return values, and envs created one after another on one
-//! thread.
+//! guest, raw return values, envs created one after another on one thread,
+//! and a guest that is called with `call_async`.
 
 #![cfg(not(target_arch = "wasm32"))]
+
+use std::{
+    pin::pin,
+    task::{Context, Poll, Waker},
+};
 
 use wasmer::{AsStoreMut, Engine, Imports, Instance, Memory, Module, Store, TypedFunction};
 use wasmer_napi::NapiCtx;
@@ -588,6 +593,37 @@ fn nested_callbacks_scopes_and_arguments() {
     assert_eq!(guest.release(), 0);
 }
 
+/// A runtime that runs its guests with `call_async`, as a WASIX v2 machine
+/// does, still has their imports on the thread's own stack, the only one V8
+/// runs on: anywhere else it aborts the process ("Check failed:
+/// IsOnCentralStack()"). Compiling, throwing, collecting garbage and calling
+/// back into the guest all work there.
+#[test]
+fn imports_of_an_async_call_run_javascript() {
+    let (ctx, engine, module) = setup();
+    let mut guest = Guest::new(&ctx, &engine, &module);
+    let script = "(() => { let caught = 0; try { null.x; } catch (error) { caught = 1; } \
+                  let kept; for (let i = 0; i < 200000; i++) kept = [i, {}]; \
+                  return caught + rec(40, function step(m) { return rec(m, step); }); })()";
+    guest
+        .memory
+        .view(&guest.store)
+        .write(u64::from(SOURCE_PTR), script.as_bytes())
+        .unwrap();
+    let eval: TypedFunction<(i32, i32), i32> = guest.typed("eval");
+    {
+        let call = pin!(eval.call_async(&mut guest.store, SOURCE_PTR as i32, script.len() as i32));
+        // Nothing in this guest waits: the call is over after one poll.
+        let Poll::Ready(status) = call.poll(&mut Context::from_waker(Waker::noop())) else {
+            panic!("the call suspended");
+        };
+        assert_eq!(status.expect("eval trapped"), 0);
+    }
+    let result: TypedFunction<(), i32> = guest.typed("result_int");
+    assert_eq!(result.call(&mut guest.store).unwrap(), 821);
+    assert_eq!(guest.release(), 0);
+}
+
 #[test]
 fn coercion_and_instanceof_can_call_guest_functions() {
     let (ctx, engine, module) = setup();
@@ -820,7 +856,7 @@ fn proxy_traps_run_by_an_import_can_call_guest_functions() {
     }
     assert!(lost.is_empty(), "guest calls lost in {lost:?}");
 
-    // napi_get_prototype does not lend the store: V8 reads a Proxy's
+    // napi_get_prototype is a synchronous import: V8 reads a Proxy's
     // prototype without running its trap.
     assert_eq!(guest.eval("fresh()"), (0, 0, 0));
     assert_eq!(call_import.call(&mut guest.store, 6).unwrap(), 0);
@@ -876,8 +912,8 @@ fn the_promise_init_hook_can_call_guest_functions() {
     assert_eq!(guest.release(), 0);
 }
 
-/// A guest function called from JavaScript that an import ran without
-/// lending the store cannot run, and throws instead of returning undefined.
+/// A guest function called from JavaScript that a synchronous import ran
+/// cannot run, and throws instead of returning undefined.
 /// napi_create_error is such an import: it assigns `code`, which runs a
 /// setter on the prototype chain.
 #[test]
@@ -890,7 +926,7 @@ fn a_call_that_cannot_reach_the_guest_throws() {
             "globalThis.outcome = 0; \
              Object.defineProperty(Error.prototype, 'code', { configurable: true, set() { \
              try { outcome = rec(1, () => 40) === undefined ? 1 : 2; } catch (error) { \
-             outcome = /store is not lent/.test(error.message) ? 3 : 4; } } }); 0"
+             outcome = /out of reach/.test(error.message) ? 3 : 4; } } }); 0"
         ),
         (0, 0, 0)
     );
@@ -899,7 +935,7 @@ fn a_call_that_cannot_reach_the_guest_throws() {
         guest.eval("delete Error.prototype.code; outcome"),
         (0, 3, 0)
     );
-    // The same call from an import that lends the store runs.
+    // The same call from an import that can run JavaScript runs.
     assert_eq!(guest.eval("rec(1, () => 40)"), (0, 41, 0));
     assert_eq!(guest.release(), 0);
 }

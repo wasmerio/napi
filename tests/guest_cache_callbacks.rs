@@ -6,7 +6,6 @@
 
 use wasmer::{AsStoreMut, Function, Instance, Memory, Module, RuntimeError, Store, TypedFunction};
 use wasmer_napi::NapiCtx;
-use wasmer_wasix::WasiError;
 
 const SOURCE_PTR: u32 = 4096;
 const OUTPUT_PTR: u64 = 208;
@@ -174,8 +173,10 @@ impl Guest {
         imports.define(
             "test",
             "exit",
-            Function::new_typed(&mut store, || -> Result<(), WasiError> {
-                Err(WasiError::Exit(37i32.into()))
+            Function::new_typed(&mut store, || -> Result<(), RuntimeError> {
+                // What a guest's runtime raises to end it: an error of its
+                // own, with no trap code.
+                Err(RuntimeError::new("the guest exited with status 37"))
             }),
         );
         let instance = Instance::new(&mut store, &module, &imports).unwrap();

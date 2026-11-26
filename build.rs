@@ -492,7 +492,9 @@ fn default_prebuilt_extra_links() -> Vec<ExtraLink> {
             ExtraLink::Framework(PathBuf::from(
                 "/System/Library/Frameworks/CoreFoundation.framework",
             )),
-            ExtraLink::Framework(PathBuf::from("/System/Library/Frameworks/Security.framework")),
+            ExtraLink::Framework(PathBuf::from(
+                "/System/Library/Frameworks/Security.framework",
+            )),
         ]
     } else {
         Vec::new()

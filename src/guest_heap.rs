@@ -39,10 +39,11 @@
 //! Growing a wasm memory needs the store that owns it. Ordinary import handlers
 //! pass their store explicitly. V8 array-buffer allocation arrives from inside
 //! C++ frames. Bridge calls that may invoke guest code or allocate through V8's
-//! array-buffer allocator must install an invocation guard and lend their store
-//! ([`crate::guest::callback`]). A foreground allocation inside such a guarded
-//! call can recover that store; a background allocator thread has no lent store
-//! and remains arena-only. Growth is always the ordinary `Memory::grow`.
+//! array-buffer allocator are made by imports that hold no store and reach it
+//! one slice at a time ([`crate::guest::callback`]). A foreground allocation
+//! inside such a call takes a slice the same way; a background allocator
+//! thread has no import to go through and remains arena-only. Growth is always
+//! the ordinary `Memory::grow`.
 //!
 //! Memory handles are store-scoped and WASIX worker threads share one linear
 //! memory while each has its own store, so the heap keeps one handle per store
@@ -69,8 +70,9 @@ use std::sync::{
 
 use offset_allocator::{Allocation, Allocator as OffsetAllocator};
 use wasmer::sys::NativeEngineExt;
-use wasmer::{AsStoreRef, Memory, MemoryStyle, Pages, Store, StoreMut};
+use wasmer::{AsStoreMut, AsStoreRef, FunctionEnv, Memory, MemoryStyle, Pages, StoreMut};
 
+use crate::NapiEnv;
 use crate::budget::{Pool, ResourceBudget};
 
 /// Allocation granularity: every allocation is a multiple of 16 bytes and
@@ -113,7 +115,7 @@ struct LiveAlloc {
 struct HeapInner {
     /// One handle to this heap's linear memory per store that has reached it.
     /// A handle only works with the store that made it, so growing means
-    /// finding the one belonging to the store currently lent.
+    /// finding the one belonging to the store that asks.
     memories: Vec<Memory>,
     chunks: Vec<Chunk>,
     live: HashMap<u32, LiveAlloc>,
@@ -212,32 +214,37 @@ impl GuestHeap {
     /// the same shared linear memory receive the same `Arc<GuestHeap>`. Returns
     /// `None` when the memory cannot support host-side allocation with a stable
     /// base, in which case callers must treat guest allocation as unavailable.
+    ///
+    /// `limit` is how far, in bytes, the heap may grow the memory: a runtime
+    /// that keeps the top of the guest's address space for itself passes where
+    /// that starts. The first env to reach a shared memory sets it.
     pub(crate) fn get_or_create(
         store: &mut StoreMut<'_>,
         memory: &wasmer::Memory,
         budget: Arc<ResourceBudget>,
+        limit: Option<u64>,
     ) -> Option<Arc<Self>> {
         let base = memory.view(store).data_ptr() as usize;
         if base == 0 {
-            return Self::new(store, memory, budget);
+            return Self::new(store, memory, budget, limit);
         }
         // Shared memories: one heap per base, reused across threads/envs.
         // Non-shared memories are single-threaded (conformance lane) — a fresh
         // heap each time is fine and avoids cross-instance base-key collisions.
         if !memory.ty(store).shared {
-            return Self::new(store, memory, budget);
+            return Self::new(store, memory, budget, limit);
         }
         let mut reg = shared_registry()
             .lock()
             .expect("guest-heap registry poisoned");
         if let Some(existing) = reg.get(&base).and_then(Weak::upgrade) {
             // This store reaches the heap for the first time; its handle is
-            // the only one that can grow the memory while it is the store
-            // being lent.
+            // the only one that can grow the memory when this store is the
+            // one that asks.
             existing.register_memory(store, memory);
             return Some(existing);
         }
-        let heap = Self::new(store, memory, budget)?;
+        let heap = Self::new(store, memory, budget, limit)?;
         reg.insert(base, Arc::downgrade(&heap));
         // Opportunistically drop dead entries so the map cannot grow unbounded
         // across many short-lived instances that reuse addresses.
@@ -246,7 +253,7 @@ impl GuestHeap {
     }
 
     /// Record the handle `store` uses for this heap's linear memory, if it has
-    /// not already. Only the handle belonging to the store being lent can grow
+    /// not already. Only the handle belonging to the store that asks can grow
     /// the memory, so every store that reaches a shared heap contributes one.
     fn register_memory(&self, store: &impl AsStoreRef, memory: &Memory) {
         let mut inner = self.inner.lock().expect("guest-heap mutex poisoned");
@@ -266,6 +273,7 @@ impl GuestHeap {
         store: &mut StoreMut<'_>,
         memory: &wasmer::Memory,
         budget: Arc<ResourceBudget>,
+        limit: Option<u64>,
     ) -> Option<Arc<Self>> {
         let ty = memory.ty(store);
         let view = memory.view(store);
@@ -275,7 +283,9 @@ impl GuestHeap {
             return None;
         }
         let max_pages = ty.maximum.map(|p| p.0).unwrap_or(65536).min(65536);
-        let max_bytes = u64::from(max_pages) * u64::from(WASM_PAGE);
+        // Whole pages only: the heap claims by growing the memory.
+        let limit_pages = limit.map_or(65536, |bytes| bytes / u64::from(WASM_PAGE));
+        let max_bytes = u64::from(max_pages).min(limit_pages) * u64::from(WASM_PAGE);
 
         // The base can only be stable if the whole range is reserved up
         // front. On 64-bit hosts this is always the case for wasm32.
@@ -371,6 +381,19 @@ impl GuestHeap {
         Some(unsafe { self.base.add(offset as usize) })
     }
 
+    /// [`Self::host_range`] for a non-empty range inside the largest length
+    /// already seen, which needs no lookup of the memory, and so no store.
+    /// `None` for any other range, also one the memory has grown to hold.
+    #[inline]
+    pub(crate) fn seen_range(&self, offset: u64, len: u64) -> Option<*mut u8> {
+        let end = offset.checked_add(len)?;
+        if len == 0 || end > self.observed_len.load(Ordering::Acquire) || end > self.max_bytes {
+            return None;
+        }
+        // SAFETY: as in `host_range`.
+        Some(unsafe { self.base.add(offset as usize) })
+    }
+
     /// The whole design (external backing stores, cached host pointers)
     /// relies on the mapping never moving. A moved base means every live
     /// pointer is dangling: abort before anything dereferences one.
@@ -422,8 +445,8 @@ impl GuestHeap {
 
     /// Allocate with explicit access to the store that owns this heap's memory.
     /// Existing arena space remains the fast path; only exhaustion grows the
-    /// memory. This is used directly by import handlers and, through a lent
-    /// store, by synchronous foreground V8 allocator calls in guarded bridges.
+    /// memory. This is used directly by import handlers and, in a slice of the
+    /// store, by the V8 allocator calls a bridge call of an import leads to.
     pub(crate) fn alloc_with_store(
         &self,
         store: &mut StoreMut<'_>,
@@ -683,6 +706,9 @@ pub(crate) struct GuestHeapCtx {
     base: usize,
     len: u64,
     heap: Weak<GuestHeap>,
+    /// The env of the guest whose memory the heap is in: how the allocator
+    /// asks for the store that can grow it.
+    env: FunctionEnv<NapiEnv>,
 }
 
 /// Context handed to the buffer-finalizer trampoline for a single
@@ -696,11 +722,14 @@ impl GuestHeap {
     /// Box an allocator context for [`unofficial_napi_env_create_options`].
     /// The receiver takes ownership (released via
     /// [`napi_host_guest_heap_release`]).
-    pub(crate) fn make_alloc_ctx(self: &Arc<Self>) -> *mut c_void {
+    ///
+    /// `env` is the env of the guest that owns the heap's memory.
+    pub(crate) fn make_alloc_ctx(self: &Arc<Self>, env: FunctionEnv<NapiEnv>) -> *mut c_void {
         Box::into_raw(Box::new(GuestHeapCtx {
             base: self.base as usize,
             len: self.max_bytes,
             heap: Arc::downgrade(self),
+            env,
         }))
         .cast()
     }
@@ -741,7 +770,15 @@ pub extern "C" fn napi_host_guest_heap_alloc(
     let Some(heap) = ctx.heap.upgrade() else {
         return std::ptr::null_mut();
     };
-    let offset = Store::with_current(|store| heap.alloc_with_store(store, length, zero != 0))
+    // The engine gives the store where it gives it to a guest function that
+    // JavaScript calls: under an import of the guest that is in a bridge
+    // call. Anywhere else the arena has to do.
+    let offset = ctx
+        .env
+        .async_env()
+        .with_if_in_reach(|mut env| {
+            heap.alloc_with_store(&mut env.as_store_mut(), length, zero != 0)
+        })
         .unwrap_or_else(|| heap.alloc(length, zero != 0));
     match offset {
         Some(offset) => heap.offset_to_host(offset).cast(),
@@ -818,9 +855,22 @@ mod tests {
         let memory = Memory::new(&mut *store, ty).expect("create shared memory");
         let heap = {
             let mut store_mut = store.as_store_mut();
-            GuestHeap::new(&mut store_mut, &memory, budget).expect("guest heap")
+            GuestHeap::new(&mut store_mut, &memory, budget, None).expect("guest heap")
         };
         (memory, heap)
+    }
+
+    /// An env in `store`, for an allocator context to ask for the store with.
+    fn napi_env(store: &mut Store) -> FunctionEnv<NapiEnv> {
+        FunctionEnv::new(
+            store,
+            NapiEnv::new(
+                ResourceBudget::unlimited(),
+                None,
+                Default::default(),
+                Default::default(),
+            ),
+        )
     }
 
     /// The bridge owns a guest-heap context once it is handed over, so a
@@ -831,7 +881,7 @@ mod tests {
         let mut store = Store::default();
         let (_memory, heap) = shared_heap(&mut store, ResourceBudget::unlimited());
         let weak_before = Arc::weak_count(&heap);
-        let ctx = heap.make_alloc_ctx();
+        let ctx = heap.make_alloc_ctx(napi_env(&mut store));
         assert_eq!(Arc::weak_count(&heap), weak_before + 1);
 
         let unknown_policy = crate::WasmPolicy::EnabledUnmetered.bridge_code() + 1;
@@ -1042,24 +1092,60 @@ mod tests {
         assert!(heap.free_offset(grown));
     }
 
-    /// The foreign V8 allocator has no Rust store argument. It may recover a
-    /// store only while an explicitly guarded bridge lends one; otherwise it
-    /// is limited to the already-prefunded arena.
+    /// The foreign V8 allocator has no Rust store argument. The engine gives
+    /// it the store only under an import of the heap's guest that holds no
+    /// slice; otherwise it is limited to the already-prefunded arena.
     #[test]
-    fn allocator_hook_grows_only_with_a_lent_store() {
+    fn allocator_hook_grows_only_under_an_import_of_its_guest() {
+        use crate::guest::import::{Cx, import};
+        use wasmer::{Function, Instance, Module, imports};
+
+        /// Calls `import` as a guest would and returns what it returned.
+        fn run(store: &mut Store, import: Function) -> i32 {
+            let module = Module::new(
+                &store,
+                r#"(module
+                  (import "host" "import" (func $import (result i32)))
+                  (func (export "run") (result i32) call $import))"#,
+            )
+            .unwrap();
+            let instance = Instance::new(
+                store,
+                &module,
+                &imports! { "host" => { "import" => import } },
+            )
+            .unwrap();
+            let run = instance.exports.get_function("run").unwrap().clone();
+            run.call(store, &[]).unwrap()[0].unwrap_i32()
+        }
+
         let mut store = Store::default();
         let (_memory, heap) = shared_heap(&mut store, ResourceBudget::unlimited());
-        let ctx = heap.make_alloc_ctx();
+        let env = napi_env(&mut store);
+        let ctx = heap.make_alloc_ctx(env.clone());
         let past_arena = (PREFUND_BYTES as usize) * 2;
 
-        let without_guard = napi_host_guest_heap_alloc(ctx, past_arena, 0);
-        assert!(without_guard.is_null());
+        let outside = napi_host_guest_heap_alloc(ctx, past_arena, 0);
+        assert!(outside.is_null());
 
-        let with_guard = store
-            .as_store_mut()
-            .parked(|| napi_host_guest_heap_alloc(ctx, past_arena, 0));
-        assert!(!with_guard.is_null());
-        assert_eq!(napi_host_guest_heap_free(ctx, with_guard, past_arena), 1);
+        // An import of another store is not the way to this one.
+        let mut other = Store::default();
+        let other_env = napi_env(&mut other);
+        let stranger = import(&mut other, &other_env, move |_: &mut Cx<'_>| -> i32 {
+            i32::from(napi_host_guest_heap_alloc(ctx, past_arena, 0).is_null())
+        });
+        assert_eq!(run(&mut other, stranger), 1);
+
+        let import = import(&mut store, &env, move |cx: &mut Cx<'_>| -> i32 {
+            // The import has the store in a slice: the allocator has none.
+            let in_slice = cx.with(|_| napi_host_guest_heap_alloc(ctx, past_arena, 0));
+            let grown = napi_host_guest_heap_alloc(ctx, past_arena, 0);
+            if !in_slice.is_null() || grown.is_null() {
+                return 0;
+            }
+            napi_host_guest_heap_free(ctx, grown, past_arena)
+        });
+        assert_eq!(run(&mut store, import), 1);
 
         napi_host_guest_heap_release(ctx);
     }
@@ -1108,7 +1194,7 @@ mod tests {
         let memory = Memory::new(&mut store, ty).expect("create owned memory");
         let heap = {
             let mut store_mut = store.as_store_mut();
-            GuestHeap::new(&mut store_mut, &memory, ResourceBudget::unlimited())
+            GuestHeap::new(&mut store_mut, &memory, ResourceBudget::unlimited(), None)
                 .expect("guest heap")
         };
 
@@ -1222,5 +1308,35 @@ mod tests {
             heap.host_range(heap.range_len(), 1, || (heap.base(), u64::MAX)),
             None
         );
+    }
+
+    /// `seen_range` is `host_range` for the ranges that need no lookup, and
+    /// refuses every other one, also one the memory holds.
+    #[test]
+    fn seen_range_is_a_range_that_needs_no_lookup() {
+        let mut store = Store::default();
+        let (memory, heap) = shared_heap(&mut store, ResourceBudget::unlimited());
+        let base = heap.base() as usize;
+        let at = |ptr: Option<*mut u8>| ptr.map(|ptr| ptr as usize - base);
+        let seen = 64 * u64::from(WASM_PAGE);
+        let grown = current(&memory, &store).1;
+        assert!(grown > seen);
+
+        assert_eq!(at(heap.seen_range(16, 100)), Some(16));
+        assert_eq!(at(heap.seen_range(0, seen)), Some(0));
+        assert_eq!(at(heap.seen_range(seen - 7, 7)), Some(seen as usize - 7));
+        // Empty, as `guest_range` has it: nothing to read or write there.
+        assert_eq!(heap.seen_range(16, 0), None);
+        assert_eq!(heap.seen_range(u64::MAX - 3, 8), None);
+
+        // In the memory, but past what the heap has seen: only a lookup,
+        // which takes the store, makes it a range this gives.
+        assert_eq!(heap.seen_range(seen - 3, 9), None);
+        assert_eq!(heap.seen_range(seen, 1), None);
+        let looked_up = heap.host_range(seen - 3, 9, || current(&memory, &store));
+        assert_eq!(at(looked_up), Some(seen as usize - 3));
+        assert_eq!(at(heap.seen_range(seen - 3, 9)), Some(seen as usize - 3));
+        assert_eq!(at(heap.seen_range(grown - 1, 1)), Some(grown as usize - 1));
+        assert_eq!(heap.seen_range(grown - 1, 2), None);
     }
 }

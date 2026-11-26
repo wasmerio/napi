@@ -221,8 +221,8 @@ const LARGE: u32 = 64 << 20;
 
 #[test]
 fn create_uint8array_grows_guest_memory_for_a_large_array() {
-    // More than the guest heap holds when the env starts: the import lends
-    // the store, so the heap grows the guest's memory.
+    // More than the guest heap holds when the env starts: the import can run
+    // JavaScript, so the heap reaches the store and grows the guest's memory.
     let mut guest = Guest::new();
     assert_eq!(guest.make(LARGE, false), 0);
     let data = guest.read_u32(DATA_OUT);

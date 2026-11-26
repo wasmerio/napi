@@ -7468,7 +7468,9 @@ pub unsafe extern "C" fn snapi_bridge_get_typedarray_info(
         return NAPI_INVALID_ARG;
     }
     if !data_out.is_null() {
-        let raw = value_byte_view(&value).map(|view| view.to_vec()).unwrap_or_default();
+        let raw = value_byte_view(&value)
+            .map(|view| view.to_vec())
+            .unwrap_or_default();
         let data = store_bytes(raw);
         if unsafe { write(data_out, data) }.is_err() {
             return NAPI_INVALID_ARG;
@@ -7529,7 +7531,9 @@ pub unsafe extern "C" fn snapi_bridge_get_dataview_info(
         return NAPI_INVALID_ARG;
     }
     if !data_out.is_null() {
-        let raw = value_byte_view(&value).map(|view| view.to_vec()).unwrap_or_default();
+        let raw = value_byte_view(&value)
+            .map(|view| view.to_vec())
+            .unwrap_or_default();
         if unsafe { write(data_out, store_bytes(raw)) }.is_err() {
             return NAPI_INVALID_ARG;
         }
@@ -8670,7 +8674,13 @@ mod tests {
             assert_eq!(
                 unsafe {
                     snapi_bridge_get_dataview_info(
-                        env, bytes, &mut byte_length, null64, null32, null32, null64,
+                        env,
+                        bytes,
+                        &mut byte_length,
+                        null64,
+                        null32,
+                        null32,
+                        null64,
                     )
                 },
                 NAPI_INVALID_ARG
@@ -8678,7 +8688,14 @@ mod tests {
             assert_eq!(
                 unsafe {
                     snapi_bridge_get_typedarray_info(
-                        env, view, &mut kind, &mut length, null64, null32, null32, null64,
+                        env,
+                        view,
+                        &mut kind,
+                        &mut length,
+                        null64,
+                        null32,
+                        null32,
+                        null64,
                     )
                 },
                 NAPI_INVALID_ARG

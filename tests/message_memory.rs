@@ -113,12 +113,10 @@ fn a_serialization_getter_can_queue_a_second_message() {
 
 #[test]
 fn a_guest_exit_in_a_getter_releases_the_unqueued_message() {
-    use wasmer_wasix::{WasiError, wasmer_wasix_types::wasi::ExitCode};
-
     let (engine, module) = compile();
     let ctx = NapiCtx::builder().total_memory_bytes(1 << 30).build();
     let mut guest = Guest::with_signal_hook(&ctx, &engine, &module, || {
-        Err(WasiError::Exit(ExitCode::from(7u16)))
+        Err(wat_guest::GuestExit::raise(7))
     });
     guest.create();
     // An ordinary getter with the same result establishes that serialization
@@ -132,9 +130,7 @@ fn a_guest_exit_in_a_getter_releases_the_unqueued_message() {
 
     assert_eq!(guest.eval("({get answer() { return signal(); }})"), 0);
     let exit = guest.try_message().unwrap_err();
-    assert!(
-        matches!(exit.downcast_ref::<WasiError>(), Some(WasiError::Exit(code)) if code.raw() == 7)
-    );
+    assert_eq!(wat_guest::GuestExit::status(&exit), Some(7));
     assert_eq!(ctx.budget().snapshot().serialized_message, 0);
     assert_eq!(guest.release(), 0);
 }

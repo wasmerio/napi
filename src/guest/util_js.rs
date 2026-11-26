@@ -321,7 +321,7 @@ pub fn write_guest_string_value(
 
 /// The guest's `WebAssembly.Memory`, a cheap externref clone.
 fn guest_memory(env: &mut FunctionEnvMut<NapiEnv>) -> Option<JsValue> {
-    let (state, store) = env.data_and_store_mut();
+    let (state, store) = env.data_and_store();
     Some(state.memory.as_ref()?.as_jsvalue(&store))
 }
 
@@ -450,10 +450,12 @@ pub fn allocate_guest_buffer(env: &mut FunctionEnvMut<NapiEnv>, byte_len: usize)
         // are unsigned even though the typed function carries them as `i32`.
         let allocation_len = u32::try_from(required_capacity).ok()?;
         let guest_ptr: u32 = {
-            let (_, mut store_ref) = env.data_and_store_mut();
             // Guest code: releasing an env from inside it is refused.
             match crate::snapi_js::call_guest(|| {
-                malloc_fn.call(&mut store_ref, allocation_len as i32)
+                malloc_fn.call(
+                    &mut wasmer::AsStoreMut::as_store_mut(env),
+                    allocation_len as i32,
+                )
             }) {
                 Ok(ptr) => ptr as u32,
                 Err(error) => {
@@ -545,7 +547,7 @@ pub fn host_ptr_to_guest_ptr(env: &mut FunctionEnvMut<NapiEnv>, host_addr: u64) 
     #[cfg(not(feature = "js"))]
     {
         let memory = env.data().memory.clone()?;
-        let (_, store_ref) = env.data_and_store_mut();
+        let (_, store_ref) = env.data_and_store();
         let view = memory.view(&store_ref);
         let host_base = view.data_ptr() as u64;
         let memory_len = view.data_size();

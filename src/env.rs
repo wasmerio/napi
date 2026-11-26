@@ -2,12 +2,17 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicU32, AtomicUsize},
+};
 
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
 #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-use crate::guest::callback_cache::CachedGuestCallback;
+use crate::guest::callback_cache::GuestCallbacks;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 use wasmer::Function;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -110,6 +115,79 @@ pub(crate) struct EnvRegistry {
     pub(crate) envs: HashMap<u32, usize>,
 }
 
+/// What the handlers of a guest reach without its store.
+///
+/// A handler that can run JavaScript holds no store (see `guest::import`),
+/// and most of what it needs of its guest is not the store's to give: which
+/// bridge env a guest env id stands for, and where the guest's memory is.
+/// The memory is mapped at a fixed base and only grows, so a range inside
+/// the length already seen is read and written through the guest heap alone
+/// ([`GuestHeap::seen_range`]). [`NapiEnv`] keeps this value current, and
+/// such a handler takes a slice of the store only for the rest: a range the
+/// heap has not seen, a store with several envs.
+///
+/// Only the thread that has the store reads or writes it, so the order of
+/// its atomic accesses is the order of the program.
+///
+/// [`GuestHeap::seen_range`]: crate::guest_heap::GuestHeap::seen_range
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+pub(crate) struct GuestShared {
+    /// [`NapiEnv::single_env`]: the guest id, the bridge env and the heap
+    /// tracker of a store's only env. All zero otherwise.
+    env_id: AtomicU32,
+    env: AtomicUsize,
+    tracker: AtomicUsize,
+    /// [`NapiEnv::guest_heap`], once the instance has one.
+    heap: OnceLock<Arc<crate::guest_heap::GuestHeap>>,
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+impl GuestShared {
+    fn new() -> Self {
+        Self {
+            env_id: AtomicU32::new(0),
+            env: AtomicUsize::new(0),
+            tracker: AtomicUsize::new(0),
+            heap: OnceLock::new(),
+        }
+    }
+
+    /// The bridge env `guest_env` stands for, and whether its heap is
+    /// tracked against a budget, if it is the store's only env. `None` for
+    /// any other id: the store then has the answer.
+    #[inline]
+    pub(crate) fn single_env(&self, guest_env: u32) -> Option<(SnapiEnv, bool)> {
+        if guest_env == 0 || self.env_id.load(Ordering::Relaxed) != guest_env {
+            return None;
+        }
+        Some((
+            self.env.load(Ordering::Relaxed) as SnapiEnv,
+            self.tracker.load(Ordering::Relaxed) != 0,
+        ))
+    }
+
+    fn set_single_env(&self, (env_id, env, tracker): (u32, usize, usize)) {
+        self.env_id.store(env_id, Ordering::Relaxed);
+        self.env.store(env, Ordering::Relaxed);
+        self.tracker.store(tracker, Ordering::Relaxed);
+    }
+
+    /// The host address of a non-empty guest range the heap has seen
+    /// already. `None` for any other: the store then has the answer.
+    #[inline]
+    pub(crate) fn seen_range(&self, guest_ptr: u32, len: usize) -> Option<*mut u8> {
+        self.heap
+            .get()?
+            .seen_range(u64::from(guest_ptr), len as u64)
+    }
+
+    /// An instance has one memory, and so one heap for its life.
+    pub(crate) fn set_heap(&self, heap: &Arc<crate::guest_heap::GuestHeap>) {
+        let held = self.heap.get_or_init(|| Arc::clone(heap));
+        assert!(Arc::ptr_eq(held, heap), "an instance has one guest heap");
+    }
+}
+
 pub(crate) struct NapiEnv {
     /// The app's shared accountant. V8 env (isolate) heap ceilings and the
     /// `max_envs` isolate count are charged against it; workers share the same
@@ -143,7 +221,9 @@ pub(crate) struct NapiEnv {
     external_declared: u64,
     /// Depth of nested guest↔host callback crossings on this thread, bounded to
     /// keep guest→host→guest recursion from overflowing the host native stack
-    /// (an uncatchable SIGSEGV). See [`NapiEnv::enter_callback`].
+    /// (an uncatchable SIGSEGV). See [`NapiEnv::enter_callback`]. Natively
+    /// the driver of guest calls counts them (see `guest::drive`).
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     callback_depth: u32,
     pub(crate) memory: Option<Memory>,
     /// Host-side allocator over the guest's linear memory. `None` only before
@@ -167,7 +247,7 @@ pub(crate) struct NapiEnv {
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) func_cache: HashMap<u32, Function>,
     #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
-    pub(crate) func_cache: HashMap<u32, CachedGuestCallback>,
+    pub(crate) func_cache: GuestCallbacks,
     pub(crate) default_napi_env_id: Option<u32>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) next_napi_scope_id: u32,
@@ -180,6 +260,10 @@ pub(crate) struct NapiEnv {
     /// [`resolve_napi_env`]: NapiEnv::resolve_napi_env
     /// [`heap_tracker_for`]: NapiEnv::heap_tracker_for
     single_env: (u32, usize, usize),
+    /// What handlers reach without the store: [`Self::single_env`] and
+    /// [`Self::guest_heap`], kept in step with them.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    pub(crate) shared: Arc<GuestShared>,
     pub(crate) napi_state_to_guest_env: IdHashMap<usize, u32>,
     pub(crate) napi_scopes: IdHashMap<u32, u32>,
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -242,6 +326,7 @@ impl NapiEnv {
             messages: crate::message::PendingMessages::new(),
             env_heap_charges: IdHashMap::default(),
             external_declared: 0,
+            #[cfg(all(target_arch = "wasm32", feature = "js"))]
             callback_depth: 0,
             memory: None,
             #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
@@ -249,12 +334,14 @@ impl NapiEnv {
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
             malloc_fn: None,
             table: None,
-            func_cache: HashMap::new(),
+            func_cache: Default::default(),
             default_napi_env_id: None,
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
             next_napi_scope_id: 0,
             napi_envs: IdHashMap::default(),
             single_env: (0, 0, 0),
+            #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+            shared: Arc::new(GuestShared::new()),
             napi_state_to_guest_env: IdHashMap::default(),
             napi_scopes: IdHashMap::default(),
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -531,6 +618,7 @@ impl NapiEnv {
     ///
     /// [`MAX_CALLBACK_DEPTH`]: crate::guest::MAX_CALLBACK_DEPTH
     /// [`leave_callback`]: NapiEnv::leave_callback
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) fn enter_callback(&mut self) -> bool {
         if self.callback_depth >= crate::guest::MAX_CALLBACK_DEPTH {
             return false;
@@ -542,6 +630,7 @@ impl NapiEnv {
     /// Release one level claimed by a `true` [`enter_callback`].
     ///
     /// [`enter_callback`]: NapiEnv::enter_callback
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     pub(crate) fn leave_callback(&mut self) {
         self.callback_depth = self.callback_depth.saturating_sub(1);
     }
@@ -703,7 +792,7 @@ impl NapiEnv {
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
         let _ = registered;
         // The tracker is freed below: forget it first.
-        self.single_env = (0, 0, 0);
+        self.set_single_env((0, 0, 0));
         // Release the heap ceiling + any callback-granted growth + isolate slot
         // this env reserved.
         if let Some(handle) = self.env_heap_charges.remove(&env_id) {
@@ -761,7 +850,7 @@ impl NapiEnv {
     ///
     /// [`single_env`]: NapiEnv::single_env
     fn refresh_single_env(&mut self) {
-        self.single_env = match self.napi_envs.iter().next() {
+        let single_env = match self.napi_envs.iter().next() {
             Some((&env_id, &env)) if self.napi_envs.len() == 1 => {
                 let tracker = self
                     .env_heap_charges
@@ -771,11 +860,28 @@ impl NapiEnv {
             }
             _ => (0, 0, 0),
         };
+        self.set_single_env(single_env);
+    }
+
+    /// The one place [`single_env`] changes, with its copy for handlers.
+    ///
+    /// [`single_env`]: NapiEnv::single_env
+    fn set_single_env(&mut self, single_env: (u32, usize, usize)) {
+        self.single_env = single_env;
+        #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+        self.shared.set_single_env(single_env);
     }
 }
 
-impl Drop for NapiEnv {
-    fn drop(&mut self) {
+impl NapiEnv {
+    /// Releases every environment this store still holds, and what was
+    /// charged for them. Runs no guest code: a finalizer that would call into
+    /// the guest finds no import to enter it through and is refused.
+    ///
+    /// This is what dropping the store does. A runtime that ends an instance
+    /// before its store calls it earlier; what is released is gone, so the
+    /// drop then finds nothing left.
+    pub(crate) fn release_envs(&mut self) {
         let scope_ids: Vec<u32> = self.napi_scopes.keys().copied().collect();
         #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
         let mut env_kept = false;
@@ -801,7 +907,7 @@ impl Drop for NapiEnv {
         }
         // A kept env's agent still points at its callback context, and its
         // owner may yet release it and run finalizers. Keep the context: it
-        // names a store that is gone, which the trampolines refuse.
+        // names a guest that is gone, which the trampolines refuse.
         #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
         for (_, ctx) in self.native_callback_contexts.drain() {
             std::mem::forget(ctx);
@@ -812,6 +918,12 @@ impl Drop for NapiEnv {
                 .uncharge(Pool::V8External, self.external_declared);
             self.external_declared = 0;
         }
+    }
+}
+
+impl Drop for NapiEnv {
+    fn drop(&mut self) {
+        self.release_envs();
     }
 }
 
@@ -869,6 +981,8 @@ mod tests {
         );
     }
 
+    // Natively the driver of guest calls keeps the bound (`guest::drive`).
+    #[cfg(all(target_arch = "wasm32", feature = "js"))]
     #[test]
     fn callback_reentrancy_is_bounded() {
         let mut env = NapiEnv::new(
@@ -898,5 +1012,43 @@ mod tests {
         }
         env.leave_callback();
         assert!(env.enter_callback());
+    }
+
+    /// What handlers have of a store's envs without the store follows the
+    /// store: its only env, and nothing once it has none or several.
+    #[cfg(not(all(target_arch = "wasm32", feature = "js")))]
+    #[test]
+    fn handlers_have_the_only_env_of_a_store_without_the_store() {
+        let mut env = NapiEnv::new(
+            ResourceBudget::unlimited(),
+            None,
+            Arc::new(std::sync::Mutex::new(EnvRegistry::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let shared = Arc::clone(&env.shared);
+        let bridge_env = |address: usize| address as SnapiEnv;
+        assert_eq!(shared.single_env(7), None);
+
+        env.napi_envs.insert(7, 0x1000);
+        env.refresh_single_env();
+        assert_eq!(shared.single_env(7), Some((bridge_env(0x1000), false)));
+        assert_eq!(shared.single_env(8), None);
+        assert_eq!(shared.single_env(0), None);
+
+        // With two envs the store has the answer.
+        env.napi_envs.insert(8, 0x2000);
+        env.refresh_single_env();
+        assert_eq!(shared.single_env(7), None);
+        assert_eq!(shared.single_env(8), None);
+        assert_eq!(env.resolve_napi_env(8), bridge_env(0x2000));
+
+        env.napi_envs.remove(&7);
+        env.refresh_single_env();
+        assert_eq!(shared.single_env(8), Some((bridge_env(0x2000), false)));
+
+        env.napi_envs.clear();
+        env.refresh_single_env();
+        assert_eq!(shared.single_env(8), None);
+        assert_eq!(shared.single_env(0), None);
     }
 }
