@@ -570,7 +570,10 @@ async fn run_in_machine(
         .context("cannot put the terminal in raw mode")?;
 
     let exit_code = machine
-        .run_module(&engine, &module, config)
+        .run_module(
+            &wasixv2::Loaded::unprepared(engine.clone(), module.clone()),
+            config,
+        )
         .await
         .context("failed to run WASIX module through the machine");
     machine.shutdown().await;
