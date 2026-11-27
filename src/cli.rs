@@ -153,14 +153,19 @@ impl Loader for CliLoader {
         &'a self,
         _: &'a Engine,
         image: &'a Image,
-    ) -> LocalFuture<'a, std::result::Result<(Engine, Module), LoadError>> {
+    ) -> LocalFuture<'a, std::result::Result<wasixv2::Loaded, LoadError>> {
         Box::pin(async move {
             // The engine of the main module: its budgeted memories and its
             // compiler features.
             let store = Store::new(self.engine.clone());
             let module = load_or_compile_module(&store, image.bytes(), self.compiler)
                 .map_err(LoadError::other)?;
-            Ok((self.engine.clone(), module))
+            let (engine, prepared) = (self.engine.clone(), false);
+            Ok(wasixv2::Loaded {
+                engine,
+                module,
+                prepared,
+            })
         })
     }
 }
